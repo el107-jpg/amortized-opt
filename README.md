@@ -2313,6 +2313,138 @@ work correctly — the `near` and `exempt` time buckets are clean.
 
 ---
 
+## Section 9 — `collision_peak`, the max-shaped half of the collision term
+
+Collision is the **dominant** acceptance failure and has been for every run in
+this record.  On the champion's three eval seeds it costs 50 / 49 / 54 of 243
+cases against torque's 23 / 20 / 19 — roughly 2.4x — and torque is the one that
+got a dedicated peak term.
+
+### Why the mean cannot close it
+
+`raw["collision_*"]` is a mean over `n_seen = 2 x S x P x D` = **~2 100**
+(bucket 25) to **~4 200** (bucket 50) `(knot, point, drum)` pairs, the
+overwhelming majority of them stick points nowhere near the drum they are being
+scored against.  `ok_collision` is zero-tolerance on *any* penetration.  The
+loss integrates one statistic and the gate reads another, `n_seen` apart — the
+same structure section 7's `torque_peak` was added for.
+
+Measured on the champion (`phase2b_main/best.pt`, 243-case grid, active-hand
+gate):
+
+| reduction | pass | fail | separation |
+|---|---|---|---|
+| mean hinge (what the cost priced) | — | — | 3.9x |
+| max **hinge** (implemented, then rejected) | 0.01104 | 0.03247 | 2.9x |
+| max **penetration** (what shipped) | 0.00537 | 0.02735 | **5.1x** |
+
+**The middle row is why this section is worth reading.**  The obvious build —
+mirror `torque_peak` exactly, i.e. `smooth_max` the same margin-softplus the
+means reduce — was implemented, measured, and thrown away: it separates the
+gate *worse than the mean it was added to fix*.  The softplus floors at
+0.0066 m for an element at zero clearance and 0.0035 m at the 5 mm margin, every
+clean sample pays it, and a max over a floor is mostly floor.  Reducing the raw
+penetration instead is identically zero on a clear element, and it is what
+`ok_collision` actually thresholds — `pen_count == 0`, no margin, no smoothing.
+The margin and the smoothing belong to the mean, whose job is dense shaping on
+the safe side.  The peak's job is the gate.
+
+Residual on the PASS row: 5.37 mm, not zero, because the peak is a max over
+**both hands** and a case that passes the striking-hand gate routinely has the
+idle arm in a drum.  That caps the achievable separation and is the same idle-arm
+problem flagged at the end of this section.
+
+**The analogy to `torque_peak` is real but weaker, and the number says so.**
+Torque violations are genuinely sparse — ~0.27 % of ~850 elements — and the
+peak separated that gate 26x against the mean's 3.4x.  Collision violations run
+a median of 10 penetrating elements at a median 35 mm depth, so the mean does
+partially see them.  Expect a smaller win.  This is why the weight ships at
+**0** and `phase2_cost_config()` does not turn it on: the term is an A/B to be
+run, not a change to the committed objective.
+
+### Two hypotheses tested and rejected
+
+1. **Between-waypoint tunnelling.**  `n_sub = 1` evaluates collision at the
+   knots only, and section 3 records a 4.6 cm worst-case gap to the scorer —
+   suspiciously close to the 3.5 cm median failure depth.  Measured on the same
+   plans, varying only `n_sub`: the cost already sees **158 / 243** cases
+   penetrating at the knots (median −9.1 mm), and `n_sub = 4` adds only 20 more
+   (median hidden depth 5.1 mm).  The training gradient barely moves —
+   mean hinge 1.168e-05 at `n_sub=1` vs 1.155e-05 at `n_sub=4`.  Worth doing
+   eventually for those 20 cases; it is not the bottleneck.
+2. **Simply underweighting.**  Already refuted by section 7c's `w_collision`
+   sweep, and the trace says why: over 15 k steps the batch-mean *minimum*
+   clearance reaches **+22 mm** against a 5 mm margin while the per-sample
+   *max* penetration plateaus at 5–9 mm from step 2 000 on.  Raising a
+   mean-shaped price buys standoff the trajectory does not need and does not
+   touch the tail — and `c_terminal` nearly doubles (35 → 65) over the same
+   span paying for it.
+
+### What shipped
+
+`CostConfig.w_collision_peak` (0.0), `collision_peak_mode` / `_p` / `_temp`,
+and a `collision_peak` augmented-Lagrangian group appended last.  The peak is a
+`smooth_max` over the per-element **penetration** `max(-sdf, 0)` — both hands,
+all three collision types, concatenated so one reduction sees the union rather
+than a max of per-hand p-norms.  Measured p-norm overestimate at `p = 12`:
+**1.0018x** the true max, so `raw["collision_peak"]` is
+`diag["collision_pen_max"]` to within 0.2 %.
+
+Cost of running it, batch 256 x horizon 50, fwd+bwd eager: **−0.2 % wall time**
+(inside noise) and **+27 MB**.  At the default weight the concatenation is never
+built, so `tests/test_cost_speed.py`'s 20 ms budget is untouched.
+
+Three deliberate asymmetries against `torque_peak`, all pinned by
+`tests/test_collision_peak.py`:
+
+* **`viol["collision_peak"]` is the same tensor as `viol["collision"]`.**  That
+  group's violation has always been a max, not a mean, so there is no second
+  quantity to hand the new group.  The two multipliers will track the same
+  signal; they are still worth splitting because the *penalties* they scale
+  differ by `n_seen` and each carries its own `rho` (the peak's is 1/10 of the
+  mean's, a conservative starting point and not a measured optimum).  Making
+  `viol["collision"]` a mean is the more correct fix and is a separate,
+  deliberately-not-bit-identical change.
+* **`migrate_al_state` does not seed `lam_collision_peak`.**  Unlike
+  `torque_peak` this is not a regrouping of a price already being paid, so
+  `lam_init` is correct and continuity is the ramp's job.
+* **It reduces the penetration, not the hinge** — see the rejected middle row
+  of the table above.  `torque_peak` peaks its hinge and is right to: the
+  torque hinge sits at ~0 on a feasible element, so it has no floor to
+  contaminate a max.
+
+At `w_collision_peak = 0` the smooth-max is not merely unpriced, it is not
+computed: the concatenation never runs and the term is bit-identical to the
+mean-only form.
+
+### Not yet measured
+
+The A/B itself.  Nothing in this section trains a model — the separation
+numbers are on existing checkpoints and the term has never been in a loss.
+
+Suggested start: **`--w-collision-peak 500`**, ramped over the default 1 000
+steps.  Measured on the champion at `lambda = 1`, that puts the peak half at
+**13.7 on a failing case and 2.7 on a passing one**, against a `terminal` of
+~65 and the collision mean's ~1.0 on the same batch — i.e. the term is a real
+price on the cases that fail the gate and close to free on the ones that do
+not.  The full curve, `w x raw` at `lambda = 1`:
+
+| `w` | PASS median | FAIL median |
+|---:|---:|---:|
+| 250 | 1.3 | 6.8 |
+| **500** | **2.7** | **13.7** |
+| 1000 | 5.4 | 27.4 |
+| 2000 | 10.7 | 54.7 |
+
+**The larger unexploited lever is still the idle arm**, and it is not this
+term.  `ok_collision` scores the *striking hand only*: 62 of 243 cases fail it,
+but **159** have a hand inside a drum once the idle arm is counted.  The cost
+prices both hands at full price, so a large share of the collision gradient is
+spent on violations acceptance never reads.  The `w_idle_home` work is aimed
+exactly there and its effect on collision is still unmeasured.
+
+---
+
 ## Section 8 — model-size ablations (2026-08-11–12)
 
 Four experiments run overnight to answer: *can we shrink the decoder, do we

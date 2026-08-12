@@ -164,9 +164,12 @@ def test_the_two_violations_are_orders_of_magnitude_apart(violating):
 
 # =========================================== 2. the multipliers are separate ==
 def test_the_group_exists_and_is_last():
-    assert CONSTRAINT_GROUPS[-1] == "torque_peak"
-    assert CONSTRAINT_GROUPS[:5] == ("torque", "velocity", "joint_box",
-                                     "collision", "terminal")
+    # ``torque_peak`` is no longer the final entry -- ``collision_peak`` was
+    # appended after it -- but the CONTRACT the original assertion protected is
+    # that the order is append-only, so every index a checkpoint recorded still
+    # resolves to the same group.  Pin the prefix instead of the tail.
+    assert CONSTRAINT_GROUPS[:6] == ("torque", "velocity", "joint_box",
+                                     "collision", "terminal", "torque_peak")
     al = AugmentedLagrangian()
     assert "torque_peak" in al.lam and "torque_peak" in al.rho
     assert al.rho["torque_peak"] < al.rho["torque"]
@@ -223,9 +226,13 @@ def test_peak_lambda_rises_while_the_mean_lambda_does_not(violating):
 
 def test_al_weights_reach_the_two_halves_separately(violating):
     b, cost, _out = violating
+    # A dict ``lam_init`` must name EVERY group -- ``_per_group`` raises on a
+    # missing one rather than silently defaulting it -- so appending a group to
+    # ``CONSTRAINT_GROUPS`` reaches every literal like this one.
     al = AugmentedLagrangian(ALConfig(lam_init={"torque": 2.0, "torque_peak": 7.0,
                                                 "velocity": 1.0, "joint_box": 1.0,
-                                                "collision": 1.0, "terminal": 1.0}))
+                                                "collision": 1.0, "terminal": 1.0,
+                                                "collision_peak": 1.0}))
     out = _fwd(b, cost, weights=al.weights())
     expect = (2.0 * cost.cfg.w_torque * out.raw["torque"]
               + 7.0 * cost.cfg.w_torque_peak * out.raw["torque_peak"])
@@ -271,13 +278,20 @@ def test_metric_names_line_up_with_the_key_tuples():
         f"v_{k}" for k in VIOL_KEYS
     )
     assert METRIC_NAMES[VIOL_OFFSET] == "v_terminal"
-    assert METRIC_NAMES[VIOL_OFFSET + len(VIOL_KEYS) - 1] == "v_torque_peak"
+    # ``torque_peak``'s index is pinned where it has always been; the tail moved
+    # when ``collision_peak`` was appended after it.  Both assertions together
+    # are the append-only contract: old indices fixed, new group at the end.
+    assert METRIC_NAMES[VIOL_OFFSET + 5] == "v_torque_peak"
+    assert METRIC_NAMES[VIOL_OFFSET + len(VIOL_KEYS) - 1] == "v_collision_peak"
     # 5 losses + len(TERM_KEYS).  The literal is here to catch an ACCIDENTAL
     # shift; a deliberate append to TERM_KEYS updates it (7 terms -> 12 before
-    # section 7d added ``effort``, 8 -> 13 after).
+    # section 7d added ``effort``, 8 -> 13 after, 9 -> 14 with ``waist_aim``,
+    # 10 -> 15 with ``waist_yaw_vel``).  ``collision_peak`` is a VIOLATION
+    # group, not a term, so it does not move this offset -- it extends the
+    # block that starts at it.
     from amortized_opt.train_cost import LOSS_KEYS, TERM_KEYS
 
-    assert VIOL_OFFSET == len(LOSS_KEYS) + len(TERM_KEYS) == 14
+    assert VIOL_OFFSET == len(LOSS_KEYS) + len(TERM_KEYS) == 15
     assert set(VIOL_KEYS) == set(CONSTRAINT_GROUPS)
     assert len(METRIC_NAMES) == len(set(METRIC_NAMES))
 

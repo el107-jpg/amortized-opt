@@ -164,6 +164,17 @@ class WeightSchedule:
     torque_peak_start: int = 0
     torque_peak_ramp: int = 1_000
 
+    # ---- the collision PEAK sub-term (``CostConfig.w_collision_peak``) ------
+    #: Same shape of ramp as ``torque_peak``, and for the same reason: the
+    #: smooth-max half is scaled by the WORST (knot, point, drum) element
+    #: rather than by an average, so switching it on at full price is a step
+    #: change in the objective.  Unlike ``torque_peak`` there is nothing to
+    #: seed on a resume -- the peak half did not previously exist in any form,
+    #: so ``lam_collision_peak`` starts at ``lam_init`` and the ramp is what
+    #: keeps the loss continuous.
+    collision_peak_start: int = 0
+    collision_peak_ramp: int = 1_000
+
     # ---- the WAIST-UPRIGHT pair (section 7d) --------------------------------
     #: ``CostConfig.waist_pr_box`` and ``CostConfig.w_waist_upright`` share one
     #: ramp, driving ``weights["waist_box"]`` and ``weights["posture_upright"]``.
@@ -215,6 +226,10 @@ class WeightSchedule:
         span = max(int(self.torque_peak_ramp), 1)
         return _smoothstep((int(step) - int(self.torque_peak_start)) / span)
 
+    def collision_peak_alpha(self, step: int) -> float:
+        span = max(int(self.collision_peak_ramp), 1)
+        return _smoothstep((int(step) - int(self.collision_peak_start)) / span)
+
     def waist_alpha(self, step: int) -> float:
         span = max(int(self.waist_ramp), 1)
         return _smoothstep((int(step) - int(self.waist_start)) / span)
@@ -250,6 +265,7 @@ class WeightSchedule:
             "velocity": lim,
             "joint_box": lim,
             "torque_peak": self.torque_peak_alpha(step),
+            "collision_peak": self.collision_peak_alpha(step),
         }
 
 
@@ -357,6 +373,11 @@ def phase2_al_config(rho_scale: float = 1.0, **kw) -> ALConfig:
         # by 2.8 N.m -- against a shared ``lam_torque`` of 7.2, which is what
         # destabilized the two continuations in section 7b.
         "torque_peak": 5.0e-4 * rho_scale,
+        # m of per-sample MAX penetration.  The same tensor ``collision``
+        # integrates -- see ``ALConfig.rho`` -- so this is 1/10 of that group's
+        # step, reflecting that the penalty it scales is undiluted where the
+        # mean is divided by ~2 100-4 200, not that the violation is smaller.
+        "collision_peak": 0.5 * rho_scale,
     }
     d = dict(lam_init=1.0, rho=rho, lam_min=0.1, lam_max=100.0, ema=0.5, decay=0.999)
     d.update(kw)
@@ -1558,9 +1579,14 @@ TERM_KEYS: tuple[str, ...] = (
 )
 #: APPEND-ONLY (``train_phase2`` reads the block positionally out of the metrics
 #: tensor).  ``torque_peak`` is the MAX-shaped half of the torque hinge and its
-#: own AL group -- see :mod:`amortized_opt.lagrangian`.
+#: own AL group; ``collision_peak`` is the same for the collision hinge -- see
+#: :mod:`amortized_opt.lagrangian`.  ``collision_peak`` integrates the same
+#: per-sample max penetration as ``collision``, so the two columns are equal by
+#: construction; they are separate groups because the PENALTIES they scale
+#: differ by ``n_seen``.
 VIOL_KEYS: tuple[str, ...] = (
     "terminal", "collision", "torque", "velocity", "joint_box", "torque_peak",
+    "collision_peak",
 )
 DIAG_KEYS: tuple[str, ...] = (
     "terminal_region_dist", "contact_pos_err", "contact_speed_err",
@@ -1987,17 +2013,26 @@ def build_optimizer(model, cfg: Phase2Config):
 def migrate_al_state(state: dict | None) -> dict | None:
     """Make a checkpointed AL state usable by the CURRENT constraint groups.
 
-    The only migration so far is ``torque_peak``.  Before it was its own group
-    the peak half of the torque term was multiplied by exactly ``lam_torque``,
-    so seeding ``lam["torque_peak"] = lam["torque"]`` is what makes the
-    objective CONTINUOUS across a resume; leaving it out would silently drop
-    the peak price back to ``lam_init`` (``AugmentedLagrangian.load_state_dict``
-    is a ``dict.update``), which on a resumed run means a step change in the
-    only term that moves the acceptance gate.
+    ``torque_peak`` needs a SEEDED multiplier.  Before it was its own group the
+    peak half of the torque term was multiplied by exactly ``lam_torque``, so
+    seeding ``lam["torque_peak"] = lam["torque"]`` is what makes the objective
+    CONTINUOUS across a resume; leaving it out would silently drop the peak
+    price back to ``lam_init`` (``AugmentedLagrangian.load_state_dict`` is a
+    ``dict.update``), which on a resumed run means a step change in the only
+    term that moves the acceptance gate.
 
-    ``avg_violation`` is deliberately NOT seeded: the stored value is a mean
-    over elements and the new group integrates a max, two quantities ~n_valid
-    apart, so the EMA is better off warming up from zero.
+    ``collision_peak`` deliberately does NOT get one.  It is not a regrouping
+    of a price that was already being paid -- the smooth-max half of the
+    collision term did not exist in any form before it -- so there is no
+    previous effective multiplier to preserve, and ``lam_init`` is the correct
+    starting point.  Continuity across the switch is the ramp's job
+    (``WeightSchedule.collision_peak_ramp``), not the multiplier's.  It is
+    listed here only so the ``groups`` record stays honest.
+
+    ``avg_violation`` is deliberately NOT seeded for either: for ``torque_peak``
+    the stored value is a mean over elements while the new group integrates a
+    max, two quantities ~n_valid apart, so the EMA is better off warming up
+    from zero.
 
     Returns a NEW dict (the caller's checkpoint payload is not mutated), or the
     argument unchanged when there is nothing to do.
@@ -2005,14 +2040,22 @@ def migrate_al_state(state: dict | None) -> dict | None:
     if not state:
         return state
     lam = dict(state.get("lam", {}))
+    groups = list(state.get("groups", [])) if "groups" in state else None
+    changed = False
     if "torque" in lam and "torque_peak" not in lam:
         lam["torque_peak"] = float(lam["torque"])
-        out = dict(state)
-        out["lam"] = lam
-        if "groups" in out and "torque_peak" not in out["groups"]:
-            out["groups"] = list(out["groups"]) + ["torque_peak"]
-        return out
-    return state
+        changed = True
+    for g in ("torque_peak", "collision_peak"):
+        if groups is not None and g not in groups:
+            groups.append(g)
+            changed = True
+    if not changed:
+        return state
+    out = dict(state)
+    out["lam"] = lam
+    if groups is not None:
+        out["groups"] = groups
+    return out
 
 
 def _wtensors(mult: dict[str, float], lam: dict[str, float], device, dtype):
@@ -2368,6 +2411,7 @@ def train_phase2(
                    "elapsed_s": now - t0,
                    "alpha": cfg.schedule.alpha(step, stage_a),
                    "alpha_tau_peak": cfg.schedule.torque_peak_alpha(step),
+                   "alpha_coll_peak": cfg.schedule.collision_peak_alpha(step),
                    "alpha_waist": cfg.schedule.waist_alpha(step),
                    "stage_a_open": stage_a,
                    "replay": replay.distribution(),

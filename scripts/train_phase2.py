@@ -132,6 +132,15 @@ def parse_args(argv=None):
     p.add_argument("--w-smooth-jerk", type=float, default=None,
                    help="override the restored jerk weight (default 1e-4)")
     p.add_argument("--w-collision", type=float, default=None)
+    p.add_argument("--w-collision-peak", type=float, default=None,
+                   help="price on the SMOOTH-MAX half of the collision term -- "
+                        "the reduction ok_collision's zero-tolerance check "
+                        "actually corresponds to.  The mean is diluted by "
+                        "~2100-4200 (knot, point, drum) pairs.  OFF by default; "
+                        "try ~500 (the hinge is in metres, ~0.03 at a 27 mm "
+                        "penetration).  Priced by its own AL group")
+    p.add_argument("--collision-peak-ramp", type=int, default=1000,
+                   help="steps over which the collision peak half ramps 0 -> 1")
     # --- section 7d: keep the waist upright (pitch/roll only, yaw stays free) --
     p.add_argument("--waist-pr-box", type=float, default=None,
                    help="shrink the joint box on waist_pitch/waist_roll to this "
@@ -410,6 +419,8 @@ def main(argv=None) -> int:
                 "w_collision_drum": float(args.w_collision),
                 "w_collision_under": float(args.w_collision),
                 "w_collision_self": float(args.w_collision)}),
+            **({} if args.w_collision_peak is None
+               else {"w_collision_peak": float(args.w_collision_peak)}),
             **({} if args.waist_pr_box is None
                else {"waist_pr_box": float(args.waist_pr_box)}),
             **({} if args.w_waist_upright is None
@@ -455,6 +466,7 @@ def main(argv=None) -> int:
     cfg.schedule = replace(
         cfg.schedule,
         torque_peak_ramp=int(args.torque_peak_ramp),
+        collision_peak_ramp=int(args.collision_peak_ramp),
         waist_ramp=int(args.waist_ramp),
         effort_ramp=int(args.effort_ramp),
         idle_ramp=int(args.idle_ramp),

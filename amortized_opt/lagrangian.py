@@ -71,10 +71,11 @@ __all__ = ["ALConfig", "AugmentedLagrangian", "CONSTRAINT_GROUPS"]
 
 #: The groups :class:`~amortized_opt.cost.FusedCost` reports violations for.
 #:
-#: ORDER IS STABLE and APPEND-ONLY: ``torque_peak`` is last so that any state
-#: (checkpointed ``lam`` dicts, saved ``groups`` lists, per-group ``rho``
-#: dicts) written before it existed still lines up.  It is a separate group
-#: from ``torque`` on purpose -- see the module docstring.
+#: ORDER IS STABLE and APPEND-ONLY: ``torque_peak`` and then ``collision_peak``
+#: are last so that any state (checkpointed ``lam`` dicts, saved ``groups``
+#: lists, per-group ``rho`` dicts) written before they existed still lines up.
+#: Each is a separate group from its mean-reduced sibling on purpose -- see the
+#: module docstring.
 CONSTRAINT_GROUPS: tuple[str, ...] = (
     "torque",
     "velocity",
@@ -82,6 +83,7 @@ CONSTRAINT_GROUPS: tuple[str, ...] = (
     "collision",
     "terminal",
     "torque_peak",
+    "collision_peak",
 )
 
 
@@ -113,6 +115,15 @@ class ALConfig:
             # 1/100 of ``torque``'s rho keeps the two multipliers on the same
             # timescale.
             "torque_peak": 0.005,
+            # m of per-sample MAX penetration -- the SAME tensor ``collision``
+            # integrates (that group's violation has always been a max, not a
+            # mean), so the ~n_valid rescaling that sets ``torque_peak``'s rho
+            # does not apply here.  What differs is the PENALTY each multiplier
+            # scales: the peak term is undiluted where the mean is divided by
+            # ~2 100-4 200, so an equal rho would move a much larger share of
+            # the loss per update.  1/10 of ``collision``'s is a conservative
+            # starting point, not a measured optimum.
+            "collision_peak": 20.0,
         }
     )
     #: Tolerated violation before the multiplier grows, in the same units the

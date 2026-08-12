@@ -244,6 +244,53 @@ class CostConfig:
     w_collision_drum: float = 100.0
     w_collision_under: float = 100.0
     w_collision_self: float = 100.0
+    #: Price on the SMOOTH-MAX of the collision hinge, alongside the three
+    #: mean-reduced sub-costs above.  The exact counterpart of
+    #: ``w_torque_peak``, and for the same reason: ``ok_collision`` is a
+    #: zero-tolerance check that no contact point penetrates any drum, while
+    #: the mean is diluted by ``n_seen`` = ``2 x S x P x D`` -- ~2 100 elements
+    #: at bucket 25 and ~4 200 at bucket 50 -- of which the overwhelming
+    #: majority are stick points nowhere near the drum they are being scored
+    #: against.  A single point 30 mm inside a drum head therefore moves the
+    #: mean by ~1e-5 while failing the case outright.
+    #:
+    #: UNLIKE the three means above, this half reduces the raw PENETRATION, not
+    #: the margin-softplus -- ``smooth_max`` over ``max(-sdf, 0)``.  Peaking the
+    #: hinge was tried and measured worse than the mean it was meant to fix
+    #: (2.9x gate separation against 3.9x): the softplus floors at 0.0066 m for
+    #: an element at zero clearance, every clean sample pays it, and a max over
+    #: a floor is mostly floor.  The penetration is exactly zero on a clear
+    #: element and separates 5.0x.  It is also what ``ok_collision`` thresholds
+    #: -- ``pen_count == 0``, no margin, no smoothing.  The margin and the
+    #: smoothing belong to the mean, whose job is dense shaping on the safe
+    #: side; this half's job is the gate.  See :meth:`FusedCost._collision`.
+    #:
+    #: The analogy to ``torque_peak`` is REAL but WEAKER, and the difference is
+    #: worth stating: torque violations are genuinely sparse (~0.27 % of ~850
+    #: elements at the median), so a mean truly cannot see them, and the peak
+    #: separates that gate 26x against the mean's 3.4x.  Collision violations
+    #: are NOT sparse -- measured on the champion's 243-case grid, a failing
+    #: case has a median of 10 penetrating elements at a median 35 mm depth --
+    #: so the mean does partially see them.  Expect a smaller win.
+    #:
+    #: ZERO by default, so every existing checkpoint and the section-3
+    #: validation weights stay bit-identical, and the smooth-max is not even
+    #: computed.  Scale: ``raw`` here is METRES OF PENETRATION -- 0 on a clear
+    #: sample, ~0.027 at the median failing case -- so a weight around 500 puts
+    #: the failing half around 14 against a live ``terminal`` of ~65 and a
+    #: collision mean of ~1, while a clean sample pays exactly nothing.  Priced
+    #: by its OWN augmented-Lagrangian group (``collision_peak``), NOT by
+    #: ``weights["collision"]``.
+    w_collision_peak: float = 0.0
+    #: ``"pnorm"`` / ``"lse"``, exactly as ``torque_peak_mode``.
+    collision_peak_mode: str = "pnorm"
+    #: p-norm exponent.  The reduction runs on ``h / max(h)`` so the exponent
+    #: never sees a value above 1 and cannot overflow fp32.
+    collision_peak_p: float = 12.0
+    #: LSE temperature, METRES.  Only read when ``collision_peak_mode == "lse"``.
+    #: Two decades below ``torque_peak_temp`` because this hinge is in metres,
+    #: not newton-metres.
+    collision_peak_temp: float = 5.0e-4
     #: Waypoints at the end of a hand's horizon whose contact geoms are exempt
     #: from the target drum, and at the start exempt from the drum the pose is
     #: departing.  Both mirror ``TrajectoryScorer``.
@@ -443,6 +490,14 @@ class CostConfig:
             raise ValueError("torque_peak_p must be >= 1")
         if self.torque_peak_temp <= 0.0:
             raise ValueError("torque_peak_temp must be > 0")
+        if self.collision_peak_mode not in ("pnorm", "lse"):
+            raise ValueError(f"collision_peak_mode={self.collision_peak_mode!r}")
+        if self.collision_peak_p < 1.0:
+            raise ValueError("collision_peak_p must be >= 1")
+        if self.collision_peak_temp <= 0.0:
+            raise ValueError("collision_peak_temp must be > 0")
+        if self.w_collision_peak < 0.0:
+            raise ValueError("w_collision_peak must be >= 0")
         if self.reduction not in ("mean", "sum"):
             raise ValueError(f"reduction={self.reduction!r}")
         if self.n_sub < 1:
@@ -1063,6 +1118,7 @@ class FusedCost:
             smooth=1.0, posture=1.0,
             terminal_region=1.0, terminal_velocity=1.0, terminal_elev=1.0,
             posture_mid=1.0, posture_elbow=1.0, torque_peak=1.0,
+            collision_peak=1.0,
             posture_upright=1.0, waist_box=1.0, effort=1.0, waist_aim=1.0,
             posture_idle=1.0, waist_yaw_vel=1.0,
         )
@@ -1083,11 +1139,20 @@ class FusedCost:
             + (cfg.w_terminal_velocity * w["terminal_velocity"]) * raw["terminal_velocity"]
             + (cfg.w_terminal_elev * w["terminal_elev"]) * raw["terminal_elev"]
         )
+        # As with ``torque``, the two reductions of the collision hinge carry
+        # INDEPENDENT multipliers: ``w["collision"]`` prices the three
+        # mean-reduced sub-costs, ``w["collision_peak"]`` the smooth max over
+        # the same hinges.  Separate augmented-Lagrangian groups so the peak
+        # price can rise while the mean price relaxes -- raising a weight
+        # against a multiplier calibrated on the other reduction is what
+        # destabilized the section-7b continuations.  At
+        # ``cfg.w_collision_peak = 0`` (the default) the second product is
+        # exactly zero and the term is bit-identical to the mean-only form.
         terms["collision"] = w["collision"] * (
             cfg.w_collision_drum * raw["collision_drum"]
             + cfg.w_collision_under * raw["collision_under"]
             + cfg.w_collision_self * raw["collision_self"]
-        )
+        ) + w["collision_peak"] * cfg.w_collision_peak * raw["collision_peak"]
         # The two reductions of the torque hinge carry INDEPENDENT multipliers:
         # ``w["torque"]`` prices the mean, ``w["torque_peak"]`` the smooth max.
         # They are separate augmented-Lagrangian groups (see
@@ -1171,6 +1236,15 @@ class FusedCost:
         v_max = None
         min_sdf = None
         n_seen = 0.0
+        # The smooth-max half is built from the SAME hinges the means reduce,
+        # collected flat and concatenated so ONE :func:`smooth_max` sees every
+        # (knot, point, drum) pair of both hands and all three collision types
+        # -- a per-hand max combined afterwards would be a max of p-norms, not
+        # the p-norm of the union.  Only assembled when the term is priced: the
+        # concatenation is ~9 k floats per sample and the default weight is 0.
+        want_peak = cfg.w_collision_peak > 0.0
+        peak_h: list[torch.Tensor] = []
+        peak_m: list[torch.Tensor] = []
         # Domain randomization moves the drums; when the caller supplies the
         # per-sample head centres (fix B) the collision scene is rebuilt from
         # them, so it agrees with the terminal cost and the goal tokens.
@@ -1231,6 +1305,7 @@ class FusedCost:
             hd = _softplus_hinge(cfg.collision_margin - sdf_b, cfg.beta_collision)
             hu = _softplus_hinge(cfg.collision_margin - sdf_u, cfg.beta_collision)
             w = keep * smask
+            wf = w.reshape(B, -1) if want_peak else None
 
             # --- time-bucketed drum collision (diagnostic only) ---------
             # Per-timestep hinge, mean over (points, drums) for this hand
@@ -1272,15 +1347,30 @@ class FusedCost:
             s_h = point_sphere_sdf(pts, hc, self.c_head_r)
             sdf_self = torch.minimum(s_t, s_h) - self.c_pt_radii.view(1, 1, P)
             ws = m_hand[hand].view(B, S, 1)
-            pen_s = pen_s + (
-                _softplus_hinge(cfg.collision_margin - sdf_self, cfg.beta_collision) * ws
-            ).sum(dim=(1, 2))
+            hs = _softplus_hinge(cfg.collision_margin - sdf_self, cfg.beta_collision)
+            pen_s = pen_s + (hs * ws).sum(dim=(1, 2))
 
             # --- raw violation (penetration depth), for the multipliers -------
             big = torch.full_like(sdf_b, 1e3)
             vd = torch.where(w > 0.5, (-sdf_b).clamp_min(0.0), torch.zeros_like(sdf_b))
             vu = torch.where(w > 0.5, (-sdf_u).clamp_min(0.0), torch.zeros_like(sdf_u))
             vs = (-sdf_self).clamp_min(0.0) * ws
+            if want_peak:
+                # The peak half reduces the PENETRATION, not the margin-softplus
+                # the means reduce.  Measured on the champion's 243-case grid,
+                # peaking the hinge separates the acceptance gate 2.9x -- WORSE
+                # than the mean's 3.9x -- because the softplus has a floor
+                # (0.0066 m at zero clearance, 0.0035 m at the 5 mm margin) that
+                # every clean sample pays, and a max over a floor is mostly
+                # floor.  The penetration is exactly zero on a clear element, so
+                # the same reduction separates 5.0x.  It is also the quantity
+                # ``ok_collision`` actually thresholds: the gate is
+                # ``pen_count == 0``, with no margin and no smoothing.  The
+                # margin and the softplus belong to the MEAN, whose job is dense
+                # shaping on the safe side; the peak's job is the gate.
+                peak_h += [vd.reshape(B, -1), vu.reshape(B, -1),
+                           vs.reshape(B, -1)]
+                peak_m += [wf, wf, ws.expand(B, S, P).reshape(B, -1)]
             hand_max = torch.maximum(
                 torch.maximum(vd.amax(dim=(1, 2, 3)), vu.amax(dim=(1, 2, 3))),
                 vs.amax(dim=(1, 2)),
@@ -1310,7 +1400,27 @@ class FusedCost:
         raw["collision_drum"] = pen_d / denom
         raw["collision_under"] = pen_u / denom
         raw["collision_self"] = pen_s / denom
+        if want_peak:
+            raw["collision_peak"] = smooth_max(
+                torch.cat(peak_h, dim=1), torch.cat(peak_m, dim=1),
+                cfg.collision_peak_mode, cfg.collision_peak_p,
+                cfg.collision_peak_temp, dims=(1,),
+            )
+        else:
+            # Exactly zero, with exactly zero gradient -- the hot path never
+            # builds the concatenation and the term is bit-identical to the
+            # pre-peak form.
+            raw["collision_peak"] = torch.zeros_like(pen_d)
         viol["collision"] = v_max.detach() if v_max is not None else pen_d.detach() * 0
+        # The peak group integrates the SAME per-sample max penetration as
+        # ``collision``.  That is not an oversight: ``viol["collision"]`` has
+        # always been a max (unlike ``viol["torque"]``, which is a mean), so
+        # there is no second quantity to hand the new group, and making the
+        # mean group's violation a mean would change the multiplier dynamics of
+        # every existing run.  The two groups are still worth separating -- the
+        # PENALTIES they scale differ by ``n_seen``, and each carries its own
+        # ``rho`` -- but they will track the same signal.  See DECISIONS.
+        viol["collision_peak"] = viol["collision"]
         diag["collision_min_sdf"] = min_sdf.detach()
         diag["collision_pen_max"] = v_max.detach()
         # Per-type breakdown (the three sub-costs before weighting)
