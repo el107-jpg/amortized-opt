@@ -21,7 +21,19 @@ lead and the whole phase-2 training distribution were identified against it:
 * the FOH position ramp across the ``decimation`` substeps with its matching
   velocity target -- this is what ``amortized_opt.pd_sim`` models analytically,
   and dropping it would invalidate the fitted lead;
-* gravity/Coriolis feedforward torque, for the same reason.
+* gravity/Coriolis feedforward torque, for the same reason;
+* the arms' inertial reaction on the WAIST rows, fed forward from the
+  commanded acceleration (``waist_reaction_ff``) -- the commanded part of the
+  load that shoves the waist off its track is known a tick ahead, so it is
+  cancelled here instead of eaten by the weak waist pitch/roll servo (Kp 40,
+  25 N*m effort).  NOTE this is a deliberate plant improvement, not gap
+  closure: ``pd_sim`` couples the joints through the frozen mass matrix and
+  so models the shove; with the feedforward ON, the real waist tracks BETTER
+  than the analytic model predicts (a conservative mismatch) until pd_sim
+  grows the mirrored term;
+* per-tick gain modulation via ``plant(..., gain_scale=...)`` -- the
+  strike-window impedance schedule (``amortized_opt.impedance``), which both
+  plants accept through the same kwarg.
 
 The articulation cfg and the drum-kit/layout paths come from :mod:`g1_scene`,
 the standalone port of what this module used to import out of ``g1_drummer``.
@@ -196,6 +208,35 @@ def _install():
                 self._rnea = BatchedRNEA.from_urdf(device=self.device).to(
                     self.device, torch.float32)
             self._tau_lim = None
+            # waist reaction feedforward: previous tick's commanded velocity
+            # (for the commanded acceleration) and the waist rows to correct.
+            self._waist_cols = torch.tensor(
+                [i for i, n in enumerate(G1_UPPER_BODY_JOINTS)
+                 if n.startswith("waist_")], device=self.device)
+            self._vcmd_prev = torch.zeros(self.num_envs, N_DOF, device=self.device)
+
+            # strike-impedance gain modulation: map each actuator group onto
+            # the optimizer's joint columns and snapshot the nominal gains, so
+            # ``plant(gain_scale=...)`` can scale for one tick and restore.
+            # Only meaningful for the explicit IdealPD actuators -- an implicit
+            # actuator's ``stiffness`` tensor is a cfg mirror, not what PhysX
+            # runs -- hence the ``use_ideal_pd`` guard in ``_apply_gain_scale``.
+            self._act_gain_map = []
+            jid_to_col = {int(j): k for k, j in enumerate(self.joint_ids)}
+            for act in self.robot.actuators.values():
+                jidx = act.joint_indices
+                if isinstance(jidx, slice):
+                    jidx = range(*jidx.indices(self.robot.num_joints))
+                pairs = [(p, jid_to_col[int(j)]) for p, j in enumerate(jidx)
+                         if int(j) in jid_to_col]
+                if pairs:
+                    self._act_gain_map.append((
+                        act,
+                        torch.tensor([p for p, _ in pairs], device=self.device),
+                        torch.tensor([c for _, c in pairs], device=self.device),
+                        act.stiffness.clone(), act.damping.clone(),
+                    ))
+            self._gains_scaled = False
             self._lag_buf: torch.Tensor | None = None
             self._lag_n = 0
             self._configure_lag()
@@ -292,21 +333,32 @@ def _install():
                 self._lag_k = torch.randint(int(lo), int(hi) + 1, (self.num_envs,),
                                             device=self.device)
 
-        def _feedforward(self, q: torch.Tensor, qd: torch.Tensor) -> torch.Tensor:
+        def _feedforward(self, q: torch.Tensor, qd: torch.Tensor,
+                         tau_waist: torch.Tensor | None = None) -> torch.Tensor:
             """Gravity + Coriolis at the measured state, clipped to the effort box.
 
-            ``qdd = 0``, i.e. the inertial term is left OUT.  The repo's env can
-            include it (``dynamics_ff_inertial_enable``) driven by the commanded
-            acceleration; here the command is a trajectory and the honest
-            commanded acceleration is available -- but including it would make
-            the plant a different plant from the one ``amortized_opt.pd_sim``
+            ``qdd = 0`` on the ARM rows, i.e. their own inertial term is left
+            OUT.  The repo's env can include it (``dynamics_ff_inertial_enable``)
+            driven by the commanded acceleration -- but that would make the
+            plant a different plant from the one ``amortized_opt.pd_sim``
             models and the lead was fitted against.  Flagged in the README as a
             deviation worth an A/B, not decided here.
+
+            The WAIST rows are the exception: ``tau_waist`` carries the arms'
+            reaction torque ``[M(q) qdd_cmd]_waist`` (see ``plant``) so the
+            weak pitch/roll servo (Kp 40, 25 N*m) is not left to eat a load
+            that was knowable a tick in advance.  Unlike gravity ff this is
+            NOT gap closure -- pd_sim models the coupling through its frozen
+            mass matrix -- it is a deliberate improvement that makes the real
+            waist track better than the model predicts, until pd_sim grows
+            the mirrored term.
             """
             if self._rnea is None:
                 return None
             z = torch.zeros_like(q)
             tau = self._rnea.rnea(q, qd, z)
+            if tau_waist is not None:
+                tau[:, self._waist_cols] += tau_waist
             if self._tau_lim is None:
                 from amortized_opt.limits import isaac_effort_limits
                 self._tau_lim = torch.as_tensor(
@@ -314,16 +366,39 @@ def _install():
                     dtype=tau.dtype)
             return torch.clamp(tau, -self._tau_lim, self._tau_lim)
 
+        def _apply_gain_scale(self, gain_scale) -> None:
+            """Scale (or restore) the actuator Kp/Kd for the coming tick."""
+            if gain_scale is None:
+                if self._gains_scaled:
+                    for act, loc, _col, kp0, kd0 in self._act_gain_map:
+                        act.stiffness[:, loc] = kp0[:, loc]
+                        act.damping[:, loc] = kd0[:, loc]
+                    self._gains_scaled = False
+                return
+            if not self.rl_cfg.use_ideal_pd:
+                raise RuntimeError(
+                    "gain_scale needs use_ideal_pd=True: implicit actuators do "
+                    "not read their stiffness tensors back at runtime")
+            kp_mul, kd_mul = gain_scale
+            for act, loc, col, kp0, kd0 in self._act_gain_map:
+                act.stiffness[:, loc] = kp0[:, loc] * kp_mul[:, col]
+                act.damping[:, loc] = kd0[:, loc] * kd_mul[:, col]
+            self._gains_scaled = True
+
         @torch.no_grad()
         def plant(self, prev_cmd: torch.Tensor, cmd: torch.Tensor,
-                  q: torch.Tensor, qd: torch.Tensor):
+                  q: torch.Tensor, qd: torch.Tensor,
+                  gain_scale: tuple[torch.Tensor, torch.Tensor] | None = None):
             """One control tick: FOH ramp over ``decimation`` physics substeps.
 
             Signature matches ``BatchedPDSim.step`` so :class:`DrumMPCLoop` runs
             unchanged against either plant -- which is what makes the Isaac
-            latency histogram comparable to the analytic one.
+            latency histogram comparable to the analytic one.  ``gain_scale``
+            is the per-tick ``(kp_mul, kd_mul)`` pair of the strike-impedance
+            schedule; gains snap back to nominal on the first tick without it.
             """
             ids = self.joint_ids
+            self._apply_gain_scale(gain_scale)
             if self._lag_n > 0:
                 # residual command lag, per env, in physics substeps (RL prio 3)
                 self._lag_buf = torch.roll(self._lag_buf, 1, dims=0)
@@ -332,6 +407,22 @@ def _install():
                 cmd = self._lag_buf.gather(
                     0, idx.view(1, -1, 1).expand(1, -1, N_DOF)).squeeze(0)
             start = prev_cmd if self.rl_cfg.foh_ramp else cmd
+            tau_waist = None
+            if self._rnea is not None and self.rl_cfg.waist_reaction_ff:
+                # The arms' reaction on the waist, from the COMMANDED
+                # acceleration -- the very velocity target the FOH ramp sends,
+                # differenced across the tick boundary.  Waist columns zeroed:
+                # the waist rows of M(q) qdd are then the arms' coupling alone,
+                # cancelling the load without boosting the waist's own
+                # bandwidth.  M(q) is held at the tick-start measured pose (it
+                # moves little in 20 ms; qdd_cmd is constant over the tick).
+                v_cmd = (cmd - start) / CONTROL_DT
+                qdd_cmd = (v_cmd - self._vcmd_prev) / CONTROL_DT
+                self._vcmd_prev = v_cmd
+                qdd_cmd[:, self._waist_cols] = 0.0
+                q0 = self.robot.data.joint_pos[:, ids]
+                tau_waist = self._rnea.mass_matrix_torque(
+                    q0, qdd_cmd)[:, self._waist_cols]
             for i in range(DECIMATION):
                 frac = (i + 1) / DECIMATION if self.rl_cfg.foh_ramp else 1.0
                 tgt = start + frac * (cmd - start)
@@ -342,8 +433,8 @@ def _install():
                 if self._rnea is not None:
                     qm = self.robot.data.joint_pos[:, ids]
                     vm = self.robot.data.joint_vel[:, ids]
-                    self.robot.set_joint_effort_target(self._feedforward(qm, vm),
-                                                       joint_ids=ids)
+                    self.robot.set_joint_effort_target(
+                        self._feedforward(qm, vm, tau_waist), joint_ids=ids)
                 if self.rl_cfg.pin_pelvis:
                     self.robot.write_root_pose_to_sim(self._pin_pose)
                     self.robot.write_root_velocity_to_sim(self._pin_vel)
@@ -380,6 +471,7 @@ def _install():
             self.joint_pos_target[env_ids] = jp[env_ids]
             self._foh_prev[env_ids] = q[env_ids] if q.shape[0] == self.num_envs \
                 else q
+            self._vcmd_prev[env_ids] = 0.0
             self.scene.write_data_to_sim()
 
     DrumRLEnv = _DrumRLEnv

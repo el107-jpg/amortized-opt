@@ -437,13 +437,30 @@ class BatchedPDSim:
         ki: torch.Tensor | None = None,
         Minv: torch.Tensor | None = None,
         integral: torch.Tensor | None = None,
+        gain_scale: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Advance exactly ONE 20 ms control tick (``substeps`` PD substeps).
 
         This is what the simulated-MPC loop calls: plan, execute one tick,
         re-plan from where the servo actually got to.  Returns ``(qa, va, integral)``
         where ``integral`` is the updated accumulated error (``None`` when ki=0).
+
+        ``gain_scale`` is an optional ``(kp_mul, kd_mul)`` pair of ``(B, n)``
+        multipliers applied ON TOP of the resolved gains for THIS tick only --
+        the strike-window impedance schedule (:mod:`amortized_opt.impedance`).
+        The Isaac plant accepts the same kwarg, so the schedule does not fork
+        the two plants.
         """
+        if gain_scale is not None:
+            B = x_prev.shape[0]
+            if kp is None or kd is None:
+                kp_n, kd_n, ki_n = self.nominal_gains(B)
+                kp = kp_n if kp is None else kp
+                kd = kd_n if kd is None else kd
+                if ki is None:
+                    ki = ki_n
+            kp = kp * gain_scale[0]
+            kd = kd * gain_scale[1]
         x_cmd = torch.stack([x_prev, x_next], dim=1)
         qa_out, va_out, int_out = self.rollout(
             x_cmd, qa0=qa, va0=va, kp=kp, kd=kd, ki=ki, Minv=Minv, integral0=integral,

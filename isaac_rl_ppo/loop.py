@@ -107,6 +107,7 @@ class DrumMPCLoop:
         plant,
         noise: ParameterNoise | None = None,
         safety=None,
+        impedance=None,
         record: bool = False,
     ):
         self.sched = schedule
@@ -115,6 +116,10 @@ class DrumMPCLoop:
         self.plant = plant
         self.noise = noise
         self.safety = safety
+        #: Optional :class:`amortized_opt.impedance.StrikeImpedance` -- softens
+        #: the striking hand's elbow/wrist gains around each hit.  Both plants
+        #: take the multipliers through the same ``gain_scale`` kwarg.
+        self.impedance = impedance
         self.stats = LoopStats()
         self.record = bool(record)
         self.history: list[TickRecord] = []
@@ -145,11 +150,17 @@ class DrumMPCLoop:
 
         # ---- 4. plant ----------------------------------------------------------
         q_before = q
-        q, qd = self.plant(self.mpc.prev_cmd, cmd, q, qd)
+        if self.impedance is not None:
+            q, qd = self.plant(self.mpc.prev_cmd, cmd, q, qd,
+                               gain_scale=self.impedance.scales(res.hit_index))
+        else:
+            q, qd = self.plant(self.mpc.prev_cmd, cmd, q, qd)
         t3 = time.perf_counter()
 
         # ---- 5. clock ----------------------------------------------------------
         fired = self.sched.advance()
+        if self.impedance is not None:
+            self.impedance.observe_fired(fired)
 
         # ---- 6. reward, on the EXECUTED state ----------------------------------
         terms, cs = self.reward.step(

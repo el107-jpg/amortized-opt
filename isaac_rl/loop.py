@@ -107,6 +107,7 @@ class DrumMPCLoop:
         plant,
         noise: ParameterNoise | None = None,
         safety=None,
+        impedance=None,
         record: bool = False,
         safety_target_exempt: bool = True,
     ):
@@ -116,6 +117,10 @@ class DrumMPCLoop:
         self.plant = plant
         self.noise = noise
         self.safety = safety
+        #: Optional :class:`amortized_opt.impedance.StrikeImpedance` -- softens
+        #: the striking hand's elbow/wrist gains around each hit.  Both plants
+        #: take the multipliers through the same ``gain_scale`` kwarg.
+        self.impedance = impedance
         #: Hand the filter the drum each hand is currently aiming at, so its
         #: clearance stage exempts the tip from its OWN target.  See the note in
         #: :meth:`tick`.  ``False`` reproduces the RL-1b behaviour.
@@ -163,12 +168,18 @@ class DrumMPCLoop:
         # Accept both rather than forcing every caller to write an adapter
         # lambda -- an un-adapted ``sim.step`` used to fail with a bare
         # "too many values to unpack" a hundred ticks into a run.
-        out = self.plant(self.mpc.prev_cmd, cmd, q, qd)
+        if self.impedance is not None:
+            out = self.plant(self.mpc.prev_cmd, cmd, q, qd,
+                             gain_scale=self.impedance.scales(res.hit_index))
+        else:
+            out = self.plant(self.mpc.prev_cmd, cmd, q, qd)
         q, qd = out[0], out[1]
         t3 = time.perf_counter()
 
         # ---- 5. clock ----------------------------------------------------------
         fired = self.sched.advance()
+        if self.impedance is not None:
+            self.impedance.observe_fired(fired)
 
         # ---- 6. reward, on the EXECUTED state ----------------------------------
         terms, cs = self.reward.step(
