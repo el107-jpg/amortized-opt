@@ -47,6 +47,7 @@ import torch
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
 from .fk import ChainFK
+from .impedance import StrikeImpedance, StrikeImpedanceConfig
 from .lead import is_schedule, lead_fraction, lead_waypoints_np, schedule_fraction
 from .limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from .pd_sim import BatchedPDSim, PDSimConfig, frozen_minv
@@ -271,6 +272,13 @@ class MPCGenConfig:
     #: ``cmd_lead_s``: the lead is a function of the servo it was fitted against.
     kp_scale: float | tuple[float, ...] = 1.0
     kd_scale: float | tuple[float, ...] = 1.0
+    #: Strike-window impedance: soften the striking hand's elbow+wrist Kp/Kd
+    #: around its hit (see :mod:`amortized_opt.impedance` -- less impact torque
+    #: reflected into the shoulder and waist).  ``None`` = nominal gains, the
+    #: shipped behaviour.  Unlike ``kp_scale`` this is per-tick and per-hand,
+    #: and it leaves the plant outside the hit windows bit-identical, so the
+    #: fitted lead stays valid away from the strike.
+    strike_impedance: StrikeImpedanceConfig | None = None
     #: Integral gain for PID control (N·m/rad·s).  0 = pure PD (default).
     ki: float = 0.0
     #: Anti-windup clamp on the integral error, in rad·s.  0 = no clamp.
@@ -571,6 +579,10 @@ class MPCGenerator:
             if cfg.randomize_gains
             else self.sim.nominal_gains(1)
         )
+        imp = (
+            StrikeImpedance(cfg.strike_impedance, batch=1, device=self.device)
+            if cfg.strike_impedance is not None else None
+        )
 
         steps = max_steps if max_steps is not None else cfg.max_steps
         if steps is None:
@@ -740,11 +752,20 @@ class MPCGenerator:
             if cmd is not traj[0]:
                 traj = traj.copy()
                 traj[0] = cmd
+            gs = None
+            if imp is not None:
+                # Pre-decrement ``hit_index``: an active hand has kh >= 1 and
+                # strikes at the END of the tick with kh == 1, so kh - 1 is
+                # this tick's ticks-to-hit (idle hands go negative = no well).
+                gs = imp.scales(torch.tensor(
+                    [[float(hit_index["left"] - 1), float(hit_index["right"] - 1)]],
+                    device=self.device))
             qa, va, int_new = self.sim.step(
                 self._t(prev_cmd)[None, :], self._t(cmd)[None, :],
                 self._t(q)[None, :], self._t(qd)[None, :],
                 kp=kp, kd=kd, ki=ki, Minv=Minv,
                 integral=self._t(integral)[None, :] if integral is not None else None,
+                gain_scale=gs,
             )
             if integral is not None:
                 integral = int_new[0].detach().cpu().numpy()
@@ -770,6 +791,9 @@ class MPCGenerator:
             # ---- per-hand post-hit reset ----
             t_next = t_start + (step + 1) * dt
             fired = [h for h in HANDS if hit_index[h] == 0]
+            if imp is not None:
+                imp.observe_fired(torch.tensor(
+                    [["left" in fired, "right" in fired]], device=self.device))
             for h in fired:
                 hit_steps.append((step + 1, h, int(snap.goal[h].drum)))
                 recent[h] = (int(snap.goal[h].drum), int(cfg.departure_exempt_wp))

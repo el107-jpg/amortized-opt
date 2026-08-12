@@ -84,6 +84,12 @@ def main(argv=None) -> int:
     p.add_argument("--noise-mode", default="film")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-cost", action="store_true")
+    p.add_argument("--strike-impedance", action="store_true",
+                   help="soften elbow+wrist Kp/Kd around each hit")
+    p.add_argument("--imp-kp", type=float, default=0.5)
+    p.add_argument("--imp-kd", type=float, default=0.7)
+    p.add_argument("--imp-window", type=int, default=3,
+                   help="ramp ticks before AND after the hit")
     p.add_argument("--out", default="")
     args = p.parse_args(argv)
 
@@ -98,9 +104,10 @@ def main(argv=None) -> int:
     gen = torch.Generator(device=dev); gen.manual_seed(args.seed)
     kp, kd, ki = sim.sample_gains(args.envs, generator=gen)
 
-    def plant(prev_cmd, cmd, q, qd):
+    def plant(prev_cmd, cmd, q, qd, gain_scale=None):
         Minv = torch.linalg.inv(mass_matrix(rnea, q))
-        q_next, qd_next, _int = sim.step(prev_cmd, cmd, q, qd, kp=kp, kd=kd, ki=ki, Minv=Minv)
+        q_next, qd_next, _int = sim.step(prev_cmd, cmd, q, qd, kp=kp, kd=kd, ki=ki, Minv=Minv,
+                                         gain_scale=gain_scale)
         return q_next, qd_next
 
     noise = None
@@ -120,8 +127,15 @@ def main(argv=None) -> int:
     qd0 = torch.zeros_like(q0)
     mpc.reset(torch.arange(args.envs, device=dev), q0)
 
+    imp = None
+    if args.strike_impedance:
+        from amortized_opt.impedance import StrikeImpedance, StrikeImpedanceConfig
+        imp = StrikeImpedance(
+            StrikeImpedanceConfig(kp_scale=args.imp_kp, kd_scale=args.imp_kd,
+                                  before_wp=args.imp_window, after_wp=args.imp_window),
+            batch=args.envs, device=dev)
     loop = DrumMPCLoop(schedule=sched, mpc=mpc, reward=rew, plant=plant,
-                       noise=noise, record=True)
+                       noise=noise, impedance=imp, record=True)
     q, qd, log = loop.rollout(q0, qd0, args.steps)
 
     stats = loop.stats.summary(args.envs)

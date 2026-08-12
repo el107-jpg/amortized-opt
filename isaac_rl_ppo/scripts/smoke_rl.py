@@ -53,6 +53,14 @@ def parse(argv=None):
     p.add_argument("--clips", type=int, default=2)
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-cost", action="store_true")
+    p.add_argument("--no-waist-ff", action="store_true",
+                   help="disable the waist reaction feedforward (A/B baseline)")
+    p.add_argument("--strike-impedance", action="store_true",
+                   help="soften elbow+wrist Kp/Kd around each hit")
+    p.add_argument("--imp-kp", type=float, default=0.5)
+    p.add_argument("--imp-kd", type=float, default=0.7)
+    p.add_argument("--imp-window", type=int, default=3,
+                   help="ramp ticks before AND after the hit")
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--out", default="")
     return p.parse_args(argv)
@@ -89,7 +97,7 @@ def main(argv=None) -> int:
 
     # ---- 1. the env ---------------------------------------------------------
     rl_cfg = DrumRLEnvCfg(num_envs=args.envs, device=args.device, seed=args.seed,
-                          record=True)
+                          waist_reaction_ff=not args.no_waist_ff, record=True)
     t0 = time.perf_counter()
     env = make_env(rl_cfg)
     env.reset()
@@ -153,8 +161,15 @@ def main(argv=None) -> int:
         noise.attach()
 
     mpc.reset(torch.arange(args.envs, device=dev), q)
+    imp = None
+    if args.strike_impedance:
+        from amortized_opt.impedance import StrikeImpedance, StrikeImpedanceConfig
+        imp = StrikeImpedance(
+            StrikeImpedanceConfig(kp_scale=args.imp_kp, kd_scale=args.imp_kd,
+                                  before_wp=args.imp_window, after_wp=args.imp_window),
+            batch=args.envs, device=dev)
     loop = DrumMPCLoop(schedule=sched, mpc=mpc, reward=rew, plant=env.plant,
-                       noise=noise, safety=safety, record=True)
+                       noise=noise, safety=safety, impedance=imp, record=True)
 
     # ---- 2 + 3. the rollout --------------------------------------------------
     q, qd, log = loop.rollout(q, qd, args.steps)
@@ -184,6 +199,28 @@ def main(argv=None) -> int:
           f"p90 {o['lat_abs_p90_ms']:.1f} ms  speed-in-band {o['speed_in_band']}  "
           f"(analytic plant, REPORT.md §4: 63 % miss, 9.5 ms p50)", flush=True)
     print(f"    histogram(ms): {o['hist_ms']}", flush=True)
+
+    # ---- 7. waist excursion (the section-9b instability metric) ---------------
+    # Measured pose per tick from the rollout history: |q| quantiles per waist
+    # joint, net drift over the episode, and the lean magnitude the ablation
+    # report tracks (sqrt(pitch^2 + roll^2), frac > 0.15 rad).
+    qh = np.stack([r.q for r in loop.history])          # (T, B, 17)
+    ws = {}
+    for name, j in (("yaw", 0), ("pitch", 1), ("roll", 2)):
+        a = np.abs(qh[:, :, j])
+        ws[name] = {"p50": float(np.median(a)), "p90": float(np.quantile(a, 0.9)),
+                    "max": float(a.max()),
+                    "net_drift": float(np.abs(qh[-1, :, j] - qh[0, :, j]).mean())}
+    lean = np.sqrt(qh[:, :, 1] ** 2 + qh[:, :, 2] ** 2)
+    ws["lean"] = {"p50": float(np.median(lean)), "p90": float(np.quantile(lean, 0.9)),
+                  "frac_over_0.15": float((lean > 0.15).mean())}
+    report["waist"] = ws
+    print(f"[7] waist: pitch p50 {ws['pitch']['p50']:.3f} net {ws['pitch']['net_drift']:+.3f}  "
+          f"roll p50 {ws['roll']['p50']:.3f} net {ws['roll']['net_drift']:+.3f}  "
+          f"lean p90 {ws['lean']['p90']:.3f} frac>0.15 {ws['lean']['frac_over_0.15']:.2f}  "
+          f"yaw max {ws['yaw']['max']:.3f}  "
+          f"(ff={'OFF' if args.no_waist_ff else 'ON'}, "
+          f"impedance={'ON' if args.strike_impedance else 'OFF'})", flush=True)
 
     # ---- 4. the deviation diagnostic ------------------------------------------
     # Clean vs perturbed plan FROM THE SAME STATE AND CONTEXT: the only honest

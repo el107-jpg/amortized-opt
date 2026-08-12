@@ -70,6 +70,11 @@ from .model import (
     model_config_from_checkpoint,
     param_counts,
 )
+from .impedance import (
+    StrikeImpedance,
+    StrikeImpedanceConfig,
+    distal_joint_masks,
+)
 from .idle_home import (
     IdleHomeConfig,
     IdleHomeTable,
@@ -313,6 +318,9 @@ __all__ = [
     "StartBatch",
     "StartConfig",
     "StartSampler",
+    "StrikeImpedance",
+    "StrikeImpedanceConfig",
+    "distal_joint_masks",
     "WaistAimConfig",
     "WaistYawController",
     "WarmStart",

@@ -391,6 +391,20 @@ class BatchedRNEA:
 
         return tau_opt.squeeze(0) if squeeze else tau_opt
 
+    def mass_matrix_torque(self, q_opt: torch.Tensor, qdd_opt: torch.Tensor) -> torch.Tensor:
+        """``(M(q) + diag(armature)) qdd`` -- the purely inertial torque.
+
+        RNEA is affine in ``qdd`` at fixed ``(q, qd)``, so the mass-matrix
+        product falls out of two calls at ``qd = 0``; gravity is in both and
+        cancels exactly, and ``qd = 0`` never generates a Coriolis term.
+        Because the armature is diagonal, a ``qdd`` with some columns zeroed
+        yields in THOSE rows the pure coupling reaction of the other joints'
+        acceleration -- the term the Isaac plant feeds forward to the waist to
+        cancel the arms' reaction torque (``waist_reaction_ff``).
+        """
+        z = torch.zeros_like(q_opt)
+        return self.rnea(q_opt, z, qdd_opt) - self.rnea(q_opt, z, torch.zeros_like(qdd_opt))
+
     __call__ = rnea
 
 

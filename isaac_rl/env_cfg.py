@@ -135,6 +135,19 @@ class DrumRLEnvCfg:
     #: gravity with position error, so dropping this would change the plant the
     #: per-joint lead was fitted against.
     gravity_feedforward: bool = True
+    #: Cancel the arms' inertial reaction on the WAIST rows: the waist rows of
+    #: ``M(q) qdd_cmd`` (waist columns of ``qdd_cmd`` zeroed) are added to the
+    #: gravity/Coriolis feedforward.  The commanded part of the load that
+    #: shoves the waist off its track is known a tick ahead, so it is
+    #: cancelled instead of eaten by the weak waist pitch/roll servo (Kp 40,
+    #: 25 N*m effort).  The arm rows keep ``qdd = 0``, so the plant the
+    #: per-joint lead was fitted against is unchanged there.  NOTE: pd_sim
+    #: models this coupling (frozen mass matrix), so with the ff ON the real
+    #: waist tracks BETTER than the analytic model predicts -- a conservative
+    #: mismatch; the waist pitch/roll lead (fitted at 50 ms against the
+    #: sagging plant) will want a refit.  Requires ``gravity_feedforward``
+    #: (it rides the same RNEA).
+    waist_reaction_ff: bool = True
     #: First-order hold on the position target across the ``DECIMATION``
     #: substeps, with the matching velocity target -- the FOH semantics
     #: ``amortized_opt.pd_sim`` reproduces analytically.
@@ -185,6 +198,8 @@ class DrumRLEnvCfg:
             ("contact sensors", str(self.contact_sensors), "CARRIED"),
             ("FOH ramp", str(self.foh_ramp), "CARRIED"),
             ("gravity/Coriolis ff", str(self.gravity_feedforward), "CARRIED"),
+            ("waist reaction ff", str(self.waist_reaction_ff),
+             "NEW -- cancels the arms' reaction on the waist"),
             ("hit detection", self.hit_mode, "REPLACED -- see DECISION 1"),
             ("extra-hit punishment", "reward.extra_hit / early_contact", "CARRIED (reshaped)"),
             ("QP safety filter", "isaac_rl.safety, always on", "PROMOTED (repo: eval only)"),
