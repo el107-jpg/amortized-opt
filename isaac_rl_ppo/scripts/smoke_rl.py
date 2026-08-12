@@ -133,9 +133,17 @@ def main(argv=None) -> int:
                              amp_dtype=None if args.no_amp else torch.bfloat16),
                    device=dev, dtype=dtype, kit_names=tuple(kit.names))
     fk = A.ChainFK(device=dev, dtype=dtype)
-    rnea = A.BatchedRNEA.from_urdf(device=dev).to(dev, dtype)
+    # ``BatchedRNEA.from_urdf`` needs Pinocchio, which cannot initialize inside
+    # the Isaac process on this box (``model.parents`` is unreadable) -- go
+    # through the frozen-tree cache instead, exactly as the env's feedforward
+    # does.  ``None`` only if BOTH the live build and the cache fail.
+    from isaac_rl.rnea_cache import build_or_load
+    rnea = build_or_load(device=dev, dtype=dtype)
     sdf = A.SdfPenalty(fk=fk, device=dev, dtype=dtype)
-    cost = None if args.no_cost else A.FusedCost(
+    if rnea is None and not args.no_cost:
+        print("[cost] RNEA unavailable in-process (no cache); w_plan_cost term OFF",
+              flush=True)
+    cost = None if (args.no_cost or rnea is None) else A.FusedCost(
         A.CostConfig(), fk=fk, rnea=rnea, sdf=sdf, max_horizon=H, device=dev, dtype=dtype)
     scorer = ExecutedStrikeScorer(fk=fk, dt=CONTROL_DT, device=dev, dtype=dtype)
     rew = ExecutedReward(RewardConfig(), scorer=scorer, cost=cost, device=dev, dtype=dtype)
