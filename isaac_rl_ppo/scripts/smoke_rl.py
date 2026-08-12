@@ -142,8 +142,11 @@ def main(argv=None) -> int:
     if rnea is None and not args.no_cost:
         print("[cost] RNEA unavailable in-process (no cache); w_plan_cost term OFF",
               flush=True)
+    # ``fk`` is deliberately NOT passed: FusedCost builds its own ChainFK with
+    # the frames its terms read (the posture term needs the shoulder frames,
+    # which the scorer's bare ChainFK does not carry).
     cost = None if (args.no_cost or rnea is None) else A.FusedCost(
-        A.CostConfig(), fk=fk, rnea=rnea, max_horizon=H, device=dev, dtype=dtype)
+        A.CostConfig(), rnea=rnea, max_horizon=H, device=dev, dtype=dtype)
     scorer = ExecutedStrikeScorer(fk=fk, dt=CONTROL_DT, device=dev, dtype=dtype)
     rew = ExecutedReward(RewardConfig(), scorer=scorer, cost=cost, device=dev, dtype=dtype)
 
