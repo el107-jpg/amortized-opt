@@ -1,0 +1,47 @@
+===== trajopt_hpipm_2026-08-10_v2b (243 cases) =====
+
+metric                                  mean         p50         p90         max
+----------------------------------------------------------------------------------
+contact pos err (mm)                 70.2923     66.8798    119.3260    171.0652
+tip pos err (mm)                    110.6420    103.9103    187.3945    250.1380
+impact speed err (m/s)                0.0631      0.0443      0.1368      0.4611
+impact dir cosine                     0.9796      0.9871      0.9973      0.9998
+approach angle (deg)                  9.9973      9.2228     16.4770     39.1659
+min clearance, active (mm)           14.5340     17.3434     65.5194    111.2975
+max penetration, active (mm)          9.9218      0.0000     41.7674    109.0431
+max penetration, both (mm)           23.4546     19.8798     54.3555    109.0431
+torque excess (N.m)                   2.9085      0.0000      1.1768    184.9039
+peak torque / limit                   0.8108      0.6522      1.0675      8.3962
+velocity excess (rad/s)               0.0000      0.0000      0.0000      0.0000
+joint-box excess (rad)                0.0000      0.0000      0.0000      0.0000
+joint travel L1 (rad)                 7.4764      7.2176     10.9096     18.1459
+travel waste (x)                      2.2519      2.1542      3.0884      5.9631
+wrist travel (rad)                    2.7729      2.7032      4.2007      8.1562
+jerk integral                    29384322.0976 13513583.9170 38583323.8402 780460165.5292
+accel integral                    12337.0466   8216.4804  23094.5980 126996.8031
+PD track err needed (rad)             0.4694      0.3287      0.7845      5.1988
+solve time (ms)                   11653.2297   6513.6741  29713.4577  65559.6035
+
+acceptance check                            count
+----------------------------------------------------
+contact inside the legal hit disk       241/243   
+... and <= 2 cm from the aim point       12/243   
+impact speed in band                    241/243   
+no penetration (active hand)            162/243   
+keeps 5 mm margin                       149/243   
+no torque-limit excess                  209/243   
+no velocity-limit excess                243/243   
+inside the joint box                    243/243   
+stick elevation in band                 230/243   
+solver converged                         15/243   
+planner reported failure                  0/243   
+ACCEPTED (hit+speed+coll+tau+vel+box)    149/243   
+
+drum            hand    n    acc  pos p50 mm   spd p50  pen p90 mm   tau p90   ms p50
+--------------------------------------------------------------------------------------
+cymbal_left     left   42  22/42        30.3     0.043       55.09     11.28    29237
+cymbal_right   right   39  23/39        71.7     0.042       44.82      0.00    15920
+hihat           left   42  32/42        92.7     0.054       16.69      0.00     6794
+snare          right   39  29/39        95.0     0.043       18.07      0.00     2498
+tom1           right   39  30/39        47.8     0.035       11.78      0.00     3356
+tom2            left   42  13/42        71.6     0.052       48.98      2.97     3793

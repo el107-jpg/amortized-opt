@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amortized-opt"
+version = "0.1.0"
+description = "Amortized trajectory optimizer for a two-stick Unitree G1 drummer"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Runtime deps of the CORE (amortized_opt). Deliberately small: the core is pure
+# torch/numpy so it stays importable on a laptop with no Isaac install. Versions
+# are the ones the results in README.md/REPORT.md were produced against
+# (python 3.11.15); floors, not pins, since nothing here is version-fragile.
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.24,<2",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Cross-checks only: amortized_opt.limits / .rnea validate the vendored URDF
+# limits and the batched RNEA against Pinocchio. Every test that needs it is
+# guarded by pytest.importorskip, so the suite is green without it.
+pinocchio = ["pin>=2.7"]
+# scripts/render_mpc.py and the report scripts.
+plots = ["matplotlib>=3.8"]
+dev = ["pytest>=8"]
+# NOT installable from PyPI, listed for the record: the Isaac layer
+# (g1_scene, isaac_rl, isaac_rl_ppo) needs `isaaclab` + `isaacsim` and
+# `unitree_rl_lab`, plus the upstream Unitree G1 USD located via
+# $UNITREE_MODEL_DIR. See CLAUDE.md for the environment that provides them.
+
+[tool.setuptools]
+# Explicit, so a stray directory (runs/, baselines/, scratch checkouts) can
+# never be picked up as a package by autodiscovery.
+packages = [
+    "amortized_opt",
+    "g1_scene",
+    "isaac_rl",
+    "isaac_rl_ppo",
+]
+
+# NOTE on assets: the vendored URDF, meshes, drum layout, goal poses and RCC
+# clips live under assets/, a SIBLING of the packages rather than inside one,
+# and amortized_opt.constants.ASSETS_DIR resolves them relative to the source
+# tree (`Path(__file__).parent.parent / "assets"`). So an editable install
+# (`pip install -e .`) is the supported mode -- a built wheel would relocate the
+# packages away from assets/ and default_urdf_path() would raise.
+
+[tool.pytest.ini_options]
+# Mirrors pytest.ini, which stays for `pytest` runs that do not read pyproject.
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

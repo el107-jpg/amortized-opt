@@ -1,0 +1,68 @@
+# `shaft_hit: true` marks a drum the stick SHAFT can sound, not just the tip --
+# the cymbals, which a drummer crashes with the shoulder of the stick. The hit
+# detector then tracks probe points along the striking half of each stick and
+# lets them fire strikes on these drums only (see hit_detector.py). Membrane
+# drums omit it (default false): a shaft laid across a snare head is not a hit.
+# `edge_hit: true` marks a drum whose RIM is a playing surface -- again the
+# cymbals, played on the bow and the edge. Their hit radius GROWS past the head
+# by cfg.cymbal_edge_margin_m instead of shrinking by the usual rim margin, so a
+# stick catching the edge registers. Membrane drums omit it: their rim is a
+# rimshot, not the head.
+drums:
+  snare:
+    id: 0
+    position: [0.35, 0.26, 0.8]
+    radius: 0.19
+    height: 0.16
+    normal: [-0.1, -0.05, 1.0]
+
+  hihat:
+    id: 1
+    position: [0.3, 0.52, 1.05]
+    radius: 0.15
+    height: 0.10
+    normal: [-0.1, -0.15, 1.0]
+    shaft_hit: true
+    edge_hit: true
+
+  # ~45° lean toward the drummer (−X) so heads face the robot more
+  # and stick shafts clear pad tops more easily. Regen USD after edit:
+  #   python scripts/create_simple_drum_kit_usd.py
+  tom1:
+    id: 2
+    position: [0.64, -0.15, 1]
+    radius: 0.14
+    height: 0.1
+    normal: [-0.4, 0.0, 1.0]
+
+  tom2:
+    id: 3
+    position: [0.64, 0.18, 1]
+    radius: 0.16
+    height: 0.1
+    normal: [-0.4, 0.0, 1.0]
+
+  cymbal_left:
+    id: 4
+    position: [0.64, 0.47, 1.15]
+    radius: 0.15
+    height: 0.1
+    normal: [-0.25, -0.15, 1.0]
+    shaft_hit: true
+    edge_hit: true
+
+  cymbal_right:
+    id: 5
+    position: [0.45, -0.37, 1.02]
+    radius: 0.16
+    height: 0.1
+    normal: [-0.35, 0.2, 1.0]
+    shaft_hit: true
+    edge_hit: true
+  
+  floor_tom:
+    id: 6
+    position: [0.2, -0.5, 0.8]
+    radius: 0.18
+    height: 0.1
+    normal: [0, 0.0, 1.0]

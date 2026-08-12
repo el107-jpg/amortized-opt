@@ -1,0 +1,79 @@
+243 cases  grid=standard+near_drum  seed=0  planner=repo_adapters.trajopt_hpipm_planner:make_planner  jobs=1
+  1/243  983 ms
+  11/243  1373 ms
+  21/243  1610 ms
+  31/243  1704 ms
+  41/243  1688 ms
+  51/243  1736 ms
+  61/243  994 ms
+  71/243  2068 ms
+  81/243  1551 ms
+  91/243  1224 ms
+  101/243  1600 ms
+  111/243  3438 ms
+  121/243  1205 ms
+  131/243  2832 ms
+  141/243  1003 ms
+  151/243  1277 ms
+  161/243  1758 ms
+  171/243  1891 ms
+  181/243  1097 ms
+  191/243  1060 ms
+  201/243  1161 ms
+  211/243  1229 ms
+  221/243  1954 ms
+  231/243  1358 ms
+  241/243  1913 ms
+solve phase done in 496.8s (2.04s/case)
+score phase done in 7.2s
+===== trajopt_hpipm_2026-08-10  [repo_adapters.trajopt_hpipm_planner:make_planner  grid=standard+near_drum] (243 cases) =====
+
+metric                                  mean         p50         p90         max
+----------------------------------------------------------------------------------
+contact pos err (mm)                 68.1864     66.9078    107.0473    147.9354
+tip pos err (mm)                    112.6293    110.7046    183.7909    237.5940
+impact speed err (m/s)                0.0884      0.0496      0.1778      0.8933
+impact dir cosine                     0.9763      0.9888      0.9987      1.0000
+approach angle (deg)                  9.9809      8.5944     17.3457     96.4907
+min clearance, active (mm)           -1.8422     -2.1870     50.0134    111.0702
+max penetration, active (mm)         17.5551      2.1870     53.1743     92.2051
+max penetration, both (mm)           48.2853     51.5173     62.7809     92.2051
+torque excess (N.m)                   3.9538      0.0000      0.6382    276.7226
+peak torque / limit                   0.8683      0.6338      1.1074     12.0689
+velocity excess (rad/s)               0.0000      0.0000      0.0000      0.0000
+joint-box excess (rad)                0.0000      0.0000      0.0000      0.0000
+joint travel L1 (rad)                 8.3347      7.8893     13.4346     18.4051
+travel waste (x)                      1.9743      1.8620      2.6150      5.3578
+wrist travel (rad)                    2.4015      2.2453      3.9597      6.4108
+jerk integral                    24533309.1899 13307787.2983 43023099.4718 423315929.4199
+accel integral                    10954.4996   7460.9292  23590.2399  61158.1237
+PD track err needed (rad)             0.5552      0.3094      1.0950      8.5200
+solve time (ms)                    1649.9612   1451.4622   2429.2247   9141.5361
+
+acceptance check                            count
+----------------------------------------------------
+contact inside the legal hit disk       240/243   
+... and <= 2 cm from the aim point       12/243   
+impact speed in band                    233/243   
+no penetration (active hand)            117/243   
+keeps 5 mm margin                       103/243   
+no torque-limit excess                  208/243   
+no velocity-limit excess                243/243   
+inside the joint box                    243/243   
+stick elevation in band                 232/243   
+solver converged                         11/243   
+planner reported failure                  0/243   
+ACCEPTED (hit+speed+coll+tau+vel+box)    108/243   
+
+drum            hand    n    acc  pos p50 mm   spd p50  pen p90 mm   tau p90   ms p50
+--------------------------------------------------------------------------------------
+cymbal_left     left   42  17/42        35.0     0.063       50.24      7.62     2223
+cymbal_right   right   39  14/39        88.6     0.040       53.31      1.62     1475
+hihat           left   42  14/42        65.8     0.068       54.66      0.19     1496
+snare          right   39  26/39        98.3     0.043       38.97      0.00     1376
+tom1           right   39  22/39        40.8     0.049       44.38      0.04     1182
+tom2            left   42  15/42        67.7     0.048       56.27      0.65     1230
+
+wrote baselines/trajopt_hpipm_2026-08-10_cases.json
+wrote baselines/trajopt_hpipm_2026-08-10_per_case.csv
+wrote baselines/trajopt_hpipm_2026-08-10_trajectories.npz

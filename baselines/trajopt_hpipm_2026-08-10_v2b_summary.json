@@ -1,0 +1,281 @@
+{
+ "n": 243,
+ "metrics": {
+  "contact_pos_err_mm": {
+   "label": "contact pos err (mm)",
+   "mean": 70.29226808294439,
+   "p50": 66.87978219293053,
+   "p90": 119.3259794021114,
+   "max": 171.06522936907962,
+   "min": 2.934112381159674
+  },
+  "tip_pos_err_mm": {
+   "label": "tip pos err (mm)",
+   "mean": 110.64197979265985,
+   "p50": 103.91034105684378,
+   "p90": 187.39452654323406,
+   "max": 250.1380044023514,
+   "min": 7.678919294026715
+  },
+  "contact_speed_err_mps": {
+   "label": "impact speed err (m/s)",
+   "mean": 0.0631002309404027,
+   "p50": 0.0443176513980581,
+   "p90": 0.13680204832559364,
+   "max": 0.46105956065608034,
+   "min": 0.00020289576250254182
+  },
+  "contact_dir_cos": {
+   "label": "impact dir cosine",
+   "mean": 0.9796303827215075,
+   "p50": 0.9870725822279168,
+   "p90": 0.9972552488885336,
+   "max": 0.9998228626085195,
+   "min": 0.7753202223562523
+  },
+  "approach_deg": {
+   "label": "approach angle (deg)",
+   "mean": 9.997324401786182,
+   "p50": 9.222793693066066,
+   "p90": 16.477031170528672,
+   "max": 39.165925938242374,
+   "min": 1.078447886716977
+  },
+  "coll_min_sdf_m": {
+   "label": "min clearance, active (mm)",
+   "mean": 14.533967226700643,
+   "p50": 17.343447393245523,
+   "p90": 65.51944724662121,
+   "max": 111.29752511552945,
+   "min": -109.04309453956203
+  },
+  "coll_pen_max_m": {
+   "label": "max penetration, active (mm)",
+   "mean": 9.921780177311083,
+   "p50": 0.0,
+   "p90": 41.76737164346861,
+   "max": 109.04309453956203,
+   "min": 0.0
+  },
+  "coll_pen_max_all_m": {
+   "label": "max penetration, both (mm)",
+   "mean": 23.454565384515206,
+   "p50": 19.879814063884712,
+   "p90": 54.355497917147616,
+   "max": 109.04309453956203,
+   "min": 0.0
+  },
+  "tau_excess_max_nm": {
+   "label": "torque excess (N.m)",
+   "mean": 2.9085182775568366,
+   "p50": 0.0,
+   "p90": 1.1767658011931261,
+   "max": 184.90392130126858,
+   "min": 0.0
+  },
+  "tau_excess_max_frac": {
+   "label": "peak torque / limit",
+   "mean": 0.8108185829548212,
+   "p50": 0.652166179399964,
+   "p90": 1.0675316050635326,
+   "max": 8.396156852050744,
+   "min": 0.24884095638033238
+  },
+  "vel_excess_max_rads": {
+   "label": "velocity excess (rad/s)",
+   "mean": 0.0,
+   "p50": 0.0,
+   "p90": 0.0,
+   "max": 0.0,
+   "min": 0.0
+  },
+  "qpos_posture_excess_max_rad": {
+   "label": "joint-box excess (rad)",
+   "mean": 0.0,
+   "p50": 0.0,
+   "p90": 0.0,
+   "max": 0.0,
+   "min": 0.0
+  },
+  "travel_l1_rad": {
+   "label": "joint travel L1 (rad)",
+   "mean": 7.476442126356275,
+   "p50": 7.217604780810014,
+   "p90": 10.90956392915523,
+   "max": 18.145910648986046,
+   "min": 2.4037042373646926
+  },
+  "travel_waste": {
+   "label": "travel waste (x)",
+   "mean": 2.251912472530313,
+   "p50": 2.1541974372388815,
+   "p90": 3.088435178882372,
+   "max": 5.963069615238846,
+   "min": 1.203650730708222
+  },
+  "travel_wrist_rad": {
+   "label": "wrist travel (rad)",
+   "mean": 2.7728793455250287,
+   "p50": 2.7031669752298084,
+   "p90": 4.200681297417595,
+   "max": 8.156156676472687,
+   "min": 0.785821682354085
+  },
+  "jerk_integral": {
+   "label": "jerk integral",
+   "mean": 29384322.097612113,
+   "p50": 13513583.917028258,
+   "p90": 38583323.840214275,
+   "max": 780460165.529153,
+   "min": 887753.3894784007
+  },
+  "accel_integral": {
+   "label": "accel integral",
+   "mean": 12337.046610236888,
+   "p50": 8216.480382014517,
+   "p90": 23094.597997680256,
+   "max": 126996.8031119782,
+   "min": 1107.117927059352
+  },
+  "pd_track_err_needed_max_rad": {
+   "label": "PD track err needed (rad)",
+   "mean": 0.46936098269300214,
+   "p50": 0.32870267650791907,
+   "p90": 0.7845440228158348,
+   "max": 5.198762068100627,
+   "min": 0.1210483062324053
+  },
+  "solve_s": {
+   "label": "solve time (ms)",
+   "mean": 11653.229690446238,
+   "p50": 6513.674077112228,
+   "p90": 29713.457662565655,
+   "max": 65559.60348108783,
+   "min": 1162.8866200335324
+  }
+ },
+ "counts": {
+  "ok_hit": {
+   "label": "contact inside the legal hit disk",
+   "count": 241,
+   "n": 243
+  },
+  "ok_hit_tight": {
+   "label": "... and <= 2 cm from the aim point",
+   "count": 12,
+   "n": 243
+  },
+  "ok_speed": {
+   "label": "impact speed in band",
+   "count": 241,
+   "n": 243
+  },
+  "ok_collision": {
+   "label": "no penetration (active hand)",
+   "count": 162,
+   "n": 243
+  },
+  "ok_collision_margin": {
+   "label": "keeps 5 mm margin",
+   "count": 149,
+   "n": 243
+  },
+  "ok_torque": {
+   "label": "no torque-limit excess",
+   "count": 209,
+   "n": 243
+  },
+  "ok_velocity": {
+   "label": "no velocity-limit excess",
+   "count": 243,
+   "n": 243
+  },
+  "ok_joint_limits": {
+   "label": "inside the joint box",
+   "count": 243,
+   "n": 243
+  },
+  "elev_ok": {
+   "label": "stick elevation in band",
+   "count": 230,
+   "n": 243
+  },
+  "converged": {
+   "label": "solver converged",
+   "count": 15,
+   "n": 243
+  },
+  "planner_failed": {
+   "label": "planner reported failure",
+   "count": 0,
+   "n": 243
+  },
+  "accepted": {
+   "label": "ACCEPTED (hit+speed+coll+tau+vel+box)",
+   "count": 149,
+   "n": 243
+  }
+ },
+ "by_drum": {
+  "cymbal_left": {
+   "n": 42,
+   "hand": "left",
+   "accepted": 22,
+   "contact_pos_err_mm_p50": 30.339030754991697,
+   "speed_err_p50": 0.04318363462763264,
+   "pen_max_mm_p90": 55.09429141990187,
+   "tau_excess_p90": 11.280730857274705,
+   "solve_ms_p50": 29237.289935001172
+  },
+  "cymbal_right": {
+   "n": 39,
+   "hand": "right",
+   "accepted": 23,
+   "contact_pos_err_mm_p50": 71.6600420829869,
+   "speed_err_p50": 0.04211095669555531,
+   "pen_max_mm_p90": 44.82327699842345,
+   "tau_excess_p90": 0.0,
+   "solve_ms_p50": 15919.615534832701
+  },
+  "hihat": {
+   "n": 42,
+   "hand": "left",
+   "accepted": 32,
+   "contact_pos_err_mm_p50": 92.68881737327393,
+   "speed_err_p50": 0.054443857553477026,
+   "pen_max_mm_p90": 16.685910550772594,
+   "tau_excess_p90": 0.0,
+   "solve_ms_p50": 6793.546493980102
+  },
+  "snare": {
+   "n": 39,
+   "hand": "right",
+   "accepted": 29,
+   "contact_pos_err_mm_p50": 94.99957436219556,
+   "speed_err_p50": 0.043088869562530885,
+   "pen_max_mm_p90": 18.0724089355414,
+   "tau_excess_p90": 0.0,
+   "solve_ms_p50": 2497.5469808559865
+  },
+  "tom1": {
+   "n": 39,
+   "hand": "right",
+   "accepted": 30,
+   "contact_pos_err_mm_p50": 47.755513578036116,
+   "speed_err_p50": 0.03468730429812572,
+   "pen_max_mm_p90": 11.77888846136436,
+   "tau_excess_p90": 0.0,
+   "solve_ms_p50": 3355.930411024019
+  },
+  "tom2": {
+   "n": 42,
+   "hand": "left",
+   "accepted": 13,
+   "contact_pos_err_mm_p50": 71.58699839650689,
+   "speed_err_p50": 0.05244750993362213,
+   "pen_max_mm_p90": 48.98126088431974,
+   "tau_excess_p90": 2.9704693368529633,
+   "solve_ms_p50": 3792.85815753974
+  }
+ }
+}
