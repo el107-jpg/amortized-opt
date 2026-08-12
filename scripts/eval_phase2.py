@@ -228,7 +228,7 @@ def main(argv=None) -> int:
     amp = None if args.no_amp else torch.bfloat16
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
     model.load_state_dict(ck["model"])
     model.eval()
@@ -251,7 +251,7 @@ def main(argv=None) -> int:
     phase1 = None
     if args.phase1 and Path(args.phase1).exists():
         c1 = torch.load(args.phase1, map_location="cpu", weights_only=False)
-        phase1 = A.build_model(A.ModelConfig(**c1["model_cfg"]), dev)
+        phase1 = A.build_model(A.model_config_from_checkpoint(c1), dev)
         phase1.load_state_dict(c1["model"])
         phase1.eval()
 

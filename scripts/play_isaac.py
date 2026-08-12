@@ -257,7 +257,7 @@ def write_mp4(path, frames, fps):
 
 def load_model(ckpt_path: Path, device: torch.device):
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, device)
     model.load_state_dict(ck["model"])
     model.eval()

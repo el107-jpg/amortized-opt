@@ -463,3 +463,161 @@ def test_rest_ticks_keep_a_both_idle_slot_alive(table):
         n_del += int((~deleted.state["active"].any(dim=1)).sum())
         n_keep += int((~kept.state["active"].any(dim=1)).sum())
     assert n_keep >= n_del
+
+
+# =========================================================== phase 1 ========
+# The warm start has to agree with phase 2 about what an idle arm does.  Before
+# 2026-08-12 it did not: ``generate_scenarios`` called ``warmstart_trajectory``
+# and ``build_context_inputs`` with no table, so the target held the idle arm at
+# its start pose while phase 2 priced a retraction to home, and the encoder's
+# IDLE token was masked out of every batch -- ``idle_proj`` and the 4th
+# ``type_emb`` row reached phase 2 at exactly their random init.
+def _phase1_pool(idle_home_path, *, n=900, seed=0, rest_frac=0.25, horizon=25,
+                 buckets=None):
+    import amortized_opt as A
+    from amortized_opt.warmstart_data import NoiseConfig, ScenarioConfig, generate_pool
+
+    cfg = ScenarioConfig(
+        horizon=horizon, buckets=tuple(buckets or (horizon,)),
+        idle_home_path=idle_home_path, rest_frac=rest_frac,
+    )
+    fk = ChainFK(device="cpu", dtype=torch.float32)
+    rnea = A.BatchedRNEA.from_urdf(with_armature=True, device="cpu", dtype=torch.float32)
+    # ``workers=1`` takes ``generate_pool_parallel``'s in-process branch.  The
+    # pool workers fork, and the cost tests above this section have already run
+    # autograd in this interpreter, which torch refuses to fork after.
+    pool = generate_pool(n, seed=seed, cfg=cfg, noise=NoiseConfig(), split="train",
+                         workers=1, device="cpu", fk=fk, rnea=rnea)
+    return cfg, pool
+
+
+@pytest.fixture(scope="module")
+def p1_home(table):
+    return _phase1_pool("default")
+
+
+@pytest.fixture(scope="module")
+def p1_none():
+    return _phase1_pool(None)
+
+
+def test_phase1_fills_the_idle_context_token(p1_home):
+    """``idle_valid`` is the complement of ``active``, with a real payload."""
+    _cfg, pool = p1_home
+    for d in pool.data.values():
+        assert torch.equal(d["idle_valid"], ~d["active"])
+        idle = d["idle_valid"]
+        assert bool(idle.any()), "pool should contain idle hands"
+        # payload present exactly where valid, and exactly zero where not
+        assert float(d["idle_home_q"][idle].abs().sum()) > 0.0
+        assert float(d["idle_home_q"][~idle].abs().sum()) == 0.0
+        assert float(d["idle_home_tip"][~idle].abs().sum()) == 0.0
+
+
+def test_phase1_target_parks_the_idle_arm(p1_home, table):
+    """The IMITATION TARGET ends at home -- not at the start pose."""
+    _cfg, pool = p1_home
+    seen = 0
+    for d in pool.data.values():
+        for hi, hand in enumerate(_HANDS):
+            rows = (~d["active"][:, hi]).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            seen += int(rows.numel())
+            cols = list(arm_slice(hand, JOINTS))
+            want = torch.as_tensor(table.arm_pose(hand), dtype=d["target"].dtype)
+            got = d["target"][rows][:, -1, cols]
+            assert torch.allclose(got, want.expand_as(got), atol=1e-5)
+            # ...and it is a real journey, not a pose that was already there
+            start = d["q0"][rows][:, cols]
+            assert float((start - want).abs().max()) > 0.5
+    assert seen > 0
+
+
+def test_phase1_idle_retraction_respects_the_speed_rating(p1_home):
+    """The settle window stretches, so a far park never outruns the joint."""
+    _cfg, pool = p1_home
+    v_lim = torch.as_tensor(isaac_velocity_limits(JOINTS), dtype=torch.float32)
+    for d in pool.data.values():
+        rate = torch.cat([d["q0"][:, None, :], d["target"]], 1).diff(dim=1).abs() / CONTROL_DT
+        for hi, hand in enumerate(_HANDS):
+            rows = (~d["active"][:, hi]).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            cols = list(arm_slice(hand, JOINTS))
+            worst = float((rate[rows][:, :, cols] / v_lim[cols]).max())
+            assert worst <= 1.0, f"{hand} idle retraction peaks at {worst:.2f}x its rating"
+
+
+def test_phase1_without_a_table_holds_the_start_pose(p1_none):
+    """``idle_home_path=None`` reproduces the pre-2026-08-12 pool exactly."""
+    _cfg, pool = p1_none
+    assert pool.stats["rest"] == 0, "rests need a table to park at"
+    for d in pool.data.values():
+        assert not bool(d["idle_valid"].any())
+        assert float(d["idle_home_q"].abs().sum()) == 0.0
+        for hi, hand in enumerate(_HANDS):
+            rows = (~d["active"][:, hi]).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            cols = list(arm_slice(hand, JOINTS))
+            held = d["target"][rows][:, :, cols]
+            start = d["q0"][rows][:, None, cols]
+            assert torch.allclose(held, start.expand_as(held), atol=1e-6)
+
+
+def test_phase1_rests_are_kept_and_spread_across_buckets(table):
+    """A both-idle draw is a rest, and it must not all land in one bucket."""
+    _cfg, pool = _phase1_pool("default", n=1600, seed=5, rest_frac=1.0,
+                              horizon=50, buckets=(25, 50))
+    assert pool.stats["rest"] > 0
+    assert pool.stats["reject_idle"] == 0, "rest_frac=1 keeps every rest"
+    per_bucket = {
+        b: int((~d["active"]).all(dim=1).sum()) for b, d in pool.data.items()
+    }
+    assert len(per_bucket) > 1
+    assert all(v > 0 for v in per_bucket.values()), per_bucket
+    # a rest has no hit, so it is not run-up-to-a-strike data
+    assert pool.stats["short_horizon"] <= pool.stats["accepted"] - pool.stats["rest"]
+
+
+def test_phase1_rest_frac_zero_rejects_every_rest(table):
+    _cfg, pool = _phase1_pool("default", n=600, seed=7, rest_frac=0.0)
+    assert pool.stats["rest"] == 0
+    for d in pool.data.values():
+        assert not bool((~d["active"]).all(dim=1).any())
+
+
+def test_phase1_trains_the_idle_token(p1_home, p1_none):
+    """THE regression this section exists for: a masked-out token gets no
+    gradient, so without a payload ``idle_proj`` reaches phase 2 random."""
+    import amortized_opt as A
+    from amortized_opt import train_warmstart as TW
+
+    def idle_grads(pool, cfg):
+        torch.manual_seed(0)
+        model = A.build_model(
+            A.ModelConfig(max_horizon=cfg.horizon, num_drums=cfg.num_drums,
+                          num_future=cfg.num_future),
+            "cpu",
+        )
+        step = TW.make_step(model, TW.LossScales(device="cpu"), TW.LossWeights(),
+                            compile_mode=None)
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(0)
+        for b, idx in TW.batch_sampler(pool, 128, rng=np.random.default_rng(0), steps=1):
+            batch = pool.batch(b, idx, generator=gen)
+        aux = batch["aux"]
+        out = step(batch["init"], batch["state"], batch["context"], batch["masks"],
+                   batch["target"],
+                   *[aux[k] for k in ("vel", "acc", "torque", "fk_pos", "fk_vel")])
+        (out[0] if isinstance(out, (tuple, list)) else out).backward()
+        enc = model.encoder
+        return (float(enc.idle_proj.weight.grad.abs().sum()),
+                float(enc.type_emb.weight.grad[3].abs().sum()))
+
+    proj_on, type_on = idle_grads(*reversed(p1_home))
+    proj_off, type_off = idle_grads(*reversed(p1_none))
+    assert proj_off == 0.0 and type_off == 0.0, "no payload must mean no gradient"
+    assert proj_on > 0.0, "the idle projection must train when the pool feeds it"
+    assert type_on > 0.0, "the IDLE type embedding must train too"

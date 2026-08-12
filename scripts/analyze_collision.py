@@ -53,7 +53,7 @@ def analyze_ckpt(ckpt_path: str, device: str = "cuda:1", grid_seed: int = 0):
     # ---- load checkpoint ----
     print(f"[load] {ckpt_path}")
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
     model.load_state_dict(ck["model"])
     model.eval()

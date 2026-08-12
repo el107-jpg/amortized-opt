@@ -379,3 +379,83 @@ if __name__ == "__main__":  # pragma: no cover
             torch._dynamo.reset()
             e, c = measure_latency(dev, bsz, mode=mode)
             print(f"batch {bsz:>4} {mode:>16}: eager {e:7.3f} ms  compiled {c:7.3f} ms")
+
+
+# =============================== rebuilding a model from a checkpoint ========
+# ``ModelConfig(**ck["model_cfg"])`` fills a field the stored config lacks from
+# the CURRENT default, so a feature that starts defaulting ON reconstructs an
+# architecture the checkpoint never had and the strict load dies on a shape
+# mismatch.  On 2026-08-12 that made every checkpoint in the tree unloadable by
+# 21 of the 23 entry points at once, so these pin the recovery.
+def _fake_ckpt(*, idle_token: bool, drop_cfg_key: bool, **cfg_kw):
+    """A checkpoint dict as ``save_checkpoint`` writes one."""
+    cfg = ModelConfig(max_horizon=25, idle_home_token=idle_token, **cfg_kw)
+    sd = AmortizedOptimizer(cfg).state_dict()
+    stored = dict(vars(cfg))
+    if drop_cfg_key:
+        stored.pop("idle_home_token")       # written before the field existed
+    return {"model_cfg": stored, "model": sd}, cfg
+
+
+@pytest.mark.parametrize("idle_token", [False, True])
+def test_arch_flag_is_recovered_from_the_weights(idle_token):
+    """A config that predates the field is rebuilt from what the weights have."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, cfg = _fake_ckpt(idle_token=idle_token, drop_cfg_key=True)
+    assert "idle_home_token" not in ck["model_cfg"]
+    got = model_config_from_checkpoint(ck)
+    assert got.idle_home_token is idle_token
+    assert got.n_token_types == cfg.n_token_types
+
+
+@pytest.mark.parametrize("idle_token", [False, True])
+def test_recovered_config_loads_strictly(idle_token):
+    """THE regression: build from the recovered config and load with strict=True."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, _cfg = _fake_ckpt(idle_token=idle_token, drop_cfg_key=True)
+    model = AmortizedOptimizer(model_config_from_checkpoint(ck))
+    model.load_state_dict(ck["model"])      # strict -- raises if the shape moved
+    assert (model.cfg.idle_home_token is idle_token)
+
+
+def test_a_stored_flag_is_believed():
+    """When the config DOES carry the field, it is used as written."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    for tok in (False, True):
+        ck, _ = _fake_ckpt(idle_token=tok, drop_cfg_key=False)
+        assert model_config_from_checkpoint(ck).idle_home_token is tok
+
+
+def test_overrides_win_over_both():
+    """``train_phase2.py`` switches the token ON over a warm start without it."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, _ = _fake_ckpt(idle_token=False, drop_cfg_key=True)
+    got = model_config_from_checkpoint(ck, idle_home_token=True, dec_layers=2)
+    assert got.idle_home_token is True and got.dec_layers == 2
+
+
+def test_a_field_removed_from_ModelConfig_is_dropped_not_raised(capsys):
+    """A stale key must not turn into a TypeError in every entry point."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False)
+    ck["model_cfg"]["a_field_that_no_longer_exists"] = 7
+    got = model_config_from_checkpoint(ck)
+    assert got.idle_home_token is True
+    assert "no longer in ModelConfig" in capsys.readouterr().out
+
+
+def test_other_shape_fields_still_round_trip():
+    """The recovery must not disturb the fields that were always stored."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, cfg = _fake_ckpt(idle_token=True, drop_cfg_key=True,
+                         dec_layers=2, d_model=256, d_ctx=128, num_future=2)
+    got = model_config_from_checkpoint(ck)
+    for f in ("dec_layers", "d_model", "d_ctx", "num_future", "max_horizon"):
+        assert getattr(got, f) == getattr(cfg, f), f
+    AmortizedOptimizer(got).load_state_dict(ck["model"])

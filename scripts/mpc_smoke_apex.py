@@ -95,7 +95,7 @@ def main(argv=None) -> int:
     for spec in args.ckpt:
         label, _, path = spec.partition("=")
         ck = torch.load(Path(path), map_location="cpu", weights_only=False)
-        model = A.build_model(A.ModelConfig(**ck["model_cfg"]), dev)
+        model = A.build_model(A.model_config_from_checkpoint(ck), dev)
         model.load_state_dict(ck["model"])
         runs.append((label, model_planner(model, dev, amp_dtype=torch.bfloat16)))
 

@@ -198,24 +198,6 @@ def flag_str(conf: dict) -> str:
 
 
 # ============================================================== stage 2 ======
-#: Architecture flags that are NOT reliably present in a checkpoint's stored
-#: ``model_cfg`` -- because the field was added to ``ModelConfig`` after the
-#: checkpoint was written -- mapped to a state-dict key that proves whether the
-#: trained weights actually have the feature.
-#:
-#: This matters more than it looks.  ``ModelConfig(**ck["model_cfg"])`` fills a
-#: missing field from the CURRENT default, so a feature that defaults ON
-#: reconstructs an architecture the checkpoint never had.  Strict loading then
-#: raises (the loud, good case); non-strict loading would silently leave the new
-#: parameters at their random init and quietly score a different model than the
-#: one that was trained.  Trusting the WEIGHTS instead of the config is the only
-#: thing that stays correct while the package is edited underneath a long run --
-#: which is the normal condition in this tree.
-_ARCH_FROM_WEIGHTS: dict[str, str] = {
-    "idle_home_token": "encoder.idle_proj.weight",
-}
-
-
 def load_model(ckpt: Path, dev):
     """Checkpoint -> model + the scenario config its tokenizer was built for.
 
@@ -224,24 +206,20 @@ def load_model(ckpt: Path, dev):
     would silently undo the very thing being measured.
 
     Architecture flags absent from the stored config are recovered from the
-    state dict (see :data:`_ARCH_FROM_WEIGHTS`), and the load is STRICT, so any
-    remaining drift between the checkpoint and the installed package is a crash
-    rather than a randomly-initialised layer scoring in the table.
+    state dict by :func:`~amortized_opt.model.model_config_from_checkpoint` (the
+    ``_ARCH_FROM_WEIGHTS`` map this file used to carry, now the package's own),
+    and the load is STRICT, so any remaining drift between the checkpoint and
+    the installed package is a crash rather than a randomly-initialised layer
+    scoring in the table.
     """
     import torch
 
     import amortized_opt as A
 
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
-    stored = dict(ck["model_cfg"])
-    sd = ck["model"]
-    for field, proof in _ARCH_FROM_WEIGHTS.items():
-        if field not in stored and hasattr(A.ModelConfig, "__dataclass_fields__") \
-                and field in A.ModelConfig.__dataclass_fields__:
-            stored[field] = proof in sd
-    mcfg = A.ModelConfig(**stored)
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
-    model.load_state_dict(sd, strict=True)
+    model.load_state_dict(ck["model"], strict=True)
     model.eval()
     buckets = tuple((ck.get("scenario_cfg") or {}).get("buckets", (25, 50, 100)))
     cfg = {"buckets": buckets, "num_drums": mcfg.num_drums,

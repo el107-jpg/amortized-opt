@@ -89,6 +89,7 @@ import torch
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, ready_joint_pos
 from .fk import ChainFK
+from .idle_home import resolve_idle_home
 from .ik import tip_jacobian, tip_position
 from .limits import isaac_velocity_limits, urdf_position_limits
 from .rhythm import (
@@ -626,6 +627,9 @@ def generate_apex_scenarios(
     v_limit = isaac_velocity_limits(names)
     H = int(cfg.horizon)
     yaw_i = names.index("waist_yaw_joint")
+    # Same ``ScenarioConfig`` field the straight-line pool reads, so the two
+    # phase-1 generators cannot disagree about where an idle arm goes.
+    idle_home = resolve_idle_home(cfg.idle_home_path, joint_names=names)
 
     out: dict[int, dict[str, list]] = {
         b: {k: [] for k in (*_APEX_KEYS, *CONTEXT_FIELDS)} for b in cfg.buckets
@@ -633,6 +637,7 @@ def generate_apex_scenarios(
     stats: dict = {
         "requested": int(n), "accepted": 0, "reject_idle": 0, "reject_velocity": 0,
         "reject_library": 0, "dual_active": 0, "asymmetric": 0, "short_horizon": 0,
+        "single_idle": 0, "rest": 0,
         "peak_rate_ratio": [], "peak_rate_ratio_init": [],
         "apex_solved": 0, "apex_inside": 0, "apex_collision_free": 0,
         "apex_no_room": 0, "apex_rejected_outside": 0,
@@ -682,15 +687,29 @@ def generate_apex_scenarios(
                 goals[hand] = (g.drum_name, k * cfg.dt)
                 aim[hand] = np.asarray(g.position, float)
             active = [hit[h] >= 0 for h in HANDS]
-            if cfg.require_active_hand and not any(active):
-                stats["reject_idle"] += 1
-                continue
+            if not any(active):
+                # A REST.  Kept at ``rest_frac`` when there is a home table to
+                # park at; the apex solve skips it by construction (pass 2 only
+                # gathers rows with a goal), so it falls through to the parked
+                # base trajectory, which is exactly the target a rest wants.
+                if cfg.require_active_hand and (
+                    idle_home is None or rng.uniform() >= cfg.rest_frac
+                ):
+                    stats["reject_idle"] += 1
+                    continue
+                stats["rest"] += 1
             if not all(library.has(h, goals[h][0]) for h in HANDS if goals[h] is not None):
                 stats["reject_library"] += 1
                 continue
 
-            k_max = max([hit[h] for h in HANDS if hit[h] >= 0], default=1)
-            Hb = bucket_for(k_max, cfg.buckets)
+            if any(active):
+                k_max = max(hit[h] for h in HANDS if hit[h] >= 0)
+                Hb = bucket_for(k_max, cfg.buckets)
+            else:
+                # No hit to size the horizon from; spread rests over the buckets
+                # rather than filing every one of them in the shortest.
+                k_max = 1
+                Hb = int(cfg.buckets[int(rng.integers(len(cfg.buckets)))])
             # The waist ramp (both hands idle) -- gives yaw_target and the yaw
             # the torso holds mid-reach, which is where the apex is solved.
             base = warmstart_trajectory(
@@ -767,11 +786,16 @@ def generate_apex_scenarios(
                     continue
                 apex_arm[hand] = a["q"][arm_slice(hand, names)]
 
+            # ``idle_home`` reaches the base (both-hands-idle) call through
+            # ``**warmstart_kwargs``, which parks BOTH arms; the apex spline then
+            # overwrites only the columns of a hand that has a goal.  So an idle
+            # hand keeps the retraction and an active one keeps its apex.
             ws = apex_warmstart_trajectory(
                 r["q0"], r["qd0"], horizon=Hb, goals=goals, library=library,
                 apex_arm=apex_arm, aim_targets=r["aim"] or None, dt=cfg.dt,
                 joint_names=names, cfg=acfg, q_bounds=q_bounds,
                 waist_cfg=cfg.waist_cfg,
+                idle_home=idle_home, idle_settle_wp=cfg.idle_settle_wp,
             )
             # how often "nearest apex" moved the terminal off the yaw pick
             for hand in HANDS:
@@ -804,6 +828,7 @@ def generate_apex_scenarios(
             ctx = build_context_inputs(
                 r["kit"], r["snap"], num_drums=cfg.num_drums, num_future=cfg.num_future,
                 frame="env", device="cpu", dtype=torch.float64,
+                idle_home=idle_home,
             )
             rec = out[Hb]
             rec["q0"].append(r["q0"].astype(np.float32))
@@ -824,7 +849,11 @@ def generate_apex_scenarios(
                 stats["dual_active"] += 1
                 if hit["left"] != hit["right"]:
                     stats["asymmetric"] += 1
-            if r["k_max"] <= cfg.short_horizon_wp:
+            elif any(r["active"]):
+                stats["single_idle"] += 1
+            # A rest carries the placeholder ``k_max = 1`` and has no hit, so it
+            # is not run-up-to-a-strike data.
+            if any(r["active"]) and r["k_max"] <= cfg.short_horizon_wp:
                 stats["short_horizon"] += 1
 
     packed: dict[int, dict[str, np.ndarray]] = {}

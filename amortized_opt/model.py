@@ -185,6 +185,56 @@ class ModelConfig:
         return N_TOKEN_TYPES if self.idle_home_token else N_TOKEN_TYPES - 1
 
 
+#: Architecture flags that a checkpoint's stored ``model_cfg`` may not carry,
+#: because the field was added to :class:`ModelConfig` after it was written,
+#: mapped to a state-dict key that PROVES whether the trained weights have the
+#: feature.
+#:
+#: Append to this whenever a new field changes a parameter SHAPE.  A field that
+#: only changes behaviour (``frozen_joints``, ``output_mode``) does not belong
+#: here: those round-trip in ``model_cfg`` and have safe defaults.
+ARCH_FROM_WEIGHTS: dict[str, str] = {
+    "idle_home_token": "encoder.idle_proj.weight",
+}
+
+
+def model_config_from_checkpoint(ck: dict, **overrides) -> ModelConfig:
+    """A checkpoint's :class:`ModelConfig`, reconciled against its own weights.
+
+    **Use this instead of ``ModelConfig(**ck["model_cfg"])``.**  That expression
+    fills any field the stored config lacks from the CURRENT default, so a
+    feature that defaults ON reconstructs an architecture the checkpoint never
+    had; the strict load that follows then dies on a shape mismatch.  That is
+    exactly what happened on 2026-08-12, when ``idle_home_token`` began
+    defaulting to True and widened ``encoder.type_emb`` from 3 rows to 4 --
+    every checkpoint written before that date became unloadable by every entry
+    point in the tree at once.
+
+    Trusting the WEIGHTS over the stored config (:data:`ARCH_FROM_WEIGHTS`) is
+    the only thing that stays correct while the package is edited underneath a
+    long run, which is the normal condition here.  Keys the installed
+    ``ModelConfig`` no longer has are dropped with a note rather than raising
+    ``TypeError``: a drop that really did move a parameter shape still fails,
+    loudly, at ``load_state_dict``.
+
+    ``overrides`` win over both, for a caller that is deliberately changing the
+    architecture (``train_phase2.py`` switching the idle token ON over a warm
+    start that predates it, and then reconciling the tensors itself).
+    """
+    stored = dict(ck["model_cfg"])
+    sd = ck.get("model") or {}
+    fields = ModelConfig.__dataclass_fields__
+    for field, proof in ARCH_FROM_WEIGHTS.items():
+        if field not in stored and field in fields:
+            stored[field] = proof in sd
+    unknown = [k for k in stored if k not in fields]
+    for k in unknown:
+        print(f"[model_cfg] checkpoint field {k!r} is no longer in ModelConfig; ignored")
+        stored.pop(k)
+    stored.update(overrides)
+    return ModelConfig(**stored)
+
+
 # ------------------------------------------------------------------ blocks --
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-6):

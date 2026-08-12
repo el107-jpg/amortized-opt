@@ -61,6 +61,27 @@ def parse_args(argv=None):
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-kit-randomization", action="store_true")
+    # ---- the idle arm (must match the phase-2 flags of the same name) ------
+    p.add_argument("--no-idle-home", action="store_true",
+                   help="target the idle arm at its START pose instead of the "
+                        "park posture, and leave the encoder's IDLE context "
+                        "token empty.  Reproduces the pre-2026-08-12 pool -- and "
+                        "leaves ``encoder.idle_proj`` at its random init, since "
+                        "a masked-out token receives no gradient")
+    p.add_argument("--idle-home", default=None,
+                   help="path to an idle-home table (default: "
+                        "assets/idle_home_poses.json when it exists)")
+    p.add_argument("--idle-settle-wp", type=int, default=10,
+                   help="waypoints the retraction eases over before holding "
+                        "home; stretched automatically when that would exceed "
+                        "the arm's speed rating")
+    p.add_argument("--rest-frac", type=float, default=0.25,
+                   help="fraction of BOTH-hands-idle draws kept instead of "
+                        "rejected.  0 reproduces the old distribution")
+    p.add_argument("--no-idle-token", action="store_true",
+                   help="keep the idle-arm TARGETS but drop the encoder's IDLE "
+                        "context token, so the park pose has to be inferred from "
+                        "the seed alone.  The ablation against the default")
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--out", default=None, help="run directory (default runs/phase1_<ts>)")
@@ -84,10 +105,18 @@ def main(argv=None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[run] {run_dir}", flush=True)
 
+    # The idle-arm table is resolved from ONE path, threaded to both consumers
+    # (the target trajectory and the encoder's IDLE context token) so the pose
+    # the model is shown and the pose it is asked to reach cannot disagree.
+    # Phase 2 resolves the same way; the two stages must agree about what an
+    # idle arm does or phase 2 spends its early steps unlearning phase 1.
     scen = ScenarioConfig(
         horizon=int(args.horizon),
         buckets=tuple(args.buckets),
         randomize_kit=not args.no_kit_randomization,
+        idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
+        idle_settle_wp=int(args.idle_settle_wp),
+        rest_frac=float(args.rest_frac),
     )
     noise = NoiseConfig()
     pool_dev = args.pool_device or args.device
@@ -120,14 +149,24 @@ def main(argv=None) -> int:
             f"accepted {s['accepted']}/{s['requested']} "
             f"(drop {100 * (1 - s['accepted'] / max(s['requested'], 1)):.1f}%: "
             f"|qd| {s['reject_velocity']}, idle {s['reject_idle']}); "
-            f"dual-arm {s['dual_active']} (asym {s['asymmetric']}); "
+            f"dual-arm {s['dual_active']} (asym {s['asymmetric']}), "
+            f"single-idle {s.get('single_idle', 0)}, rest {s.get('rest', 0)}; "
             f"peak|qd|/limit p50={np.percentile(pr, 50):.2f} p99={np.percentile(pr, 99):.2f}",
             flush=True,
         )
     print(f"[data] {t_data:.1f} s", flush=True)
 
+    # The IDLE context token is only worth its parameters when the pool carries
+    # a payload for it: with no home table ``build_context_inputs`` leaves the
+    # idle block zeroed and ``idle_valid`` False, the encoder masks those rows
+    # out, and ``idle_proj`` plus the 4th ``type_emb`` row would train at exactly
+    # zero gradient for the whole run and reach phase 2 randomly initialised.
+    # Tying the flag to the data means ``--no-idle-home`` reconstructs the
+    # pre-2026-08-12 encoder bit for bit instead of carrying dead weight.
     model_cfg = A.ModelConfig(
-        max_horizon=int(args.horizon), num_drums=scen.num_drums, num_future=scen.num_future
+        max_horizon=int(args.horizon), num_drums=scen.num_drums,
+        num_future=scen.num_future,
+        idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
     )
     for attr in ("d_model", "dec_layers"):
         val = getattr(args, attr, None)

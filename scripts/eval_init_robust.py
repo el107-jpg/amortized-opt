@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def load_model(ckpt, dev):
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
     model.load_state_dict(ck["model"])
     model.eval()

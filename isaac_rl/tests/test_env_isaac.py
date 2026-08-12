@@ -115,7 +115,7 @@ def test_full_loop_runs_and_scores(isaac_env, request):
     dev = torch.device(request.config.getoption("--isaac-device"))
     B = isaac_env.num_envs
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
     model.load_state_dict(ck["model"])
     model.eval()

@@ -41,7 +41,7 @@ from isaac_rl.schedule import BatchedSchedule, ScheduleConfig  # noqa: E402
 
 def build(args, device, dtype=torch.float32):
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, device)
     model.load_state_dict(ck["model"])
     model.eval()

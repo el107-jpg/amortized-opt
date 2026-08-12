@@ -60,12 +60,14 @@ from .limits import (
     urdf_position_limits,
 )
 from .model import (
+    ARCH_FROM_WEIGHTS,
     AmortizedOptimizer,
     ContextEncoder,
     ContextEncoding,
     ModelConfig,
     TrajectoryDecoder,
     TrajectoryOutput,
+    model_config_from_checkpoint,
     param_counts,
 )
 from .idle_home import (
@@ -213,6 +215,7 @@ __all__ = [
     "ContextEncoding",
     "ContextInputs",
     "FK_POINT_NAMES",
+    "ARCH_FROM_WEIGHTS",
     "ModelConfig",
     "TrajectoryDecoder",
     "TrajectoryOutput",
@@ -221,6 +224,7 @@ __all__ = [
     "drum_tensors_from_scene",
     "fourier_time_features",
     "joint_group_masks",
+    "model_config_from_checkpoint",
     "pack_state",
     "param_counts",
     "waypoint_times",

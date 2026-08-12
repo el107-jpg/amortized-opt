@@ -103,7 +103,7 @@ def main(argv=None) -> int:
         if not path:
             label, path = Path(spec).parent.name, spec
         ck = torch.load(Path(path), map_location="cpu", weights_only=False)
-        model_cfg = A.ModelConfig(**ck["model_cfg"])
+        model_cfg = A.model_config_from_checkpoint(ck)
         model = A.build_model(model_cfg, dev)
         model.load_state_dict(ck["model"])
         model.eval()

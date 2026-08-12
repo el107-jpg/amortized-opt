@@ -206,7 +206,7 @@ def main(argv=None) -> int:  # noqa: C901 -- one linear driver, deliberately
     q0_home = q.clone()
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    mcfg = A.ModelConfig(**ck["model_cfg"])
+    mcfg = A.model_config_from_checkpoint(ck)
     model = A.build_model(mcfg, dev)
     model.load_state_dict(ck["model"])
     H = int((ck.get("scenario_cfg") or {}).get("horizon", 50))

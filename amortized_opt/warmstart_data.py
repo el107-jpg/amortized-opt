@@ -68,6 +68,7 @@ import torch
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
 from .fk import ChainFK, stick_tip_offset
+from .idle_home import resolve_idle_home
 from .limits import isaac_velocity_limits, urdf_position_limits
 from .rhythm import (
     HANDS,
@@ -137,6 +138,36 @@ class ScenarioConfig:
 
     #: Drop a scenario whose two hands are both idle (nothing to plan).
     require_active_hand: bool = True
+
+    # ---------------------------------------------------------- idle arm --
+    #: Park an idle hand at the home posture instead of holding it wherever it
+    #: started.  ``"default"`` uses ``assets/idle_home_poses.json`` when it
+    #: exists, a path names another table, ``None`` keeps the hold-in-place
+    #: target.  Mirrors :attr:`Phase2ScenarioConfig.idle_home_path` field for
+    #: field, and for the same reason: the seed IS the statement of where home
+    #: is, because the decoder reads it as its waypoint tokens.
+    #:
+    #: This also decides whether the encoder's IDLE context token carries a
+    #: payload.  Without a table ``build_context_inputs`` leaves the idle block
+    #: zeroed and ``idle_valid`` False, the encoder masks those rows out, and
+    #: ``encoder.idle_proj`` receives exactly zero gradient for the whole run --
+    #: so a phase-1 model trained without one hands phase 2 a randomly
+    #: initialised token, having learnt nothing about the idle arm and having
+    #: been taught the OPPOSITE behaviour by the hold-in-place target.
+    #:
+    #: ``None`` reproduces the pre-2026-08-12 pool exactly.
+    idle_home_path: str | None = None
+    #: Waypoints the retraction eases over before holding home.  Stretched
+    #: automatically when the arm is far enough away that this would exceed its
+    #: speed rating (``warmstart_trajectory``'s idle branch does the stretch).
+    idle_settle_wp: int = 10
+    #: REST SCENARIOS.  Fraction of draws kept even when NEITHER hand has a
+    #: goal -- the bar rest ``require_active_hand`` otherwise throws away.  Only
+    #: meaningful with a home table: without one the row is a pose held in place
+    #: with nothing to imitate but itself.  Single-hand-idle scenarios are NOT
+    #: affected -- those were always kept, and are ~32 % of the pool.
+    #: 0.0 reproduces the pre-2026-08-12 distribution exactly.
+    rest_frac: float = 0.0
 
     joint_names: tuple[str, ...] = field(default=G1_UPPER_BODY_JOINTS)
     waist_cfg: WaistAimConfig | None = None
@@ -221,6 +252,10 @@ def generate_scenarios(
     q_bounds = urdf_position_limits(names)
     v_limit = isaac_velocity_limits(names)
     H = int(cfg.horizon)
+    # Resolved per call, which under ``generate_pool_parallel`` means once per
+    # worker process -- the config travels as a path string, so the table never
+    # has to be pickled across the fork.
+    idle_home = resolve_idle_home(cfg.idle_home_path, joint_names=names)
 
     out: dict[int, dict[str, list]] = {
         b: {k: [] for k in ("q0", "qd0", "target", "hit", "active", "drum", *CONTEXT_FIELDS)}
@@ -235,6 +270,8 @@ def generate_scenarios(
         "dual_active": 0,
         "asymmetric": 0,
         "short_horizon": 0,
+        "single_idle": 0,
+        "rest": 0,
         "peak_rate_ratio": [],
     }
 
@@ -274,21 +311,40 @@ def generate_scenarios(
             goals[hand] = (g.drum_name, k * cfg.dt)
             aim[hand] = np.asarray(g.position, float)
         active = [hit[h] >= 0 for h in HANDS]
-        if cfg.require_active_hand and not any(active):
-            stats["reject_idle"] += 1
-            continue
+        if not any(active):
+            # A both-hands-idle draw is a REST.  Keep it at ``rest_frac`` when a
+            # home table is available to park the arms at; without one the
+            # target is the start pose held for the whole horizon, which teaches
+            # only that nothing ever moves.
+            if cfg.require_active_hand and (
+                idle_home is None or rng.uniform() >= cfg.rest_frac
+            ):
+                stats["reject_idle"] += 1
+                continue
+            stats["rest"] += 1
         if not all(
             library.has(h, goals[h][0]) for h in HANDS if goals[h] is not None
         ):
             stats["reject_library"] += 1
             continue
 
-        k_max = max([hit[h] for h in HANDS if hit[h] >= 0], default=1)
-        Hb = bucket_for(k_max, cfg.buckets)
+        if any(active):
+            k_max = max(hit[h] for h in HANDS if hit[h] >= 0)
+            Hb = bucket_for(k_max, cfg.buckets)
+        else:
+            # A rest has no hit to size the horizon from, and ``bucket_for(1)``
+            # would file every one of them in the shortest bucket.  Both arms are
+            # masked over the WHOLE grid when neither is active (see
+            # ``build_waypoint_masks``), so spread rests across the buckets
+            # instead -- otherwise the retraction is only ever imitated at the
+            # one horizon too short to show it settle.
+            k_max = 1
+            Hb = int(cfg.buckets[int(rng.integers(len(cfg.buckets)))])
         ws = warmstart_trajectory(
             q0, qd0, horizon=Hb, goals=goals, library=library,
             aim_targets=aim or None, dt=cfg.dt, joint_names=names,
             waist_cfg=cfg.waist_cfg, q_bounds=q_bounds,
+            idle_home=idle_home, idle_settle_wp=cfg.idle_settle_wp,
         )
         target = np.asarray(ws.init_traj, float)
         peak = _peak_rate(q0, target, cfg.dt)
@@ -301,6 +357,7 @@ def generate_scenarios(
         ctx = build_context_inputs(
             kit_s, snap, num_drums=cfg.num_drums, num_future=cfg.num_future,
             frame="env", device="cpu", dtype=torch.float64,
+            idle_home=idle_home,
         )
         rec = out[Hb]
         rec["q0"].append(q0.astype(np.float32))
@@ -322,7 +379,11 @@ def generate_scenarios(
             stats["dual_active"] += 1
             if hit["left"] != hit["right"]:
                 stats["asymmetric"] += 1
-        if k_max <= cfg.short_horizon_wp:
+        elif any(active):
+            stats["single_idle"] += 1
+        # ``short_horizon`` counts the run-up to a hit, so a rest -- which has no
+        # hit and carries the placeholder ``k_max = 1`` -- must not land in it.
+        if any(active) and k_max <= cfg.short_horizon_wp:
             stats["short_horizon"] += 1
 
     packed: dict[int, dict[str, np.ndarray]] = {}

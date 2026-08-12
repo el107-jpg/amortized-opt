@@ -342,12 +342,17 @@ def main(argv=None) -> int:
     pool = load_or_make_pool(args, scen, noise, dev)
 
     # ---- model -------------------------------------------------------------
+    # ``model_config_from_checkpoint`` reconstructs the architecture the weights
+    # ACTUALLY have, not the one today's defaults would build -- so this is the
+    # checkpoint as trained.  The deliberate change (switching the idle token on
+    # over a warm start that predates it) is applied below, explicitly, and the
+    # tensors are reconciled with it.
     if args.resume:
         ck = torch.load(args.resume, map_location="cpu", weights_only=False)
-        model_cfg = A.ModelConfig(**ck["model_cfg"])
+        model_cfg = A.model_config_from_checkpoint(ck)
     elif args.init:
         ck = torch.load(args.init, map_location="cpu", weights_only=False)
-        model_cfg = A.ModelConfig(**ck["model_cfg"])
+        model_cfg = A.model_config_from_checkpoint(ck)
     else:
         ck = None
         model_cfg = A.ModelConfig(max_horizon=int(args.horizon),
@@ -389,7 +394,32 @@ def main(argv=None) -> int:
     model = A.build_model(model_cfg, dev)
     if ck is not None:
         if overridden:
-            missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+            # ``strict=False`` forgives MISSING and UNEXPECTED keys but NOT a
+            # shape mismatch on a key that exists in both -- it still raises.
+            # ``encoder.type_emb.weight`` is exactly that case when the idle
+            # token is switched on over a checkpoint that predates it: (3, 256)
+            # against (4, 256).  Copy the overlapping block (the DRUM / GOAL /
+            # FUTURE rows, which ARE trained) and leave the rest at its random
+            # init, rather than dropping the whole tensor and throwing three
+            # trained embeddings away with the one new row.
+            sd = dict(ck["model"])
+            own = model.state_dict()
+            for k, v in list(sd.items()):
+                w = own.get(k)
+                if w is None or w.shape == v.shape:
+                    continue
+                if w.dim() != v.dim():
+                    print(f"[init] {k}: rank {tuple(v.shape)} != {tuple(w.shape)}, "
+                          f"dropped (random init)", flush=True)
+                    sd.pop(k)
+                    continue
+                sl = tuple(slice(0, min(a, b)) for a, b in zip(w.shape, v.shape))
+                new = w.clone()
+                new[sl] = v[sl].to(new.dtype)
+                sd[k] = new
+                print(f"[init] {k}: {tuple(v.shape)} -> {tuple(w.shape)}, copied "
+                      f"{tuple(s.stop for s in sl)} (remainder random)", flush=True)
+            missing, unexpected = model.load_state_dict(sd, strict=False)
             if missing:
                 print(f"[init] {len(missing)} missing keys (random init): "
                       f"{missing[:3]}...", flush=True)

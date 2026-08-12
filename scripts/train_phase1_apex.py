@@ -67,6 +67,20 @@ def parse_args(argv=None):
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-kit-randomization", action="store_true")
+    # ---- the idle arm (same flags, same meanings, as train_phase1.py) ------
+    p.add_argument("--no-idle-home", action="store_true",
+                   help="target the idle arm at its START pose instead of the "
+                        "park posture, and leave the IDLE context token empty")
+    p.add_argument("--idle-home", default=None,
+                   help="path to an idle-home table (default: "
+                        "assets/idle_home_poses.json when it exists)")
+    p.add_argument("--idle-settle-wp", type=int, default=10)
+    p.add_argument("--rest-frac", type=float, default=0.25,
+                   help="fraction of BOTH-hands-idle draws kept instead of "
+                        "rejected.  0 reproduces the old distribution")
+    p.add_argument("--no-idle-token", action="store_true",
+                   help="keep the idle-arm targets but drop the encoder's IDLE "
+                        "context token")
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--out", default=None, help="run directory (default runs/phase1_apex)")
@@ -138,6 +152,9 @@ def main(argv=None) -> int:
         horizon=int(args.horizon),
         buckets=tuple(args.buckets),
         randomize_kit=not args.no_kit_randomization,
+        idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
+        idle_settle_wp=int(args.idle_settle_wp),
+        rest_frac=float(args.rest_frac),
     )
     acfg = ApexConfig(
         height=float(args.apex_height), radius=float(args.apex_radius),
@@ -175,8 +192,12 @@ def main(argv=None) -> int:
         print(_fmt_stats(name, pool), flush=True)
     print(f"[data] {t_data:.1f} s", flush=True)
 
+    # The IDLE context token is only worth its parameters when the pool carries
+    # a payload for it -- see the same block in ``train_phase1.py``.
     model_cfg = A.ModelConfig(
-        max_horizon=int(args.horizon), num_drums=scen.num_drums, num_future=scen.num_future
+        max_horizon=int(args.horizon), num_drums=scen.num_drums,
+        num_future=scen.num_future,
+        idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
     )
     for attr in ("d_model", "dec_layers"):
         val = getattr(args, attr, None)
