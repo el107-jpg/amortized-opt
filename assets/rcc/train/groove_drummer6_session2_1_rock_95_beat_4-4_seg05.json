@@ -1,0 +1,2276 @@
+{
+  "metadata": {
+    "name": "groove_30s",
+    "source_dataset": "groove_midi_dataset",
+    "source_midi": "/data2/eric/amortized-opt/assets/rcc/groove/drummer6/session2/1_rock_95_beat_4-4.mid",
+    "source_split": "train",
+    "original_bpm": 94.99999208333399,
+    "segment_start_sec": 150.0,
+    "segment_duration_sec": 30.0,
+    "event_count": 215,
+    "drum_counts": {
+      "snare": 55,
+      "hihat": 81,
+      "kick": 58,
+      "cymbal_left": 3,
+      "tom1": 5,
+      "tom2": 1,
+      "floor_tom": 3,
+      "cymbal_right": 9
+    },
+    "pitch_counts": {
+      "40": 98,
+      "22": 139,
+      "36": 299,
+      "38": 386,
+      "44": 140,
+      "37": 26,
+      "42": 60,
+      "46": 62,
+      "48": 18,
+      "55": 14,
+      "26": 67,
+      "45": 8,
+      "49": 3,
+      "51": 78,
+      "53": 63,
+      "43": 11
+    },
+    "ignored_pitch_counts": {},
+    "generated_by": "scripts/convert_groove_midi.py",
+    "tolerance": 0.12,
+    "limb_assignment": "layout_graph_greedy"
+  },
+  "groups": [
+    {
+      "time": 0.169749,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 0.4173
+        }
+      ]
+    },
+    {
+      "time": 0.305276,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4724
+        }
+      ]
+    },
+    {
+      "time": 0.521065,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 0.3543
+        }
+      ]
+    },
+    {
+      "time": 0.627644,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.4803
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4173
+        }
+      ]
+    },
+    {
+      "time": 0.836855,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.4331
+        }
+      ]
+    },
+    {
+      "time": 0.951328,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7638
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.8583
+        }
+      ]
+    },
+    {
+      "time": 1.27896,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5118
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5118
+        }
+      ]
+    },
+    {
+      "time": 1.459223,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2047
+        }
+      ]
+    },
+    {
+      "time": 1.519749,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.1969
+        }
+      ]
+    },
+    {
+      "time": 1.589486,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7795
+        }
+      ]
+    },
+    {
+      "time": 1.602644,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4724
+        }
+      ]
+    },
+    {
+      "time": 1.793434,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2677
+        }
+      ]
+    },
+    {
+      "time": 1.917118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4016
+        }
+      ]
+    },
+    {
+      "time": 2.092118,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.622
+        }
+      ]
+    },
+    {
+      "time": 2.223697,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7953
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 2.536855,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.4961
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7165
+        }
+      ]
+    },
+    {
+      "time": 2.65396,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.1339
+        }
+      ]
+    },
+    {
+      "time": 2.732907,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.6063
+        }
+      ]
+    },
+    {
+      "time": 2.85396,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 3.046065,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.6929
+        }
+      ]
+    },
+    {
+      "time": 3.138171,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.1417
+        }
+      ]
+    },
+    {
+      "time": 3.163171,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7638
+        }
+      ]
+    },
+    {
+      "time": 3.381592,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5591
+        }
+      ]
+    },
+    {
+      "time": 3.463171,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.1811
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.9764
+        }
+      ]
+    },
+    {
+      "time": 3.722381,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.6535
+        }
+      ]
+    },
+    {
+      "time": 3.855276,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4803
+        }
+      ]
+    },
+    {
+      "time": 4.142118,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.9921
+        },
+        {
+          "drum": "cymbal_left",
+          "drum_id": 4,
+          "limb": "left_hand",
+          "velocity": 0.3228
+        }
+      ]
+    },
+    {
+      "time": 4.310539,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.252
+        }
+      ]
+    },
+    {
+      "time": 4.456592,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4016
+        }
+      ]
+    },
+    {
+      "time": 4.636855,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.685
+        }
+      ]
+    },
+    {
+      "time": 4.767118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7165
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.8031
+        }
+      ]
+    },
+    {
+      "time": 5.067118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5984
+        }
+      ]
+    },
+    {
+      "time": 5.143434,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.2441
+        }
+      ]
+    },
+    {
+      "time": 5.222381,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.3465
+        }
+      ]
+    },
+    {
+      "time": 5.347381,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.3858
+        }
+      ]
+    },
+    {
+      "time": 5.36975,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7008
+        }
+      ]
+    },
+    {
+      "time": 5.556592,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2992
+        }
+      ]
+    },
+    {
+      "time": 5.677645,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.8031
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.3858
+        }
+      ]
+    },
+    {
+      "time": 5.996066,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7559
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.9606
+        }
+      ]
+    },
+    {
+      "time": 6.311855,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5669
+        }
+      ]
+    },
+    {
+      "time": 6.525013,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5039
+        }
+      ]
+    },
+    {
+      "time": 6.640803,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4173
+        }
+      ]
+    },
+    {
+      "time": 6.855276,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.378
+        }
+      ]
+    },
+    {
+      "time": 6.952645,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.3228
+        }
+      ]
+    },
+    {
+      "time": 6.967118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7402
+        }
+      ]
+    },
+    {
+      "time": 7.292118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7638
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7008
+        }
+      ]
+    },
+    {
+      "time": 7.573697,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.1102
+        }
+      ]
+    },
+    {
+      "time": 7.611855,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5984
+        }
+      ]
+    },
+    {
+      "time": 7.781592,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.3622
+        }
+      ]
+    },
+    {
+      "time": 7.896066,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5984
+        }
+      ]
+    },
+    {
+      "time": 7.927645,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.2913
+        }
+      ]
+    },
+    {
+      "time": 8.098697,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 8.200013,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7953
+        }
+      ]
+    },
+    {
+      "time": 8.217118,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7323
+        }
+      ]
+    },
+    {
+      "time": 8.514487,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 8.526329,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6772
+        }
+      ]
+    },
+    {
+      "time": 8.623697,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.1339
+        }
+      ]
+    },
+    {
+      "time": 8.843434,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6929
+        }
+      ]
+    },
+    {
+      "time": 9.103961,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5039
+        }
+      ]
+    },
+    {
+      "time": 9.157908,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4803
+        }
+      ]
+    },
+    {
+      "time": 9.457908,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.6142
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 9.771066,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6693
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7402
+        }
+      ]
+    },
+    {
+      "time": 10.090803,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5512
+        }
+      ]
+    },
+    {
+      "time": 10.280277,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5433
+        }
+      ]
+    },
+    {
+      "time": 10.414487,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4488
+        }
+      ]
+    },
+    {
+      "time": 10.597382,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.3386
+        }
+      ]
+    },
+    {
+      "time": 10.680277,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.2756
+        }
+      ]
+    },
+    {
+      "time": 10.698698,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.8346
+        }
+      ]
+    },
+    {
+      "time": 11.038171,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.8268
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.9449
+        }
+      ]
+    },
+    {
+      "time": 11.363171,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6142
+        }
+      ]
+    },
+    {
+      "time": 11.540803,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.4646
+        }
+      ]
+    },
+    {
+      "time": 11.663171,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5433
+        }
+      ]
+    },
+    {
+      "time": 11.673698,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.3937
+        }
+      ]
+    },
+    {
+      "time": 11.863171,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 11.978961,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6063
+        }
+      ]
+    },
+    {
+      "time": 12.167119,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.6063
+        }
+      ]
+    },
+    {
+      "time": 12.296066,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.8504
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7717
+        }
+      ]
+    },
+    {
+      "time": 12.380277,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2283
+        }
+      ]
+    },
+    {
+      "time": 12.553961,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7165
+        }
+      ]
+    },
+    {
+      "time": 12.63554,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5512
+        }
+      ]
+    },
+    {
+      "time": 12.888171,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.4961
+        }
+      ]
+    },
+    {
+      "time": 12.967119,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7402
+        }
+      ]
+    },
+    {
+      "time": 13.264487,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6772
+        }
+      ]
+    },
+    {
+      "time": 13.475014,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.6772
+        }
+      ]
+    },
+    {
+      "time": 13.593435,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.9291
+        }
+      ]
+    },
+    {
+      "time": 13.78554,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7087
+        }
+      ]
+    },
+    {
+      "time": 13.902645,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.748
+        }
+      ]
+    },
+    {
+      "time": 14.076329,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4488
+        }
+      ]
+    },
+    {
+      "time": 14.206593,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7874
+        }
+      ]
+    },
+    {
+      "time": 14.217119,
+      "targets": [
+        {
+          "drum": "cymbal_left",
+          "drum_id": 4,
+          "limb": "left_hand",
+          "velocity": 0.5197
+        }
+      ]
+    },
+    {
+      "time": 14.397382,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4646
+        }
+      ]
+    },
+    {
+      "time": 14.522382,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7559
+        }
+      ]
+    },
+    {
+      "time": 14.53554,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 14.836856,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.811
+        }
+      ]
+    },
+    {
+      "time": 15.136856,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7559
+        }
+      ]
+    },
+    {
+      "time": 15.367119,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7165
+        }
+      ]
+    },
+    {
+      "time": 15.513172,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5512
+        }
+      ]
+    },
+    {
+      "time": 15.842119,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 1.0
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5512
+        }
+      ]
+    },
+    {
+      "time": 16.168435,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 16.184224,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7323
+        }
+      ]
+    },
+    {
+      "time": 16.490803,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 16.581593,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.1024
+        }
+      ]
+    },
+    {
+      "time": 16.672382,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.3228
+        }
+      ]
+    },
+    {
+      "time": 16.778961,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7402
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4567
+        }
+      ]
+    },
+    {
+      "time": 16.948698,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2047
+        }
+      ]
+    },
+    {
+      "time": 17.075014,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4331
+        }
+      ]
+    },
+    {
+      "time": 17.102646,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5669
+        }
+      ]
+    },
+    {
+      "time": 17.393435,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6929
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7559
+        }
+      ]
+    },
+    {
+      "time": 17.705277,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5354
+        }
+      ]
+    },
+    {
+      "time": 17.873698,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5354
+        }
+      ]
+    },
+    {
+      "time": 18.017119,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5748
+        }
+      ]
+    },
+    {
+      "time": 18.22633,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.3465
+        }
+      ]
+    },
+    {
+      "time": 18.306593,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6299
+        }
+      ]
+    },
+    {
+      "time": 18.319751,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.3622
+        }
+      ]
+    },
+    {
+      "time": 18.573698,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.0945
+        }
+      ]
+    },
+    {
+      "time": 18.638172,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.8425
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.7953
+        }
+      ]
+    },
+    {
+      "time": 18.950014,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5669
+        }
+      ]
+    },
+    {
+      "time": 19.018435,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.2362
+        }
+      ]
+    },
+    {
+      "time": 19.106593,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.3071
+        }
+      ]
+    },
+    {
+      "time": 19.180277,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2283
+        }
+      ]
+    },
+    {
+      "time": 19.250014,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4252
+        }
+      ]
+    },
+    {
+      "time": 19.263172,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7323
+        }
+      ]
+    },
+    {
+      "time": 19.442119,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.2677
+        }
+      ]
+    },
+    {
+      "time": 19.56054,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.8189
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.3307
+        }
+      ]
+    },
+    {
+      "time": 19.871067,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7323
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.8268
+        }
+      ]
+    },
+    {
+      "time": 20.178962,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5748
+        }
+      ]
+    },
+    {
+      "time": 20.396067,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5354
+        }
+      ]
+    },
+    {
+      "time": 20.518435,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4488
+        }
+      ]
+    },
+    {
+      "time": 20.731593,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.4094
+        }
+      ]
+    },
+    {
+      "time": 20.811856,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.2913
+        },
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5039
+        }
+      ]
+    },
+    {
+      "time": 21.150014,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.6929
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.8346
+        }
+      ]
+    },
+    {
+      "time": 21.480277,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5512
+        }
+      ]
+    },
+    {
+      "time": 21.64212,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.1969
+        }
+      ]
+    },
+    {
+      "time": 21.76712,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7953
+        }
+      ]
+    },
+    {
+      "time": 21.778962,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.315
+        }
+      ]
+    },
+    {
+      "time": 21.96712,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.6063
+        }
+      ]
+    },
+    {
+      "time": 22.072383,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.8346
+        }
+      ]
+    },
+    {
+      "time": 22.089488,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5197
+        }
+      ]
+    },
+    {
+      "time": 22.393435,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.7874
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 22.71712,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.8268
+        }
+      ]
+    },
+    {
+      "time": 22.918435,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.4016
+        }
+      ]
+    },
+    {
+      "time": 23.027646,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.5433
+        }
+      ]
+    },
+    {
+      "time": 23.210541,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.9134
+        }
+      ]
+    },
+    {
+      "time": 23.350014,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.1339
+        },
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "right_hand",
+          "velocity": 0.3465
+        }
+      ]
+    },
+    {
+      "time": 23.51712,
+      "targets": [
+        {
+          "drum": "tom1",
+          "drum_id": 2,
+          "limb": "right_hand",
+          "velocity": 0.8268
+        }
+      ]
+    },
+    {
+      "time": 23.648699,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5512
+        },
+        {
+          "drum": "tom1",
+          "drum_id": 2,
+          "limb": "right_hand",
+          "velocity": 0.874
+        }
+      ]
+    },
+    {
+      "time": 23.843436,
+      "targets": [
+        {
+          "drum": "tom1",
+          "drum_id": 2,
+          "limb": "right_hand",
+          "velocity": 0.5827
+        }
+      ]
+    },
+    {
+      "time": 23.959225,
+      "targets": [
+        {
+          "drum": "tom2",
+          "drum_id": 3,
+          "limb": "right_hand",
+          "velocity": 0.6299
+        }
+      ]
+    },
+    {
+      "time": 24.156593,
+      "targets": [
+        {
+          "drum": "floor_tom",
+          "drum_id": 6,
+          "limb": "right_hand",
+          "velocity": 0.6772
+        }
+      ]
+    },
+    {
+      "time": 24.264488,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.9843
+        },
+        {
+          "drum": "cymbal_left",
+          "drum_id": 4,
+          "limb": "left_hand",
+          "velocity": 0.6299
+        }
+      ]
+    },
+    {
+      "time": 24.469751,
+      "targets": [
+        {
+          "drum": "floor_tom",
+          "drum_id": 6,
+          "limb": "right_hand",
+          "velocity": 0.4409
+        }
+      ]
+    },
+    {
+      "time": 24.60133,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7402
+        }
+      ]
+    },
+    {
+      "time": 24.618436,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.3386
+        }
+      ]
+    },
+    {
+      "time": 24.921067,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 24.940804,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5276
+        }
+      ]
+    },
+    {
+      "time": 25.24212,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.3937
+        }
+      ]
+    },
+    {
+      "time": 25.405278,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4803
+        }
+      ]
+    },
+    {
+      "time": 25.54212,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7323
+        }
+      ]
+    },
+    {
+      "time": 25.753962,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4646
+        }
+      ]
+    },
+    {
+      "time": 25.861857,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.5906
+        }
+      ]
+    },
+    {
+      "time": 25.888173,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.5433
+        }
+      ]
+    },
+    {
+      "time": 26.177646,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 26.502646,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.4331
+        }
+      ]
+    },
+    {
+      "time": 26.66712,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4646
+        }
+      ]
+    },
+    {
+      "time": 26.790804,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.6929
+        }
+      ]
+    },
+    {
+      "time": 27.001331,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 27.107909,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.7008
+        }
+      ]
+    },
+    {
+      "time": 27.14212,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.4488
+        }
+      ]
+    },
+    {
+      "time": 27.438173,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 27.753962,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.4173
+        }
+      ]
+    },
+    {
+      "time": 27.927646,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.4882
+        }
+      ]
+    },
+    {
+      "time": 28.061857,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.622
+        }
+      ]
+    },
+    {
+      "time": 28.106594,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.1969
+        }
+      ]
+    },
+    {
+      "time": 28.253962,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.5039
+        }
+      ]
+    },
+    {
+      "time": 28.381594,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.811
+        }
+      ]
+    },
+    {
+      "time": 28.406594,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.4646
+        }
+      ]
+    },
+    {
+      "time": 28.594752,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 28.725015,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 28.91712,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 0.7244
+        }
+      ]
+    },
+    {
+      "time": 28.950015,
+      "targets": [
+        {
+          "drum": "hihat",
+          "drum_id": 1,
+          "limb": "left_hand",
+          "velocity": 0.2362
+        }
+      ]
+    },
+    {
+      "time": 29.031594,
+      "targets": [
+        {
+          "drum": "floor_tom",
+          "drum_id": 6,
+          "limb": "right_hand",
+          "velocity": 0.8268
+        }
+      ]
+    },
+    {
+      "time": 29.214489,
+      "targets": [
+        {
+          "drum": "tom1",
+          "drum_id": 2,
+          "limb": "right_hand",
+          "velocity": 0.6142
+        }
+      ]
+    },
+    {
+      "time": 29.334225,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 0.8898
+        }
+      ]
+    },
+    {
+      "time": 29.348699,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.3228
+        }
+      ]
+    },
+    {
+      "time": 29.525015,
+      "targets": [
+        {
+          "drum": "tom1",
+          "drum_id": 2,
+          "limb": "right_hand",
+          "velocity": 0.5591
+        }
+      ]
+    },
+    {
+      "time": 29.634225,
+      "targets": [
+        {
+          "drum": "kick",
+          "drum_id": 7,
+          "limb": "right_foot",
+          "velocity": 1.0
+        }
+      ]
+    },
+    {
+      "time": 29.653962,
+      "targets": [
+        {
+          "drum": "cymbal_right",
+          "drum_id": 5,
+          "limb": "right_hand",
+          "velocity": 0.2756
+        }
+      ]
+    },
+    {
+      "time": 29.939489,
+      "targets": [
+        {
+          "drum": "snare",
+          "drum_id": 0,
+          "limb": "left_hand",
+          "velocity": 1.0
+        }
+      ]
+    }
+  ]
+}

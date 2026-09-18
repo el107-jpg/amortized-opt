@@ -49,6 +49,7 @@ from torch.distributions import Normal
 from amortized_opt.constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, N_DOF
 from amortized_opt.model import AmortizedOptimizer, ContextEncoding, ModelConfig
 from amortized_opt.tokenizer import ContextInputs, WaypointMasks, build_waypoint_masks
+from amortized_opt.warmstart import arm_slice, waist_slice
 
 from .cfg import ActorConfig, CriticConfig
 
@@ -310,7 +311,10 @@ class PrivilegedObsSpec:
             ("goal_pos", 6),                      # aim point per hand
             ("goal_vel", 6),                      # commanded impact velocity
             ("goal_valid", 2),
-            ("future_tth", 2 * self.num_future),  # the next few beats
+            # the next few beats, as HIT-RELATIVE gaps from the current goal's
+            # strike (``ContextInputs.future_gap``) -- same width, but it no
+            # longer slides with the tick.
+            ("future_gap", 2 * self.num_future),
         ]
         if self.include_tips:
             b.append(("tip_pos", 6))              # both stick tips, pelvis frame
@@ -406,6 +410,9 @@ class AmortizedPpoActor(nn.Module):
         self.n = len(self.joint_names)
         self.dt = float(control_dt)
         self.H = int(cfg.horizon)
+        self.arm_cols = {h: arm_slice(hand, self.joint_names)
+                         for h, hand in enumerate(("left", "right"))}
+        self.waist_cols = waist_slice(self.joint_names)
 
         # ---- freeze the backbone -------------------------------------------
         for p in self.model.parameters():
@@ -530,18 +537,57 @@ class AmortizedPpoActor(nn.Module):
 
         init = inputs.init * masks.elem_mask
         self._hidden = None
-        out = self.model.refine(
-            init, inputs.state, encoding, masks,
-            iterations=int(cfg.iterations if iterations is None else iterations))
+        # Collection's IsaacMPC.plan runs refine under eval(); dropout in
+        # train() was a ~0.07-nat mean mismatch before any PPO step.
+        was = self.model.training
+        self.model.eval()
+        try:
+            out = self.model.refine(
+                init, inputs.state, encoding, masks,
+                iterations=int(cfg.iterations if iterations is None else iterations))
+        finally:
+            if was:
+                self.model.train()
 
-        raw_first = out.traj[:, 0]
+        traj = out.traj
+        if cfg.freeze_wp > 0:
+            traj = traj.clone()
+            self._apply_freeze(traj, inputs.init, inputs.hit_index)
+
+        raw_first = traj[:, 0]
         hidden = None
         mean = raw_first
         if self.mean_correction is not None and self._hidden is not None:
             hidden = self._hidden[:, 1]                     # waypoint 0
             mean = mean + cfg.mean_correction_scale * self.mean_correction(hidden)
-        return PlanOutput(mean=mean, traj=out.traj, elem_mask=out.elem_mask,
+        return PlanOutput(mean=mean, traj=traj, elem_mask=out.elem_mask,
                           raw_first=raw_first, hidden=hidden)
+
+    def _apply_freeze(
+        self,
+        traj: torch.Tensor,
+        init: torch.Tensor,
+        hit_index: torch.Tensor,
+    ) -> None:
+        """Copy the previous plan through contact for the striking arm.
+
+        Mirrors ``IsaacMPC.plan`` so the PPO replay mean matches collection
+        on frozen ticks.  In-place on ``traj``.
+        """
+        n = int(self.cfg.freeze_wp)
+        hit_any = torch.zeros(traj.shape[0], dtype=torch.bool, device=traj.device)
+        for h in (0, 1):
+            k = hit_index[:, h]
+            sel = (k >= 1) & (k <= n)
+            if bool(sel.any()):
+                cols = self.arm_cols[h]
+                m = sel.view(-1, 1, 1)
+                traj[:, :, cols] = torch.where(m, init[:, :, cols], traj[:, :, cols])
+                hit_any |= sel
+        if self.cfg.freeze_waist and bool(hit_any.any()):
+            m = hit_any.view(-1, 1, 1)
+            wc = self.waist_cols
+            traj[:, :, wc] = torch.where(m, init[:, :, wc], traj[:, :, wc])
 
     # ---------------------------------------------------- the Gaussian head --
     def current_std(self) -> torch.Tensor:

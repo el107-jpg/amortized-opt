@@ -46,10 +46,13 @@ Computed ONCE per pool entry on the GPU, from the *target* trajectory:
 * ``vel`` / ``acc`` -- the C2 spline's own derivatives at each waypoint
   (:mod:`amortized_opt.tspline`, clamped to ``v0`` at the start, natural at the
   strike -- the same spline the cost builds);
-* ``torque`` -- ``max(|tau_{i-1}|, |tau_i|)``, i.e. the peak |tau| over the
-  segment ending at waypoint ``i``, from :class:`~amortized_opt.rnea.BatchedRNEA`
-  driven by the ``knot_fd`` finite differences :mod:`amortized_opt.cost` uses in
-  its default ``physics_mode``;
+* ``torque`` -- by default (``torque_mode="rnea_segmax"``)
+  ``max(|tau_{i-1}|, |tau_i|)``, i.e. the peak |tau| over the segment ending at
+  waypoint ``i``, from :class:`~amortized_opt.rnea.BatchedRNEA` driven by the
+  ``knot_fd`` finite differences :mod:`amortized_opt.cost` uses in its default
+  ``physics_mode``.  With ``torque_mode="tracking"`` it is instead the DEMANDED
+  PD tracking torque ``|tau_rnea + tau_fb|`` at the waypoint, the very quantity
+  ``w_track_torque`` prices -- see :func:`aux_targets`;
 * ``fk_pos`` / ``fk_vel`` -- tip / wrist / elbow of both arms
   (:data:`~amortized_opt.tokenizer.FK_POINT_NAMES` order), positions from
   :class:`~amortized_opt.fk.ChainFK` at the waypoint and velocities by the
@@ -67,14 +70,16 @@ import numpy as np
 import torch
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
-from .fk import ChainFK, stick_tip_offset
+from .fk import ChainFK, StickRandomization, stick_tip_offset
 from .idle_home import resolve_idle_home
+from .ik import corrected_arm_terminals
 from .limits import isaac_velocity_limits, urdf_position_limits
 from .rhythm import (
     HANDS,
     DrumKit,
     KitRandomization,
     RhythmClip,
+    aim_inputs_from_snapshot,
     build_context_inputs,
     default_rcc_dir,
     goal_snapshot,
@@ -101,7 +106,9 @@ __all__ = [
 CONTEXT_FIELDS: tuple[str, ...] = tuple(ContextInputs.__dataclass_fields__)
 
 _LONG_FIELDS = frozenset({"goal_drum", "future_drum"})
-_BOOL_FIELDS = frozenset({"drum_valid", "goal_valid", "future_valid", "idle_valid"})
+_BOOL_FIELDS = frozenset(
+    {"drum_valid", "goal_valid", "future_valid", "idle_valid", "stick_valid", "aim_valid"}
+)
 
 
 # =============================================================== config ======
@@ -123,6 +130,11 @@ class ScenarioConfig:
     hit_radius_frac: float = 0.6
     speed_min: float = 1.0
     speed_max: float = 3.0
+
+    #: Rhythm augmentation at snapshot time (see
+    #: :func:`~amortized_opt.rhythm.goal_snapshot`); 0.0 = old stream.
+    hit_time_jitter_s: float = 0.0
+    hit_loudness_jitter: float = 0.0
 
     #: Fraction of scenarios whose "now" is snapped to within
     #: ``short_horizon_wp`` waypoints of a hit -- the plan's "include a few more
@@ -169,8 +181,26 @@ class ScenarioConfig:
     #: 0.0 reproduces the pre-2026-08-12 distribution exactly.
     rest_frac: float = 0.0
 
+    #: THE FITTED STICK.  ``None`` = every sample uses the nominal stick from
+    #: ``constants.py``, which is the shipped behaviour.  Set it and each
+    #: scenario draws its own per-hand stick, which is carried in the context
+    #: (``TYPE_STICK``) and priced by the cost -- both are required, or the
+    #: variation is unlearnable noise the way the drum jitter was.
+    stick_rand: "StickRandomization | None" = None
+    #: One-shot full-arm DLS on quintic terminals (kit jitter / yaw-bin).
+    #: 0 disables; default 1 matches phase-2 so training inits match deployment.
+    #: Batched like apex pass 2.  Apex teacher (if used) keeps its own 3-step.
+    correct_terminal_steps: int = 1
+    correct_terminal_damping: float = 0.05
+
     joint_names: tuple[str, ...] = field(default=G1_UPPER_BODY_JOINTS)
     waist_cfg: WaistAimConfig | None = None
+    #: Pitch/roll ease-to-upright window for the seed AND the imitation target
+    #: (``warmstart_trajectory``'s ``waist_upright_ease_wp``).  None keeps the
+    #: hold-the-measured-lean behaviour bit for bit; ~5 teaches phase 1 to
+    #: RECOVER upright instead of blessing the sampled lean, which is the
+    #: prior the phase-2 upright well otherwise has to fight.
+    waist_upright_ease_wp: int | None = None
 
     def __post_init__(self) -> None:
         self.buckets = tuple(sorted(int(b) for b in self.buckets))
@@ -256,6 +286,7 @@ def generate_scenarios(
     # worker process -- the config travels as a path string, so the table never
     # has to be pickled across the fork.
     idle_home = resolve_idle_home(cfg.idle_home_path, joint_names=names)
+    fk64 = ChainFK(device="cpu", dtype=torch.float64)
 
     out: dict[int, dict[str, list]] = {
         b: {k: [] for k in ("q0", "qd0", "target", "hit", "active", "drum", *CONTEXT_FIELDS)}
@@ -272,11 +303,76 @@ def generate_scenarios(
         "short_horizon": 0,
         "single_idle": 0,
         "rest": 0,
+        "terminal_corrected": 0,
         "peak_rate_ratio": [],
     }
 
     starts = None
     si = 0
+    pending: list[dict] = []
+    _CHUNK = 512
+
+    def _emit_ws(*, q0, qd0, target, hit, active, kit_s, snap, sticks, Hb, k_max):
+        ctx = build_context_inputs(
+            kit_s, snap, num_drums=cfg.num_drums, num_future=cfg.num_future,
+            frame="env", device="cpu", dtype=torch.float64,
+            idle_home=idle_home, sticks=sticks,
+            yaw_now=q0[names.index("waist_yaw_joint")], waist_cfg=cfg.waist_cfg,
+        )
+        rec = out[Hb]
+        rec["q0"].append(q0.astype(np.float32))
+        rec["qd0"].append(qd0.astype(np.float32))
+        rec["target"].append(np.asarray(target, float).astype(np.float32))
+        rec["hit"].append(np.array([hit["left"], hit["right"]], dtype=np.int64))
+        rec["active"].append(np.array(active, dtype=bool))
+        rec["drum"].append(
+            np.array(
+                [snap.goal[h].drum if hit[h] >= 0 else -1 for h in HANDS], dtype=np.int64
+            )
+        )
+        for f in CONTEXT_FIELDS:
+            v = getattr(ctx, f)[0].numpy()
+            rec[f].append(v.astype(np.int64) if f in _LONG_FIELDS
+                          else (v.astype(bool) if f in _BOOL_FIELDS else v.astype(np.float32)))
+        stats["accepted"] += 1
+        if all(active):
+            stats["dual_active"] += 1
+            if hit["left"] != hit["right"]:
+                stats["asymmetric"] += 1
+        elif any(active):
+            stats["single_idle"] += 1
+        if any(active) and k_max <= cfg.short_horizon_wp:
+            stats["short_horizon"] += 1
+
+    def _flush_pending():
+        if not pending:
+            return
+        if cfg.correct_terminal_steps > 0:
+            terms = corrected_arm_terminals(
+                fk64, pending,
+                steps=int(cfg.correct_terminal_steps),
+                damping=float(cfg.correct_terminal_damping),
+                q_bounds=q_bounds, joint_names=names, library=library,
+            )
+            for p, term in zip(pending, terms):
+                if term:
+                    p["ws"] = warmstart_trajectory(
+                        p["q0"], p["qd0"], terminal_arm=term, **p["ws_kw"]
+                    )
+                    stats["terminal_corrected"] += len(term)
+        for p in pending:
+            target = np.asarray(p["ws"].init_traj, float)
+            ratio = float((_peak_rate(p["q0"], target, cfg.dt) / v_limit).max())
+            stats["peak_rate_ratio"].append(ratio)
+            if ratio > cfg.vel_reject_scale:
+                stats["reject_velocity"] += 1
+                continue
+            _emit_ws(
+                q0=p["q0"], qd0=p["qd0"], target=target, hit=p["hit"],
+                active=p["active"], kit_s=p["kit_s"], snap=p["snap"],
+                sticks=p["sticks"], Hb=p["Hb"], k_max=p["k_max"],
+            )
+        pending.clear()
     for i in range(int(n)):
         if starts is None or si >= len(starts):
             starts = sampler.sample(int(start_chunk), rng=rng)
@@ -296,15 +392,22 @@ def generate_scenarios(
             hit_radius_frac=cfg.hit_radius_frac,
             speed_min=cfg.speed_min, speed_max=cfg.speed_max,
             horizon_cap=H * cfg.dt,
+            time_jitter_s=cfg.hit_time_jitter_s,
+            loudness_jitter=cfg.hit_loudness_jitter,
         )
         hit = {}
         goals: dict[str, tuple[str, float] | None] = {}
         aim: dict[str, np.ndarray] = {}
+        # Future-aware aim inputs, the same ones ``build_context_inputs`` below
+        # tokenizes: the imitation TARGET's yaw ramp and the ``aim_yaw`` token
+        # the model conditions on have to name one yaw.
+        _t, aim_tth, aim_futures = aim_inputs_from_snapshot(snap, frame="env")
         for hand in HANDS:
             g = snap.goal[hand]
             if not g.active:
                 hit[hand] = -1
                 goals[hand] = None
+                aim_tth.pop(hand, None)
                 continue
             k = int(np.clip(round(g.time_to_hit / cfg.dt), 1, H))
             hit[hand] = k
@@ -340,51 +443,28 @@ def generate_scenarios(
             # one horizon too short to show it settle.
             k_max = 1
             Hb = int(cfg.buckets[int(rng.integers(len(cfg.buckets)))])
-        ws = warmstart_trajectory(
-            q0, qd0, horizon=Hb, goals=goals, library=library,
-            aim_targets=aim or None, dt=cfg.dt, joint_names=names,
+        sticks = None
+        if cfg.stick_rand is not None:
+            sticks = (cfg.stick_rand.sample(rng, "left"),
+                      cfg.stick_rand.sample(rng, "right"))
+        ws_kw = dict(
+            horizon=Hb, goals=goals, library=library,
+            aim_targets=aim or None, aim_tth=aim_tth, aim_futures=aim_futures,
+            dt=cfg.dt, joint_names=names,
             waist_cfg=cfg.waist_cfg, q_bounds=q_bounds,
+            waist_upright_ease_wp=cfg.waist_upright_ease_wp,
             idle_home=idle_home, idle_settle_wp=cfg.idle_settle_wp,
         )
-        target = np.asarray(ws.init_traj, float)
-        peak = _peak_rate(q0, target, cfg.dt)
-        ratio = float((peak / v_limit).max())
-        stats["peak_rate_ratio"].append(ratio)
-        if ratio > cfg.vel_reject_scale:
-            stats["reject_velocity"] += 1
-            continue
+        pending.append({
+            "ws": warmstart_trajectory(q0, qd0, **ws_kw),
+            "ws_kw": ws_kw, "q0": q0, "qd0": qd0, "goals": goals,
+            "aim": aim, "hit": hit, "active": active, "sticks": sticks,
+            "kit_s": kit_s, "snap": snap, "Hb": Hb, "k_max": k_max,
+        })
+        if len(pending) >= _CHUNK:
+            _flush_pending()
 
-        ctx = build_context_inputs(
-            kit_s, snap, num_drums=cfg.num_drums, num_future=cfg.num_future,
-            frame="env", device="cpu", dtype=torch.float64,
-            idle_home=idle_home,
-        )
-        rec = out[Hb]
-        rec["q0"].append(q0.astype(np.float32))
-        rec["qd0"].append(qd0.astype(np.float32))
-        rec["target"].append(target.astype(np.float32))
-        rec["hit"].append(np.array([hit["left"], hit["right"]], dtype=np.int64))
-        rec["active"].append(np.array(active, dtype=bool))
-        rec["drum"].append(
-            np.array(
-                [snap.goal[h].drum if hit[h] >= 0 else -1 for h in HANDS], dtype=np.int64
-            )
-        )
-        for f in CONTEXT_FIELDS:
-            v = getattr(ctx, f)[0].numpy()
-            rec[f].append(v.astype(np.int64) if f in _LONG_FIELDS
-                          else (v.astype(bool) if f in _BOOL_FIELDS else v.astype(np.float32)))
-        stats["accepted"] += 1
-        if all(active):
-            stats["dual_active"] += 1
-            if hit["left"] != hit["right"]:
-                stats["asymmetric"] += 1
-        elif any(active):
-            stats["single_idle"] += 1
-        # ``short_horizon`` counts the run-up to a hit, so a rest -- which has no
-        # hit and carries the placeholder ``k_max = 1`` -- must not land in it.
-        if any(active) and k_max <= cfg.short_horizon_wp:
-            stats["short_horizon"] += 1
+    _flush_pending()
 
     packed: dict[int, dict[str, np.ndarray]] = {}
     for b, rec in out.items():
@@ -477,13 +557,44 @@ def aux_targets(
     fk: ChainFK,
     rnea: BatchedRNEA,
     dt: float = CONTROL_DT,
+    torque_mode: str = "rnea_segmax",
+    tau_kernel: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Spline / torque / FK labels for one bucket-homogeneous block.
 
     All five heads' targets, per waypoint:
     ``vel``/``acc``/``torque`` ``(B, H, 17)``, ``fk_pos``/``fk_vel``
     ``(B, H, 6, 3)``.
+
+    ``torque_mode`` picks WHICH physical torque the ``torque`` label -- and so
+    the model's ``head_torque`` -- is asked to predict:
+
+    * ``"rnea_segmax"`` (**the default, and what every checkpoint before
+      2026-08-16 was trained on**): ``max(|tau_rnea[i-1]|, |tau_rnea[i]|)``,
+      the peak inverse-dynamics torque over the segment ENDING at waypoint
+      ``i``, from the knot finite differences.  It is the plan's own OPEN-LOOP
+      dynamics: it says nothing about what the servo has to spend to make the
+      plant follow the plan.
+    * ``"tracking"``: ``|tau_rnea[i] + tau_fb[i]|`` at waypoint ``i``, the
+      torque the PD servo actually DEMANDS while tracking this plan, from
+      :func:`~amortized_opt.pd_sim.tracking_torque_knots` -- literally the same
+      function, kernel and DC removal that
+      :meth:`~amortized_opt.cost.FusedCost._track_torque` prices.  This is the
+      mode consistent with ``w_track_torque`` / ``w_track_torque_peak``: with
+      it on, the head predicts the quantity the cost charges for, so the
+      planner's own torque estimate and the objective agree.  It is a
+      per-waypoint value, not a segment max, because the FIR bank lives on the
+      control-tick grid.
+
+    ``tau_kernel`` is the ``(17, L)`` FIR bank; ``"tracking"`` identifies one
+    with :func:`~amortized_opt.pd_sim.nominal_torque_kernels` when it is not
+    supplied.  Pass it when calling in a loop -- identification runs a small PD
+    rollout.  Ignored under ``"rnea_segmax"``.
     """
+    if torque_mode not in ("rnea_segmax", "tracking"):
+        raise ValueError(
+            f"torque_mode must be 'rnea_segmax' or 'tracking', got {torque_mode!r}"
+        )
     B, H, D = target.shape
     sp = builder.from_masks(q0, target, v0, elem_mask)
 
@@ -492,12 +603,24 @@ def aux_targets(
     vel = qd[:, :, 0, :]
     acc = qdd[:, :, 0, :]
 
-    xk, qd_fd, qdd_fd = sp.knot_finite_differences(v0)  # (B, H+1, D)
-    n = xk.shape[1]
-    tau = rnea.rnea(
-        xk.reshape(B * n, D), qd_fd.reshape(B * n, D), qdd_fd.reshape(B * n, D)
-    ).reshape(B, n, D).abs()
-    torque = torch.maximum(tau[:, :-1], tau[:, 1:])  # segment ending at waypoint i
+    if torque_mode == "tracking":
+        from .pd_sim import nominal_torque_kernels, tracking_torque_knots
+
+        if tau_kernel is None:
+            tau_kernel = nominal_torque_kernels(
+                rnea, joint_names=tuple(builder.joint_names), dt=float(dt),
+                device=target.device, dtype=target.dtype,
+            )
+        tau_hat, xk, _qd_fd = tracking_torque_knots(sp, v0, rnea, tau_kernel)
+        torque = tau_hat[:, 1:].abs()          # (B, H, D), waypoints 1..H
+        n = xk.shape[1]
+    else:
+        xk, qd_fd, qdd_fd = sp.knot_finite_differences(v0)  # (B, H+1, D)
+        n = xk.shape[1]
+        tau = rnea.rnea(
+            xk.reshape(B * n, D), qd_fd.reshape(B * n, D), qdd_fd.reshape(B * n, D)
+        ).reshape(B, n, D).abs()
+        torque = torch.maximum(tau[:, :-1], tau[:, 1:])  # segment ending at waypoint i
 
     pts = _fk_points(fk, xk.reshape(B * n, D)).reshape(B, n, len(FK_POINT_NAMES), 3)
     fk_pos = pts[:, 1:]
@@ -541,7 +664,13 @@ class WarmstartPool:
         rnea: BatchedRNEA | None = None,
         aux_chunk: int = 131_072,
         stats: dict | None = None,
+        aux_torque_tracking: bool = False,
     ):
+        #: ``True`` -> the stored ``aux_torque`` label is the DEMANDED PD
+        #: tracking torque instead of the RNEA segment max.  Opt-in: ``False``
+        #: reproduces every pool built before 2026-08-16 bit-for-bit.  See
+        #: :func:`aux_targets`.
+        self.aux_torque_tracking = bool(aux_torque_tracking)
         self.cfg = cfg
         self.noise = noise or NoiseConfig()
         self.device = torch.device(device)
@@ -556,6 +685,16 @@ class WarmstartPool:
         rnea = rnea or BatchedRNEA.from_urdf(
             joint_names=names, with_armature=True, device=self.device, dtype=dtype
         )
+        # Identify the command -> demand FIR bank ONCE, not per bucket-chunk.
+        tau_kernel = None
+        if self.aux_torque_tracking:
+            from .pd_sim import nominal_torque_kernels
+
+            tau_kernel = nominal_torque_kernels(
+                rnea, joint_names=names, dt=float(cfg.dt),
+                device=self.device, dtype=dtype,
+            )
+        self.aux_tau_kernel = tau_kernel
         self.data: dict[int, dict[str, torch.Tensor]] = {}
         self._ou: dict[int, torch.Tensor] = {}
         for H, arrays in sorted(buckets.items()):
@@ -586,6 +725,10 @@ class WarmstartPool:
                 a = aux_targets(
                     d["q0"][sl], d["target"][sl], d["qd0"][sl], d["elem_mask"][sl],
                     builder=builder, fk=fk, rnea=rnea, dt=cfg.dt,
+                    torque_mode=(
+                        "tracking" if self.aux_torque_tracking else "rnea_segmax"
+                    ),
+                    tau_kernel=tau_kernel,
                 )
                 for k, v in a.items():
                     aux.setdefault(k, []).append(v)
@@ -703,6 +846,7 @@ def generate_pool(
     dtype: torch.dtype = torch.float32,
     fk: ChainFK | None = None,
     rnea: BatchedRNEA | None = None,
+    aux_torque_tracking: bool = False,
 ) -> WarmstartPool:
     """Generate ``n`` scenarios and wrap them in a :class:`WarmstartPool`."""
     cfg = cfg or ScenarioConfig()
@@ -712,6 +856,7 @@ def generate_pool(
     return WarmstartPool(
         raw["buckets"], cfg=cfg, noise=noise, device=device, dtype=dtype,
         fk=fk, rnea=rnea, stats=raw["stats"],
+        aux_torque_tracking=aux_torque_tracking,
     )
 
 

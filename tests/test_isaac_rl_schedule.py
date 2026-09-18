@@ -92,17 +92,25 @@ def test_goal_tth_matches_mpc_generator(kit, clips):
 
 
 def test_future_tokens_match(kit, clips):
+    """Including the HIT-RELATIVE anchoring of ``future_gap``.
+
+    ``GoalSnapshot`` still carries from-now times; the anchoring happens in
+    ``rhythm.build_context_inputs`` and the batched scheduler has to reproduce
+    it exactly -- the current goal's strike when the hand has one, else now.
+    """
     gen = MPCGenerator(kit=kit, config=MPCGenConfig(horizon=H, hit_radius_frac=0.0))
     s = _sched(kit, clips, 1)
     for step in range(40):
         ctx = s.context()
         snap = gen._snapshot(clips[0], step * DT, np.random.default_rng(0))
         for hi, hand in enumerate(("left", "right")):
+            g = snap.goal[hand]
+            anchor = g.time_to_hit if g.active else 0.0
             for j, fut in enumerate(snap.future[hand][:3]):
                 assert bool(ctx.future_valid[0, hi, j]) == bool(fut.active)
                 if fut.active:
-                    assert float(ctx.future_tth[0, hi, j]) == pytest.approx(
-                        fut.time_to_hit, abs=1e-5)
+                    assert float(ctx.future_gap[0, hi, j]) == pytest.approx(
+                        fut.time_to_hit - anchor, abs=1e-5)
                     assert int(ctx.future_drum[0, hi, j]) == int(fut.drum)
         s.advance()
 

@@ -67,6 +67,27 @@ def test_quantize_time_rounds_to_nearest():
     assert abs(quantize_time(-0.011) + 0.02) < 1e-12
 
 
+def test_pad_first_hit_to_preserves_gaps(tmp_path, kit):
+    from amortized_opt.rhythm import pad_first_hit_to, shift_rcc_json
+
+    path = default_rcc_dir("eval") / (
+        "groove_eval_drummer1_session2_62_punk_144_beat_4-4_seg05.json"
+    )
+    clip = load_rcc(path, kit)
+    t0 = min(h.time for h in clip.hits)
+    gaps = np.diff(sorted(h.time for h in clip.hits))
+    padded, dt = pad_first_hit_to(clip, 1.0)
+    assert dt == pytest.approx(1.0 - t0)
+    assert min(h.time for h in padded.hits) == pytest.approx(1.0)
+    assert np.allclose(np.diff(sorted(h.time for h in padded.hits)), gaps)
+    dest = tmp_path / "padded.json"
+    shift_rcc_json(path, dest, dt)
+    raw = __import__("json").loads(path.read_text())
+    out = __import__("json").loads(dest.read_text())
+    assert out["groups"][0]["time"] == pytest.approx(raw["groups"][0]["time"] + dt)
+    assert out["groups"][1]["time"] == pytest.approx(raw["groups"][1]["time"] + dt)
+
+
 def test_hand_and_drum_vocabulary_matches_the_repo_loader(kit, capsys):
     """The vendored parser must map limbs / aliases exactly like the env's.
 
@@ -189,6 +210,26 @@ def test_hit_points_stay_inside_the_legal_strike_region(kit):
             if half is not None:
                 assert float(off @ half) >= -1e-9  # on the playable semicircle
     assert np.array_equal(sample_hit_point(kit, 0, None), strike_region(kit, 0)[0])
+
+
+def test_hit_cylinder_is_1cm_inside_the_head():
+    """Legal volume is a 1 cm slab from the inset aim out to the head surface."""
+    from amortized_opt.strike import (
+        STRIKE_AXIAL_HEIGHT,
+        STRIKE_SURFACE_OFFSET,
+        strike_aim_on_head,
+        strike_axial_limits,
+    )
+
+    assert STRIKE_SURFACE_OFFSET == pytest.approx(0.01)
+    assert STRIKE_AXIAL_HEIGHT == pytest.approx(0.01)
+    lo, hi = strike_axial_limits()
+    assert lo == pytest.approx(0.0)
+    assert hi == pytest.approx(0.01)
+    c = np.array([0.35, 0.26, 0.8])
+    n = np.array([0.0, 0.0, 1.0])
+    aim, _r = strike_aim_on_head(c, n, 0.19, name="snare")
+    assert float((c - aim) @ n) == pytest.approx(0.01)
 
 
 def test_hit_points_track_the_strike_aim(kit):

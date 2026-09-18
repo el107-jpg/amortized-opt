@@ -56,7 +56,11 @@ __all__ = [
     "correlated_noise",
     "arm_slice",
     "waist_slice",
+    "waist_pr_slice",
     "warmstart_trajectory",
+    "seed_waist_pr_to_sp",
+    "update_waist_pr_ema",
+    "rewrite_waist_target_to_sp",
 ]
 
 _WAIST_NAMES = ("waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint")
@@ -68,6 +72,193 @@ def arm_slice(hand: str, joint_names=G1_UPPER_BODY_JOINTS) -> list[int]:
 
 def waist_slice(joint_names=G1_UPPER_BODY_JOINTS) -> list[int]:
     return [i for i, n in enumerate(joint_names) if n.startswith("waist_")]
+
+
+def waist_pr_slice(joint_names=G1_UPPER_BODY_JOINTS) -> list[int]:
+    """Pitch then roll, matching ``FusedCost.c_waist_pr`` order."""
+    names = tuple(joint_names)
+    return [names.index("waist_pitch_joint"), names.index("waist_roll_joint")]
+
+
+def update_waist_pr_ema(ema, cmd_pr, *, alpha: float = 0.1, leak: float = 0.02):
+    """Leaky EMA of the committed (clipped) waist pitch/roll command.
+
+    ``ema ← (1 − leak) · ((1 − α) · ema + α · cmd_pr)``.  ``α = 1`` is
+    lag-1; ``leak = 1`` snaps to upright.  The two jobs are separate:
+    memory stops closed-loop hunting, leak is the attractor toward 0.
+    Works on numpy arrays and torch tensors.  Caller ``stopgrad``s.
+    """
+    a = float(alpha)
+    b = float(leak)
+    if not 0.0 <= a <= 1.0:
+        raise ValueError(f"alpha must be in [0, 1], got {a}")
+    if not 0.0 <= b <= 1.0:
+        raise ValueError(f"leak must be in [0, 1], got {b}")
+    return (1.0 - b) * ((1.0 - a) * ema + a * cmd_pr)
+
+
+def seed_waist_pr_to_sp(
+    init,
+    q0,
+    qd0,
+    sp_pr,
+    *,
+    joint_names=None,
+    dt: float = CONTROL_DT,
+    ease_wp: int | None = None,
+):
+    """Ease ``init`` pitch/roll to the encoder set-point -- the yaw-ramp analogue.
+
+    Yaw's quintic already ramps to :func:`~amortized_opt.waist_aim.aim_yaw`
+    (the encoder yaw head's untrained set-point).  Pitch/roll have no analytic
+    aim; ``sp_pr`` *is* that set-point.  Untrained (``sp_pr == 0``) is the
+    existing ease-to-upright.  ``sp_pr`` is detached: the seed is a prior, not
+    a gradient path.  No-op when ``sp_pr`` is None.
+
+    ``ease_wp`` is the minimum window (waypoints); the same 1.875x stretch as
+    ``waist_upright_ease_wp`` applies.  ``None`` uses 5 -- yaw always ramps,
+    so a head-on seed always eases rather than holding the last command.
+    """
+    if sp_pr is None:
+        return init
+    import torch
+
+    names = tuple(joint_names or G1_UPPER_BODY_JOINTS)
+    pitch_i = names.index("waist_pitch_joint")
+    roll_i = names.index("waist_roll_joint")
+    pr = [pitch_i, roll_i]
+    _B, H, _n = init.shape
+    k_min = 5 if ease_wp is None else max(int(ease_wp), 1)
+    dt = float(dt)
+
+    out = init.clone()
+    q0t = q0.to(device=init.device, dtype=init.dtype)
+    q0w = q0t[:, pr]
+    term = sp_pr.detach().to(device=init.device, dtype=init.dtype).reshape(-1, 2)
+    v_lim = isaac_velocity_limits(names)
+    step = torch.as_tensor(
+        [float(ETA_VELOCITY) * float(v_lim[i]) * dt for i in pr],
+        device=init.device, dtype=init.dtype,
+    ).clamp_min(1e-9)
+    v0w = torch.zeros_like(q0w)
+    if qd0 is not None:
+        cap = step / dt
+        v0w = qd0.to(device=init.device, dtype=init.dtype)[:, pr].clamp(-cap, cap)
+
+    def _ramp(lengths):
+        k = torch.arange(1, H + 1, device=init.device, dtype=init.dtype).view(1, H, 1)
+        L = lengths.clamp_min(1).to(init.dtype)
+        u = (k / L.unsqueeze(1)).clamp(0.0, 1.0)
+        d = (term - q0w).unsqueeze(1)
+        V = (v0w * L * dt).unsqueeze(1)
+        u3 = u * u * u
+        return (
+            q0w.unsqueeze(1) + V * u
+            + (10.0 * d - 6.0 * V) * u3
+            + (8.0 * V - 15.0 * d) * u3 * u
+            + (6.0 * d - 3.0 * V) * u3 * u * u
+        )
+
+    need = torch.ceil(1.875 * (term - q0w).abs() / step)
+    L = need.clamp(float(k_min), float(H))
+    pr_sub = _ramp(L)
+    d0 = (pr_sub[:, 0, :] - q0w).abs().unsqueeze(1)
+    peak = torch.cat([d0, (pr_sub[:, 1:] - pr_sub[:, :-1]).abs()], 1).amax(1)
+    ratio = peak / step
+    over = ratio > 1.0
+    if bool(over.any()):
+        pr_sub = _ramp(torch.where(over, (L * ratio).ceil().clamp(1.0, float(H)), L))
+    out[:, :, pitch_i] = pr_sub[:, :, 0]
+    out[:, :, roll_i] = pr_sub[:, :, 1]
+    return out
+
+
+def rewrite_waist_target_to_sp(
+    target,
+    q0,
+    sp,
+    cols,
+    *,
+    k_min: int,
+    elem_mask,
+    dt: float = CONTROL_DT,
+    row_mask=None,
+):
+    """Rewrite ``target`` waist columns to a rest-to-rest quintic ``q0 → sp``.
+
+    Arms are untouched.  ``k*`` is ``clamp(ceil(1.875 |Δq| / qdot_max), k_min,
+    H_waist)`` per waist DoF, with ``H_waist`` from ``elem_mask`` (not bucket
+    H).  Rows whose waist horizon is ``< 2`` are left alone.  ``row_mask``, if
+    given, selects which batch rows to rewrite.
+
+    The seed ``init`` is deliberately NOT rewritten -- the decoder has to read
+    the set-point token rather than copy init.
+    """
+    import torch
+
+    if not cols:
+        return target
+    out = target.clone()
+    B, H, _n = target.shape
+    device, dtype = target.device, target.dtype
+    cols_t = torch.as_tensor(list(cols), device=device, dtype=torch.long)
+    n_c = cols_t.numel()
+    q0w = q0.to(device=device, dtype=dtype).index_select(-1, cols_t)
+    term = sp.to(device=device, dtype=dtype).reshape(B, n_c)
+    names = G1_UPPER_BODY_JOINTS
+    v_lim = isaac_velocity_limits(names)
+    step = torch.as_tensor(
+        [float(ETA_VELOCITY) * float(v_lim[int(i)]) * float(dt) for i in cols],
+        device=device, dtype=dtype,
+    ).clamp_min(1e-9)
+
+    waist_m = elem_mask.index_select(-1, cols_t).amax(-1)  # (B, H)
+    idx = torch.arange(H, device=device, dtype=dtype).view(1, H)
+    H_w = (waist_m * (idx + 1.0)).amax(-1).clamp_min(0.0)  # (B,)
+    skip = H_w < 2.0
+    if row_mask is not None:
+        skip = skip | ~row_mask.to(dtype=torch.bool, device=device)
+
+    need = torch.ceil(1.875 * (term - q0w).abs() / step)
+    hi = H_w.unsqueeze(-1).clamp_min(1.0).expand_as(need)
+    lo = torch.minimum(torch.full_like(hi, float(max(int(k_min), 1))), hi)
+    L = need.clamp(min=lo, max=hi)
+    k = torch.arange(1, H + 1, device=device, dtype=dtype).view(1, H, 1)
+    u = (k / L.unsqueeze(1).clamp_min(1.0)).clamp(0.0, 1.0)
+    d = (term - q0w).unsqueeze(1)
+    u3 = u * u * u
+    ramp = q0w.unsqueeze(1) + (10.0 * d) * u3 + (-15.0 * d) * u3 * u + (6.0 * d) * u3 * u * u
+
+    keep = (~skip).to(dtype).view(B, 1, 1)
+    valid = (elem_mask.index_select(-1, cols_t) > 0.5).to(dtype)
+    w = keep * valid
+    cur = out.index_select(-1, cols_t)
+    mixed = ramp * w + cur * (1.0 - w)
+    out.index_copy_(-1, cols_t, mixed)
+    return out
+
+
+def _boundary_quintic(
+    q_from: float, v_from: float, q_to: float, k: int, H: int, dt: float
+) -> np.ndarray:
+    """Rows ``0..H`` of the quintic with BCs ``p(0)=q_from, p'(0)=v_from,
+    p''(0)=0`` and ``p=q_to`` at rest from waypoint ``k`` on (held after).
+
+    ``v_from = 0`` reduces exactly to the quintic smoothstep
+    ``q_from + (q_to-q_from)*u^3*(10-15u+6u^2)``.  The GPU twin is
+    :func:`amortized_opt.train_cost.vel_ramp_seed`; the two must agree
+    element-for-element (pinned by ``tests/test_waist_upright_ease.py``).
+    """
+    u = np.clip(np.arange(H + 1, dtype=float) / float(max(int(k), 1)), 0.0, 1.0)
+    d = float(q_to) - float(q_from)
+    V = float(v_from) * float(max(int(k), 1)) * float(dt)
+    u3 = u * u * u
+    return (
+        q_from + V * u
+        + (10.0 * d - 6.0 * V) * u3
+        + (8.0 * V - 15.0 * d) * u3 * u
+        + (6.0 * d - 3.0 * V) * u3 * u * u
+    )
 
 
 def _slew_limited(x: np.ndarray, max_step: float) -> np.ndarray:
@@ -290,6 +481,8 @@ def warmstart_trajectory(
     goals: dict[str, tuple[str, float] | None],
     library: GoalPoseLibrary,
     aim_targets: dict[str, np.ndarray] | None = None,
+    aim_tth: dict[str, float] | None = None,
+    aim_futures: dict[str, object] | None = None,
     dt: float = CONTROL_DT,
     joint_names=G1_UPPER_BODY_JOINTS,
     waist_cfg: WaistAimConfig | None = None,
@@ -301,15 +494,31 @@ def warmstart_trajectory(
     yaw_rate_limit: float | None = None,
     yaw_slew_eta: float = ETA_VELOCITY,
     waist_setpoint: np.ndarray | None = None,
+    waist_upright_ease_wp: int | None = None,
     slew_limit_eta: float | None = None,
     idle_home=None,
+    idle_library=None,
+    idle_cylinder=None,
+    fk=None,
     idle_settle_wp: int = 10,
+    terminal_arm: dict[str, np.ndarray | None] | None = None,
 ) -> WarmStart:
     """Quintic straight-line seed to each hand's library pose + the waist ramp.
 
     ``goals`` maps a hand to ``(drum_name, time_to_hit_seconds)`` or ``None``
     (idle). ``aim_targets`` are the per-hand tip targets the waist aims at
     (env/pelvis XY is all that matters); omit to hold the current yaw.
+
+    ``aim_tth`` / ``aim_futures`` are :func:`~amortized_opt.waist_aim.aim_yaw`'s
+    future-aware inputs -- this hand's time to its current goal, and its
+    upcoming ``(position, time_to_hit)`` hits beyond it.  The SEED must ramp
+    toward the same aim the context token carries or the model's residual
+    parameterization starts off the ramp, so every caller that has a snapshot
+    threads both (``mpc_gen``, ``phase2_data``, ``warmstart_data``,
+    ``warmstart_apex``).  A caller with no schedule -- the eval harness, whose
+    case IS a single hit -- passes neither and gets the current-goal law.
+    ``aim_futures`` alone is enough to aim a hand whose goal the horizon cap
+    demoted, which is why the ``aim_targets``-empty case still runs the law.
 
     Each arm's path is the two-pose polyline ``[q_start_arm, q_goal_arm]``
     retimed by :func:`~amortized_opt.spline.retime_joint_path` over that hand's
@@ -347,25 +556,33 @@ def warmstart_trajectory(
     velocity the arms couple into the waist integrates freely.  Measured over
     300 ticks it walked ``waist_pitch`` 0.79 rad outside a +/-0.52 rad box.
 
-    The idle arm (2026-08-12)
-    -------------------------
-    ``idle_home`` is any object exposing ``arm_pose(hand) -> (7,)`` -- in
-    practice an :class:`~amortized_opt.idle_home.IdleHomeTable`.  When given, a
-    hand with ``goals[hand] is None`` no longer *holds* its measured pose (which
-    is what let the waist sweep a parked arm through the kit); it eases to the
-    park posture over ``idle_settle_wp`` waypoints, **arrives at rest**, and
-    holds it for the remainder of the horizon.  The posture is torso-relative
-    and therefore the same at every waist yaw, so unlike the active arm's
-    library pose there is no yaw to look it up at -- and the parked arm does not
-    have to keep moving while the waist sweeps for the other hand.
+    ``waist_upright_ease_wp`` (None by default, so every existing target and
+    seed is unchanged bit for bit) replaces the pitch/roll HOLD with a
+    recovery: a quintic smoothstep from the measured pose to UPRIGHT (0 rad,
+    or ``waist_setpoint`` when given) over that many waypoints, arriving at
+    rest and holding.  Holding the measured lean is what taught phase 1 the
+    "stay leaned" prior the upright well then has to fight -- the starts
+    sample pitch/roll in a posture box, so every imitation target said "keep
+    it".  A raw zero setpoint is NOT the fix: it steps up to 0.52 rad inside
+    one control period and the acceleration lands on ``torque_peak`` (the same
+    reason ``ModelConfig.frozen_ramp_wp`` ramps).  The ease is stretched like
+    the idle-arm park when the requested window would exceed the joint's speed
+    rating (quintic peak rate is 1.875x its mean).
 
-    This is also the model's *encoding* of the idle target.  The decoder reads
-    ``init_traj`` as its waypoint tokens, so seeding the idle columns with the
-    ramp puts the home pose in front of the network directly, in the same units
-    it must output -- exactly how the active arm's library terminal is
-    communicated.  The cost's ``w_idle_home`` then prices that same pose, so the
-    seed and the objective agree by construction.  ``None`` (the default) keeps
-    the old hold-in-place behaviour bit for bit.
+    The idle arm (idle safety cylinder)
+    -----------------------------------
+    ``idle_library`` + ``idle_cylinder`` (+ ``fk``) park a hand with
+    ``goals[hand] is None`` inside the torso-frame idle cylinder (see
+    :mod:`~amortized_opt.idle_cylinder`):
+
+    * tip already inside -> hold the measured 7 arm DoFs for the horizon;
+    * tip outside -> nearest library pose (shoulder_weight=10) ->
+      :func:`~amortized_opt.idle_cylinder.nudge_into_cylinder` -> arm-only
+      quintic over ``L = clamp(speed_need, idle_settle_wp, H)``, then hold.
+
+    ``idle_home`` (an object with ``arm_pose(hand)``) remains as a legacy
+    fallback when no cylinder library is supplied.  ``None`` for both keeps
+    hold-in-place.
 
     ``slew_limit_eta`` (off by default, so phase-1 targets are unchanged bit for
     bit) applies the same per-waypoint speed bound to **every** joint.  The
@@ -405,16 +622,22 @@ def warmstart_trajectory(
         else float(yaw_rate_limit)
     )
     yaw_rate_now = float(np.clip(yaw_rate_now, -rate_cap, rate_cap))
-    if aim_targets:
-        yaw_target = float(aim_yaw(aim_targets, cfg=waist_cfg, yaw_current=yaw_now))
+    if aim_targets or aim_futures:
+        yaw_target = float(
+            aim_yaw(aim_targets or {}, cfg=waist_cfg, yaw_current=yaw_now,
+                    goal_tth=aim_tth, futures=aim_futures)
+        )
     else:
         yaw_target = yaw_now
     yaw_target = float(np.clip(yaw_target, yaw_lo, yaw_hi))
     waist_names = [nm for nm in names if nm.startswith("waist_")]
-    if waist_setpoint is None:
-        setpoint = np.array([q0[names.index(nm)] for nm in waist_names], dtype=float)
-    else:
+    if waist_setpoint is not None:
         setpoint = np.asarray(waist_setpoint, float).reshape(len(waist_names)).copy()
+    elif waist_upright_ease_wp is not None:
+        # ease-to-upright: the hold target is 0 rad, not the measured lean
+        setpoint = np.zeros(len(waist_names), dtype=float)
+    else:
+        setpoint = np.array([q0[names.index(nm)] for nm in waist_names], dtype=float)
     setpoint = np.clip(
         setpoint,
         np.array([lo[names.index(nm)] for nm in waist_names]),
@@ -442,23 +665,90 @@ def warmstart_trajectory(
         out[:, names.index(nm)] = waist_ref[:, j]
     yaw_ref = waist_ref[:, jy].copy()
 
+    if waist_upright_ease_wp is not None:
+        # ---- pitch/roll: ease from the measured STATE to the hold target ----
+        # A VELOCITY-MATCHED boundary quintic: p(0) = measured pose, p'(0) =
+        # measured rate (clipped to the speed rating), p''(0) = 0, arriving at
+        # the target at rest.  ``v_from = 0`` reduces exactly to the quintic
+        # smoothstep (the ``frozen_ramp_wp`` shape), so a rest start is
+        # bit-identical to the pre-velocity-matched ease.  The match is what
+        # makes a per-tick rebuild a CONTINUATION rather than a re-anchor: a
+        # seed rebuilt mid-recovery keeps the recovery's current rate instead
+        # of braking to zero slope and crawling at ~s(1/k) per tick.  The
+        # window stretches under the rest-to-rest 1.875x rule, then one
+        # correction round re-stretches if the velocity term pushed a step
+        # over the rating.  Row 0 evaluates to the measured value exactly.
+        for j, nm in enumerate(waist_names):
+            if nm == "waist_yaw_joint":
+                continue
+            ci = names.index(nm)
+            step_lim = max(ETA_VELOCITY * float(v_lim[ci]) * float(dt), 1e-9)
+            q_from, q_to = float(q0[ci]), float(setpoint[j])
+            v_from = float(np.clip(v0[ci], -step_lim / float(dt), step_lim / float(dt)))
+            need = int(np.ceil(1.875 * abs(q_to - q_from) / step_lim))
+            k_ease = int(np.clip(max(int(waist_upright_ease_wp), need), 1, H))
+            col = _boundary_quintic(q_from, v_from, q_to, k_ease, H, float(dt))
+            peak_step = float(np.abs(np.diff(col)).max())
+            if peak_step > step_lim:
+                k_ease = int(np.clip(
+                    int(np.ceil(k_ease * peak_step / step_lim)), 1, H))
+                col = _boundary_quintic(q_from, v_from, q_to, k_ease, H, float(dt))
+            out[:, ci] = col
+
     # ---- arms: independent quintic straight lines to the library pose ----
     for hand in ("left", "right"):
         idx = arm_slice(hand, names)
         goal = goals.get(hand)
         if goal is None:
             hit_index[hand] = -1
+            lib = idle_library
+            cyl = idle_cylinder
+            if cyl is None and lib is not None and hasattr(lib, "cylinder"):
+                cyl = lib.cylinder
+            if lib is not None and fk is not None and cyl is not None:
+                # Lazy import: idle_cylinder imports arm_slice from this module.
+                import torch
+                from .idle_cylinder import nudge_into_cylinder, tip_in_torso, tip_inside
+
+                q_t = torch.as_tensor(
+                    q0[None], device=fk.device, dtype=getattr(fk, "dtype", None)
+                )
+                tip = tip_in_torso(fk, q_t, hand).squeeze(0).detach().cpu().numpy()
+                if tip_inside(cyl, tip):
+                    out[:, idx] = q0[idx][None, :]
+                    used[hand] = "idle_hold"
+                    continue
+                _k, q_near = lib.nearest_arm_pose(hand, q0[idx], shoulder_weight=10.0)
+                q_full = q0.copy()
+                q_full[idx] = np.asarray(q_near, float)
+                q_nudge = nudge_into_cylinder(
+                    fk, q_full, hand, cyl,
+                    shoulder_weight=10.0,
+                    joint_names=names,
+                    q_bounds=(lo, hi) if clamp else None,
+                )
+                Q = np.stack([q0[idx], np.asarray(q_nudge, float)[idx]])
+                span = np.abs(Q[1] - Q[0])
+                need = np.ceil(
+                    1.875 * span
+                    / np.maximum(ETA_VELOCITY * v_lim[idx] * float(dt), 1e-9)
+                ).max()
+                k_set = int(np.clip(max(int(idle_settle_wp), int(need)), 1, H))
+                X, rate = retime_joint_path(
+                    Q, k_set + 1, float(dt), v_start=v0[idx], v_limit=v_lim[idx],
+                    q_lower=lo[idx] if clamp else None,
+                    q_upper=hi[idx] if clamp else None,
+                )
+                peak[hand] = float(rate)
+                used[hand] = "idle_cyl"
+                out[: k_set + 1, idx] = X
+                out[k_set + 1 :, idx] = X[-1][None, :]
+                continue
             if idle_home is None:
                 out[:, idx] = q0[idx][None, :]
                 continue
-            # park: ease to home, arrive stopped, then sit there.
+            # Legacy single-home park.
             Q = np.stack([q0[idx], np.asarray(idle_home.arm_pose(hand), float)])
-            # Retiming is by waypoint COUNT, and ``retime_joint_path`` only uses
-            # ``v_limit`` to clip the start-velocity projection -- so a long
-            # retraction over a fixed 10 waypoints would command whatever speed
-            # it takes.  Stretch the ramp instead: the quintic ease peaks at
-            # 1.875x its mean rate, so this is the shortest settle that keeps the
-            # parked arm inside its own speed rating.
             span = np.abs(Q[1] - Q[0])
             need = np.ceil(
                 1.875 * span / np.maximum(ETA_VELOCITY * v_lim[idx] * float(dt), 1e-9)
@@ -477,9 +767,18 @@ def warmstart_trajectory(
         drum, tth = goal
         k_hit = int(np.clip(round(float(tth) / float(dt)), 1, H))
         hit_index[hand] = k_hit
-        entry = library.select(hand, drum, yaw_target)
-        used[hand] = f"{drum}@{entry.waist_yaw:+.3f}"
-        Q = np.stack([q0[idx], entry.arm_q])
+        # ``terminal_arm`` overrides the library pick -- the caller has already
+        # re-aimed it at the drum that is actually there (``ik.correct_tip``),
+        # which the library, keyed on (hand, drum, waist_yaw), cannot know about.
+        q_term = None if terminal_arm is None else terminal_arm.get(hand)
+        if q_term is None:
+            entry = library.select(hand, drum, yaw_target)
+            used[hand] = f"{drum}@{entry.waist_yaw:+.3f}"
+            q_term = entry.arm_q
+        else:
+            q_term = np.asarray(q_term, float).reshape(len(idx))
+            used[hand] = f"{drum}@corrected"
+        Q = np.stack([q0[idx], q_term])
         X, rate = retime_joint_path(
             Q,
             k_hit + 1,

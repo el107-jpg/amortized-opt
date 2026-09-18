@@ -19,10 +19,13 @@ Two consumers:
 
 Semantic summary (see the individual docstrings for the reasoning):
 
-* **Cymbals and the hi-hat** may be sounded by the stick SHAFT, so the contact
-  point sits ``contact_sigma`` back from the bead (default: the shoulder,
-  10 cm).  They are aimed off-centre toward the near edge, keep the *full* head
-  radius (no rim buffer), and only the near semicircle is legal.
+* **Cymbals and the hi-hat** may be sounded by the stick SHAFT, so hit
+  membership is the playing-shaft segment
+  (:func:`shaft_hit_sigma_range`, bead back to the 5 cm fallback) against the
+  legal head region -- not a single shoulder point.  ``contact_sigma`` is still
+  the diagnostic default (the shoulder).  They are aimed off-centre toward the
+  near edge, keep the *full* head radius (no rim buffer), and only the near
+  semicircle is legal.
 * **Toms** are tip-only pads that borrow the cymbals' off-centre *geometry*:
   aimed 45 % of the rim-buffered radius toward the drummer, near semicircle only.
 * **Everything else** (the snare) is a tip-only pad aimed dead centre, hit disk
@@ -51,10 +54,13 @@ __all__ = [
     "STICK_ELEV_MAX_DEG",
     "STICK_ELEV_MIN_DEG",
     "STICK_TIP_SIGMA",
+    "STRIKE_AXIAL_HEIGHT",
+    "STRIKE_SURFACE_OFFSET",
     "StrikeSpec",
     "TOM_NEAR_FRACTION",
     "contact_sigma_candidates",
     "default_contact_sigma",
+    "shaft_hit_sigma_range",
     "is_cymbal_name",
     "is_hihat_name",
     "is_tom_name",
@@ -62,6 +68,7 @@ __all__ = [
     "stick_elevation_from_surface",
     "stick_elevation_ok",
     "strike_aim_on_head",
+    "strike_axial_limits",
     "strike_disk_center_offset",
     "strike_elevation_required",
     "strike_half_plane_dir",
@@ -93,6 +100,16 @@ HIHAT_RIM_FRACTION = 1.0
 #: Same idea for the TOMS, as a fraction of the *usable* (rim-buffered) radius
 #: out from the centre toward the drummer.
 TOM_NEAR_FRACTION = 0.45
+
+#: Aim inset along ``-axis``, past the geometric head plane.  10 mm (was 5 mm)
+#: so the aim sits on the INNER face of :data:`STRIKE_AXIAL_HEIGHT`.
+STRIKE_SURFACE_OFFSET = 0.01
+
+#: Height of the legal hit cylinder along the head normal.  The cylinder occupies
+#: the interior of the drum: outer face on the geometric head surface, inner
+#: face ``STRIKE_AXIAL_HEIGHT`` into the drum (the aim plane, when this equals
+#: :data:`STRIKE_SURFACE_OFFSET`).
+STRIKE_AXIAL_HEIGHT = 0.01
 
 #: Two-sided stick-elevation band at the strike, degrees.  Mirrors
 #: ``TrajOptConfig.stick_elev_{min,max}_deg``.  Sign-blind: the requirement is
@@ -141,7 +158,8 @@ def is_tom_name(name: str | None) -> bool:
 
     A tom is still a pad: it keeps the rim buffer, the elevation band and the
     tip-only hit rule.  The only thing it borrows from the cymbals is the
-    *geometry* of the aim -- off-centre toward the drummer, far semicircle cut.
+    off-centre AIM, toward the drummer.  It no longer borrows the semicircle
+    cut -- see :func:`strike_half_plane_dir` for why that was wrong.
     """
     if name is None:
         return False
@@ -161,12 +179,22 @@ def shaft_hit_allowed(name: str | None) -> bool:
 def strike_elevation_required(name: str | None) -> bool:
     """Whether a strike on this drum must land in the stick-elevation band.
 
-    True for EVERY drum, cymbals and hi-hat included.  Kept as a predicate
-    because the call sites read as "does this drum have a terminal pose
-    requirement", and because a future layout may answer no.
+    PADS ONLY -- the snare and the toms.  A pad is a membrane struck from above
+    with the bead, so "how steeply is the stick coming in" is a real
+    requirement: the band rejects both the in-plane graze and the near-normal
+    tunnelling.  A cymbal is not played that way.  It is struck on the bow or
+    the edge with the SHAFT (:func:`shaft_hit_allowed` is True for exactly the
+    cymbals, and :func:`default_contact_sigma` gives them the shoulder rather
+    than the bead), so the approach angle is whatever the swing wants and a
+    band on it is a constraint with no physical referent.
+
+    Until 2026-08-14 this returned True unconditionally, which mattered less
+    than it looks: ``elev_ok`` was computed and reported but was NOT part of
+    ``CaseScore.accepted``, so nothing was ever gated on it.  Now that it gates,
+    the predicate has to be right -- otherwise turning the gate on would fail
+    every cymbal case for violating a band that does not apply to cymbals.
     """
-    del name  # every drum, for now
-    return True
+    return not is_cymbal_name(name)
 
 
 # ------------------------------------------------------------ contact point --
@@ -176,13 +204,29 @@ def default_contact_sigma(name: str | None) -> float:
     """Contact point a strike on ``name`` uses when it does not name one.
 
     The bead everywhere except the cymbals (hi-hat included), which default to
-    the shoulder because a crash/edge articulation is a shaft hit.  A caller
-    that specifically wants a bead strike on a cymbal must pass
-    ``contact_sigma=STICK_TIP_SIGMA`` explicitly.
+    the shoulder because a crash/edge articulation is a shaft hit.  Hit
+    *membership* on those drums is the playing-shaft capsule
+    (:func:`shaft_hit_sigma_range`); this scalar is the diagnostic / aim
+    default.  A caller that specifically wants a bead strike on a cymbal must
+    pass ``contact_sigma=STICK_TIP_SIGMA`` explicitly.
     """
     if is_cymbal_name(name):
         return HIHAT_SHOULDER_SIGMA
     return STICK_TIP_SIGMA
+
+
+def shaft_hit_sigma_range(name: str | None) -> tuple[float, float] | None:
+    """Playing-shaft ``(sigma_lo, sigma_hi)`` for a shaft-hittable drum, else None.
+
+    Pads (snare, toms) are tip-only.  Cymbals and the hi-hat may be sounded by
+    any point from the bead back to :data:`CYMBAL_CONTACT_SIGMA_FALLBACK`
+    (5 cm from the mount, 15 cm from the bead).  The grip (``sigma`` below
+    that) does not count.  Cost, eval, probe and the RL scorer all share this
+    span so a shaft that spans the rim cannot miss every discrete sample.
+    """
+    if not shaft_hit_allowed(name):
+        return None
+    return (float(CYMBAL_CONTACT_SIGMA_FALLBACK), float(STICK_TIP_SIGMA))
 
 
 def contact_sigma_candidates(
@@ -231,14 +275,28 @@ def strike_half_plane_dir(
 ) -> np.ndarray | None:
     """In-plane facing direction ``t`` for a half-disk strike region, or None.
 
-    None for heads with no half-plane (the snare -- the whole head is playable).
-    For cymbals and TOMS, ``t`` points from the head centre back toward the
-    drummer, so ``(p - c).t >= 0`` keeps the strike on the near semicircle.
+    None for every head whose whole (rim-buffered) disk is playable: the snare,
+    and -- since 2026-08-14 -- the TOMS.  For cymbals, ``t`` points from the
+    head centre back toward the drummer, so ``(p - c).t >= 0`` keeps the strike
+    on the near semicircle.
+
+    Why the toms lost theirs.  A cymbal is a thin plate on a stand: reaching
+    over it to strike the far side means putting the stick through the stand or
+    the drummer's own arm, so the cut is real geometry.  A tom is a drum head
+    facing up and slightly toward the player; its far side is as strikeable as
+    its near side, and the cut was inherited from the cymbal aim geometry rather
+    than measured.  Toms keep everything else that made them pads -- the 1 cm
+    rim buffer, the elevation band, the tip-only rule, and the near-side aim
+    (:func:`_strike_aim_offset` still offsets it) -- so only the LEGAL REGION
+    grows, from a half disk to the full rim-buffered disk.
+
+    NOTE this changes the acceptance test: ``ok_hit`` on a tom is strictly
+    easier than before, so tom acceptance is not comparable across this change.
 
     The robot stands at x = y = 0 in both the env and the pelvis frame, so this
     is frame-independent and callers may pass a centre in either.
     """
-    if not (is_cymbal_name(name) or is_tom_name(name)):
+    if not is_cymbal_name(name):
         return None
     c = np.asarray(center, float)
     n = _unit3(np.asarray(axis, float))
@@ -295,13 +353,29 @@ def _strike_aim_offset(
     return frac * r_use * t
 
 
+def strike_axial_limits(
+    *,
+    surface_offset: float = STRIKE_SURFACE_OFFSET,
+    height: float = STRIKE_AXIAL_HEIGHT,
+) -> tuple[float, float]:
+    """Aim-frame ``(lo, hi)`` along the outward head normal.
+
+    ``axial = (p_contact - aim) · n_out``.  Positive is short of the aim
+    (toward / past the geometric surface).  The default band is the interior
+    1 cm slab from the aim (inner face) to the head surface (outer face).
+    """
+    hi = float(surface_offset)
+    lo = hi - float(height)
+    return lo, hi
+
+
 def strike_aim_on_head(
     center: np.ndarray,
     axis: np.ndarray,
     radius: float,
     *,
     name: str | None = None,
-    surface_offset: float = 0.005,
+    surface_offset: float = STRIKE_SURFACE_OFFSET,
     rim_buffer: float = 0.01,
 ) -> tuple[np.ndarray, float]:
     """Cartesian strike aim and in-plane hit-disk radius for a drum head.
@@ -458,11 +532,11 @@ class StrikeSpec:
       direction (cymbals, toms).  None = whole disk.
     * ``disk_center_offset`` is the in-plane vector from ``position`` to the head
       centre, for strikes that aim off-centre.  None = disk centred on the aim.
-    * ``contact_sigma`` is the point ON THE STICK that must land in the disk, as
-      an arc coordinate from the stick's centre (``STICK_TIP_SIGMA`` = the bead).
-      Legal behind the bead on the cymbals only.  The velocity requirement is
-      applied at that same point, which makes a shoulder hit harder in speed
-      exactly as it is easier in position.
+    * ``contact_sigma`` is the diagnostic / aim point ON THE STICK, as an arc
+      coordinate from the stick's centre (``STICK_TIP_SIGMA`` = the bead).
+      Pads must land that point (the bead) in the disk.  Cymbals and the hi-hat
+      use the playing-shaft capsule (:func:`shaft_hit_sigma_range`); velocity
+      is applied at the closest point on that capsule.
     """
 
     time: float
@@ -517,7 +591,7 @@ def strike_from_drum(
     radius: float,
     speed: float,
     contact_sigma: float | None = None,
-    surface_offset: float = 0.005,
+    surface_offset: float = STRIKE_SURFACE_OFFSET,
     rim_buffer: float = 0.01,
 ) -> StrikeSpec:
     """Build the canonical :class:`StrikeSpec` for one drum, hand and speed.

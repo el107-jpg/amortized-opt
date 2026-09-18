@@ -117,6 +117,65 @@ Widening the inward bound past ~44 deg returns to just the cross-body three.
 
 Set ``engage_in``/``engage_out`` to None to disable the gate and fire the law on
 every beat, as it did originally.
+
+Aiming at the FUTURE, not just at this beat (2026-08-14)
+--------------------------------------------------------
+Everything above computes the aim from the hands' *currently active* goals. That
+made the commanded yaw a function of a set that churns at beat rate, and two
+failure modes were measured on ``gmd_eval_000006`` (drums at +37..+60 deg) with
+``runs/phase2_19m_ctxv2/ckpt_10k.pt``:
+
+* **square-waving.** The right hand's snare goal dropped in and out of the
+  horizon cap at ~1 Hz, so the target set flipped between {left, right} ->
+  +37 deg and {left} -> "no turn needed, hold". A heavy torso chasing that
+  square wave oscillated 131 deg peak-to-peak. The set never actually changed --
+  only which *label* (goal vs future[0]) the snare hit carried.
+* **hold ratification.** A per-tick trace caught the hold branch returning the
+  MEASURED yaw verbatim after an overshoot (aim = +63.2 = yaw_meas while the
+  drums sat at +37). Every hold phase legitimizes wherever the torso ran off to,
+  so an overshoot is never commanded back.
+
+So the aim is now taken over each hand's whole upcoming schedule -- its active
+goal AND its next ``future_max`` hits -- with a weight per target that depends
+only on TIME TO HIT, never on the active/future label. Both failures follow from
+that one change: relabelling moves no weight (so the cap crossing is continuous,
+`tests/test_future_aim.py`), and a hand whose goal is capped still votes (so the
+"no targets -> hold" branch now fires only at a genuine rest, where holding is
+the right answer and there is nothing to ratify against).
+
+The weights are an APPROACH WINDOW, not a point discount: hit ``i`` owns the
+interval ``[t_{i-1}, t_i]`` of the future, i.e. the stretch of time during which
+the torso is on its way to it, and the weight is the exponential kernel
+``exp(-s / future_tau)`` integrated over that interval (normalized per hand, so
+a hand's total vote is its ``hand_weights`` entry no matter how many hits it
+carries).  Three properties, all wanted:
+
+* the intervals TILE the future, so a hit that is consumed (its ``t`` reaches 0)
+  leaves with the weight it has already decayed to -- zero -- and its successor
+  inherits the window continuously. A point discount ``exp(-t_i / tau)`` does
+  the opposite: it gives the imminent hit the LARGEST weight and drops it at
+  the moment it fires, which is the same square wave one beat further on;
+* relative weights are all that matter, so a hand with a single pending hit
+  aims fully at it however close it is (the normalization gives it 1.0);
+* ``future_tau`` is the knob between the two regimes: small -> the imminent hit
+  owns nearly the whole window and the law reduces to the current-goal one;
+  large -> the next few hits share the vote and the torso parks between them.
+
+``future_tau = 0`` (or None) restores the current-goals-only law BIT-EXACTLY --
+it is the A/B switch, and ``tests/test_future_aim.py`` pins the equality on a
+grid of scenarios.
+
+The per-hand cap ``future_max`` counts the WHOLE merged list, goal included, and
+that is deliberate: ``goal_snapshot`` hands out ``goal + num_future`` targets
+when the goal is active but ``num_future`` when the cap demoted it, so counting
+the merged list at ``num_future`` is what makes the two spellings of the same
+instant the same target set. Counting only the futures would leave a 4-vs-3
+mismatch, and the demotion would jump the aim again.
+
+The gate and the deadband are applied ONCE, to the aggregate: the per-hand
+inward angle is the same weighted mean of that hand's targets, so the gate still
+asks "does THIS hand need the torso" (per hand, ORed) rather than being opened
+by any single far-off hit in the window.
 """
 
 from __future__ import annotations
@@ -185,15 +244,32 @@ class WaistAimConfig:
     damping: float = 0.3
     # Hard clamp on the commanded yaw (rad).
     yaw_limit: float = _DEFAULT_YAW_LIMIT
-    # Below this |demand| the torso does not bother turning (rad). Without it
-    # the yaw twitches by a degree or two every beat, which reads as noise in
-    # the dataset and buys no reach.
+    # A CHANGE threshold, not a demand threshold: ``_apply_deadband`` tests
+    # |psi - yaw_current| -- how far the commanded yaw is from where the torso
+    # already sits -- and holds ``yaw_current`` while that stays below this
+    # (rad).  Without it the yaw twitches by a degree or two every beat, which
+    # reads as noise in the dataset and buys no reach.
     deadband: float = 0.09  # ~5 deg
     # Per-hand weights when both hands strike. Equal by default: the commanded
-    # yaw is the plain average of the two demands.
+    # yaw is the plain average of the two demands.  With futures in play this is
+    # each HAND's total vote, split across its own upcoming hits -- so a hand
+    # playing a roll does not outvote a hand playing whole notes.
     hand_weights: dict[str, float] = field(
         default_factory=lambda: {"left": 1.0, "right": 1.0}
     )
+    # --- future awareness (see the module docstring) --------------------------
+    # Time constant (s) of the exponential kernel integrated over each hit's
+    # APPROACH WINDOW.  1.0 s is ~2-4 beats at drumming tempi: long enough that
+    # a goal crossing the horizon cap changes no weight (the square wave) and
+    # short enough that the imminent hit still owns most of the vote.
+    # ``0`` or ``None`` = the pre-2026-08-14 law, current goals only, bit for
+    # bit -- the A/B escape hatch, not a tuning value.
+    future_tau: float | None = 1.0
+    # How many targets per hand may vote, COUNTING THE CURRENT GOAL.  3 matches
+    # the ``num_future`` every snapshot/schedule carries, which is what makes
+    # the goal-active and goal-demoted spellings of one instant identical sets;
+    # see the module docstring.
+    future_max: int = 3
     # Shoulder XY offsets in the pelvis frame; override to match a re-rigged robot.
     shoulder_xy: dict[str, tuple[float, float]] = field(
         default_factory=lambda: dict(_SHOULDER_XY)
@@ -232,22 +308,22 @@ _INWARD_SIGN: dict[str, float] = {"left": -1.0, "right": +1.0}
 
 
 def _shoulder_azimuths(
-    active: dict[str, np.ndarray], cfg: WaistAimConfig, psi: float
-) -> dict[str, float]:
-    """World azimuth of each shoulder->target ray with the torso yawed by ``psi``.
+    entries: list[tuple[str, np.ndarray, float]], cfg: WaistAimConfig, psi: float
+) -> list[tuple[str, float, float]]:
+    """``(hand, weight, world azimuth)`` per target with the torso yawed ``psi``.
 
     The torso-frame azimuth is this less ``psi``; keeping the world value is
     what lets the gate write its constraint as an interval in ``psi``.
     """
     c, s = np.cos(psi), np.sin(psi)
-    out: dict[str, float] = {}
-    for hand, p in active.items():
+    out: list[tuple[str, float, float]] = []
+    for hand, p, w in entries:
         sx, sy = cfg.shoulder_xy[hand]
         shoulder = np.array([c * sx - s * sy, s * sx + c * sy])
         d = p[:2] - shoulder
         if float(np.hypot(*d)) < 1e-6:
             continue
-        out[hand] = float(np.arctan2(d[1], d[0]))
+        out.append((hand, w, float(np.arctan2(d[1], d[0]))))
     return out
 
 
@@ -261,16 +337,91 @@ def _active_targets(
     }
 
 
-def _weights(
-    active: dict[str, np.ndarray], cfg: WaistAimConfig
-) -> tuple[dict[str, float], float]:
-    weights = {h: float(cfg.hand_weights.get(h, 1.0)) for h in active}
-    return weights, sum(weights.values())
+def _window_weights(times: np.ndarray, tau: float) -> np.ndarray:
+    """Approach-window weights for ONE hand's time-ordered hits, summing to 1.
+
+    Hit ``i`` owns ``[t_{i-1}, t_i]`` (the first owns ``[0, t_0]``) and its
+    weight is ``exp(-s / tau)`` integrated over that interval; the ``tau``
+    factor of the integral cancels in the normalization and is dropped. The
+    intervals tile ``[0, t_last]``, which is what makes a hit's weight fall
+    continuously to zero as it is consumed -- see the module docstring.
+    """
+    t = np.maximum(np.asarray(times, dtype=float).reshape(-1), 0.0)
+    if t.size == 0:
+        return t
+    a = np.empty_like(t)
+    a[0] = 0.0
+    a[1:] = t[:-1]
+    a = np.minimum(a, t)            # a clip that is out of order votes 0, not <0
+    w = np.exp(-a / float(tau)) - np.exp(-t / float(tau))
+    s = float(w.sum())
+    if not np.isfinite(s) or s <= 1e-15:
+        # Every hit is at (or before) now: there is no window left to integrate
+        # over.  The earliest is the one being played -- give it the hand's
+        # whole vote rather than dividing by zero.
+        w = np.zeros_like(t)
+        w[0] = 1.0
+        s = 1.0
+    return w / s
+
+
+def _aim_entries(
+    targets: dict[str, np.ndarray],
+    cfg: WaistAimConfig,
+    *,
+    goal_tth: dict[str, float] | None = None,
+    futures: dict[str, object] | None = None,
+) -> tuple[list[tuple[str, np.ndarray, float]], float]:
+    """``[(hand, target, weight)]`` and the total weight the demand divides by.
+
+    ``futures[hand]`` is that hand's upcoming hits beyond its current goal as
+    ``(position, time_to_hit)`` pairs, both from NOW, time-ordered.
+    ``goal_tth[hand]`` is the same clock for the entry in ``targets``. With no
+    futures (or ``cfg.future_tau`` off) this returns exactly one entry per
+    active hand at its ``hand_weights`` value -- the pre-2026-08-14 law, whose
+    arithmetic downstream is then unchanged bit for bit.
+    """
+    goal = _active_targets(targets, cfg)
+    tau = float(cfg.future_tau or 0.0)
+    if tau <= 0.0 or not futures:
+        entries = [
+            (h, p, float(cfg.hand_weights.get(h, 1.0))) for h, p in goal.items()
+        ]
+        return entries, sum(w for _h, _p, w in entries)
+
+    if goal and goal_tth is None:
+        raise ValueError(
+            "aim_yaw: futures were given without goal_tth -- the current goal's "
+            "own time to hit is what places it in the weighting window"
+        )
+    order = list(goal) + [
+        h for h in futures if h not in goal and h in cfg.shoulder_xy
+    ]
+    entries: list[tuple[str, np.ndarray, float]] = []
+    for hand in order:
+        items: list[tuple[np.ndarray, float]] = []
+        if hand in goal:
+            items.append((goal[hand], float((goal_tth or {}).get(hand, 0.0))))
+        for p, t in futures.get(hand) or ():
+            if p is None:
+                continue
+            items.append((np.asarray(p, dtype=float).reshape(3), float(t)))
+        if not items:
+            continue
+        # Stable sort, so a future sharing the goal's instant still ranks after
+        # it; the merged list is capped as a WHOLE (module docstring).
+        items.sort(key=lambda pt: max(pt[1], 0.0))
+        items = items[: max(int(cfg.future_max), 1)]
+        hw = float(cfg.hand_weights.get(hand, 1.0))
+        w = _window_weights(np.array([t for _p, t in items]), tau)
+        entries.extend(
+            (hand, p, hw * float(wi)) for (p, _t), wi in zip(items, w)
+        )
+    return entries, sum(w for _h, _p, w in entries)
 
 
 def _demand(
-    active: dict[str, np.ndarray],
-    weights: dict[str, float],
+    entries: list[tuple[str, np.ndarray, float]],
     w_sum: float,
     cfg: WaistAimConfig,
     psi: float,
@@ -283,14 +434,18 @@ def _demand(
     if w_sum <= 0.0:
         return 0.0
     total = 0.0
-    for hand, az in _shoulder_azimuths(active, cfg, psi).items():
+    for hand, w, az in _shoulder_azimuths(entries, cfg, psi):
         az_pref = cfg.az_pref if hand == "left" else -cfg.az_pref
-        total += weights[hand] * _wrap_pi(az - az_pref)
+        total += w * _wrap_pi(az - az_pref)
     return total / w_sum
 
 
 def aim_demand(
-    targets: dict[str, np.ndarray], *, cfg: WaistAimConfig | None = None
+    targets: dict[str, np.ndarray],
+    *,
+    cfg: WaistAimConfig | None = None,
+    goal_tth: dict[str, float] | None = None,
+    futures: dict[str, object] | None = None,
 ) -> float:
     """The net weighted azimuth demand (rad) the aim LAW damps.
 
@@ -299,9 +454,8 @@ def aim_demand(
     whether it opens. Exposed so a caller can log both.
     """
     cfg = cfg or WaistAimConfig()
-    active = _active_targets(targets, cfg)
-    weights, w_sum = _weights(active, cfg)
-    return _demand(active, weights, w_sum, cfg, psi=0.0)
+    entries, w_sum = _aim_entries(targets, cfg, goal_tth=goal_tth, futures=futures)
+    return _demand(entries, w_sum, cfg, psi=0.0)
 
 
 def aim_inward(
@@ -309,6 +463,8 @@ def aim_inward(
     *,
     cfg: WaistAimConfig | None = None,
     yaw_current: float = 0.0,
+    goal_tth: dict[str, float] | None = None,
+    futures: dict[str, object] | None = None,
 ) -> dict[str, float]:
     """Per-hand inward angle (rad) **as seen from the torso's current yaw**.
 
@@ -326,14 +482,39 @@ def aim_inward(
 
     Returned per hand rather than averaged because the gate is per hand: one
     arm's inability to reach is not cancelled by the other arm being comfortable.
+    With futures in play it is that hand's OWN weighted mean over its upcoming
+    targets -- the aggregate the gate is applied to once (module docstring), so
+    a single far-off hit in the window cannot open the gate by itself.
     """
     cfg = cfg or WaistAimConfig()
-    active = _active_targets(targets, cfg)
+    entries, _w_sum = _aim_entries(targets, cfg, goal_tth=goal_tth, futures=futures)
+    return _inward_of(entries, cfg, yaw_current)
+
+
+def _inward_of(
+    entries: list[tuple[str, np.ndarray, float]],
+    cfg: WaistAimConfig,
+    yaw_current: float,
+) -> dict[str, float]:
+    """:func:`aim_inward` on already-built entries (see it for the semantics)."""
     psi = float(yaw_current)
-    out: dict[str, float] = {}
-    for hand, az in _shoulder_azimuths(active, cfg, psi).items():
+    per_hand: dict[str, list[tuple[float, float]]] = {}
+    for hand, w, az in _shoulder_azimuths(entries, cfg, psi):
         az_pref = cfg.az_pref if hand == "left" else -cfg.az_pref
-        out[hand] = _INWARD_SIGN[hand] * _wrap_pi(az - psi - az_pref)
+        per_hand.setdefault(hand, []).append((w, _wrap_pi(az - psi - az_pref)))
+    out: dict[str, float] = {}
+    for hand, items in per_hand.items():
+        if len(items) == 1:
+            # A single-target hand takes its residual UNDIVIDED: ``(w*x)/w`` is
+            # not the identity in floating point, and the futures-off path has
+            # to reproduce the old gate bit for bit.
+            resid = items[0][1]
+        else:
+            den = sum(w for w, _x in items)
+            resid = (
+                sum(w * x for w, x in items) / den if den > 0.0 else 0.0
+            )
+        out[hand] = _INWARD_SIGN[hand] * resid
     return out
 
 
@@ -342,20 +523,33 @@ def gate_open(
     *,
     cfg: WaistAimConfig | None = None,
     yaw_current: float = 0.0,
+    goal_tth: dict[str, float] | None = None,
+    futures: dict[str, object] | None = None,
 ) -> bool:
     """Does any striking hand need the torso to move FROM WHERE IT IS?
 
-    True as soon as ONE hand's target leaves its cone as seen from
+    True as soon as ONE hand's aggregate target leaves its cone as seen from
     ``yaw_current`` -- ``inward > engage_in`` (across the body) or
     ``inward < -engage_out`` (outboard). With both bounds disabled this is
     always True and the law fires on every beat.
     """
     cfg = cfg or WaistAimConfig()
+    entries, _w_sum = _aim_entries(targets, cfg, goal_tth=goal_tth, futures=futures)
+    return _gate_open_of(entries, cfg, yaw_current)
+
+
+def _gate_open_of(
+    entries: list[tuple[str, np.ndarray, float]],
+    cfg: WaistAimConfig,
+    yaw_current: float,
+) -> bool:
+    """:func:`gate_open` on already-built entries, so the caller that has them
+    (``aim_yaw``) does not assemble the weighted schedule twice per solve."""
     lo = cfg.engage_out
     hi = cfg.engage_in
     if hi is None and lo is None:
         return True
-    for inward in aim_inward(targets, cfg=cfg, yaw_current=yaw_current).values():
+    for inward in _inward_of(entries, cfg, yaw_current).values():
         if hi is not None and inward > float(hi) + 1e-12:
             return True
         if lo is not None and inward < -float(lo) - 1e-12:
@@ -376,6 +570,8 @@ def aim_yaw(
     *,
     cfg: WaistAimConfig | None = None,
     yaw_current: float = 0.0,
+    goal_tth: dict[str, float] | None = None,
+    futures: dict[str, object] | None = None,
 ) -> float:
     """Commanded waist yaw (rad) for the upcoming strike target(s).
 
@@ -389,17 +585,32 @@ def aim_yaw(
     cone (:func:`gate_open`); when one does, the full damped law runs and the
     weighted average serves both hands.
 
-    ``yaw_current`` is only used by the deadband: a commanded yaw smaller than
-    ``cfg.deadband`` away from where the torso already is returns
-    ``yaw_current`` unchanged, so a rhythm that keeps asking for roughly the
-    same aim does not produce a jittering torso.
+    ``yaw_current`` enters in three places, not just the deadband.  It is the
+    GATE's reference frame (:func:`gate_open` asks "must I turn from where I
+    am", so which side of the engage bounds a target falls on depends on it);
+    it is the value RETURNED (clamped to ``cfg.yaw_limit``) whenever the law
+    does not run -- no active hand, zero weights, or a shut gate all hold the
+    torso where it is; and it is the deadband's hold value: a commanded yaw
+    within ``cfg.deadband`` of it returns ``yaw_current`` unchanged, so a
+    rhythm that keeps asking for roughly the same aim does not produce a
+    jittering torso.
+
+    ``goal_tth`` (per hand, seconds from now) and ``futures`` (per hand, an
+    ordered sequence of ``(position, time_to_hit)`` for the hits BEYOND the
+    current goal) turn on the future-aware aggregate -- see the module
+    docstring.  Every producer in the stack passes them; ``cfg.future_tau = 0``
+    is the switch that ignores them.  Note the semantic change they carry: the
+    "no targets -> hold ``yaw_current``" branch below now fires only when the
+    hands have no upcoming hits AT ALL (a rest), because a hand whose goal the
+    horizon cap demoted still votes through its futures.  That is the point --
+    the hold branch was ratifying overshoots, returning the measured yaw as the
+    command every time the target set momentarily emptied.
     """
     cfg = cfg or WaistAimConfig()
-    active = _active_targets(targets, cfg)
-    if not active:
+    entries, w_sum = _aim_entries(targets, cfg, goal_tth=goal_tth, futures=futures)
+    if not entries:
         return float(np.clip(yaw_current, -cfg.yaw_limit, cfg.yaw_limit))
 
-    weights, w_sum = _weights(active, cfg)
     if w_sum <= 0.0:
         return float(np.clip(yaw_current, -cfg.yaw_limit, cfg.yaw_limit))
 
@@ -411,7 +622,7 @@ def aim_yaw(
     # yaw below is an ABSOLUTE damped target recomputed from the beat, never an
     # increment on the current one -- the torso can only sit where some beat put
     # it, and every engaged beat re-derives that from scratch.
-    if not gate_open(active, cfg=cfg, yaw_current=yaw_current):
+    if not _gate_open_of(entries, cfg, yaw_current):
         return float(np.clip(yaw_current, -cfg.yaw_limit, cfg.yaw_limit))
 
     # Fixed point of psi = demand(psi) / (1 + lambda), NOT psi += residual(psi):
@@ -421,7 +632,7 @@ def aim_yaw(
     # the rest of the azimuth for the arm.
     psi = 0.0
     for _ in range(max(int(cfg.refine_iters), 1)):
-        demand = _demand(active, weights, w_sum, cfg, psi)
+        demand = _demand(entries, w_sum, cfg, psi)
         psi = float(
             np.clip(demand / (1.0 + float(cfg.damping)), -cfg.yaw_limit, cfg.yaw_limit)
         )
@@ -633,6 +844,9 @@ class WaistYawController:
         step_now: int,
         targets: dict[str, np.ndarray],
         t_to_next_beat: float | None = None,
+        *,
+        goal_tth: dict[str, float] | None = None,
+        futures: dict[str, object] | None = None,
     ) -> bool:
         """Retarget if the pending beat(s) now want a different aim.
 
@@ -644,10 +858,15 @@ class WaistYawController:
         ``TrajOptAgent._update_waist_aim`` does -- independent of ``aim_move_s``,
         which only bounds how fast the ramp itself runs once one is built.
 
+        ``goal_tth`` / ``futures`` are :func:`aim_yaw`'s future-aware inputs,
+        passed straight through; omit them and this controller aims at the
+        pending beat alone, whatever ``cfg.future_tau`` says.
+
         Returns True when the schedule was rebuilt.
         """
         yaw_now = float(self.command_at(step_now)[0])
-        yaw_new = float(aim_yaw(targets, cfg=self.cfg, yaw_current=yaw_now))
+        yaw_new = float(aim_yaw(targets, cfg=self.cfg, yaw_current=yaw_now,
+                                goal_tth=goal_tth, futures=futures))
         # aim_yaw's own deadband returns yaw_current unchanged on a small
         # demand, so this also absorbs per-beat jitter that would otherwise
         # rebuild the schedule every tick.

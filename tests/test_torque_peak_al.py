@@ -146,7 +146,9 @@ def test_violation_is_zero_on_a_feasible_batch():
     assert float(out.violations["torque"].abs().max()) == 0.0
     # ... and the hinge, which is a softplus, is NOT zero -- that is the whole
     # reason the multipliers are driven by the violation and not by the penalty.
-    assert float(out.raw["torque_peak"].min()) > 0.0
+    assert float(out.raw["torque"].min()) > 0.0
+    # ReLU peak is identically 0 on a feasible row (pnorm of all-zero).
+    assert float(out.raw["torque_peak"].abs().max()) == 0.0
 
 
 def test_the_two_violations_are_orders_of_magnitude_apart(violating):
@@ -164,29 +166,30 @@ def test_the_two_violations_are_orders_of_magnitude_apart(violating):
 
 # =========================================== 2. the multipliers are separate ==
 def test_the_group_exists_and_is_last():
-    # ``torque_peak`` is no longer the final entry -- ``collision_peak`` was
-    # appended after it -- but the CONTRACT the original assertion protected is
-    # that the order is append-only, so every index a checkpoint recorded still
-    # resolves to the same group.  Pin the prefix instead of the tail.
-    assert CONSTRAINT_GROUPS[:6] == ("torque", "velocity", "joint_box",
-                                     "collision", "terminal", "torque_peak")
+    # Peaks stay near the end so older checkpoints still append cleanly.  Limit
+    # families are split by actuator class (``torque_waist``, ...).
+    assert CONSTRAINT_GROUPS[-5:] == (
+        "torque_peak", "collision_peak", "joint_box_peak", "waist_pr_band",
+        "velocity_peak",
+    )
+    assert "torque_waist" in CONSTRAINT_GROUPS and "torque" not in CONSTRAINT_GROUPS
     al = AugmentedLagrangian()
     assert "torque_peak" in al.lam and "torque_peak" in al.rho
-    assert al.rho["torque_peak"] < al.rho["torque"]
+    assert al.rho["torque_peak"] < al.rho["torque_waist"]
 
 
 def test_pure_al_groups_are_independent():
     al = AugmentedLagrangian(ALConfig(rho=1.0, decay=1.0))
     base = dict(al.lam)
-    al.update({"torque": 0.0, "torque_peak": 5.0})
+    al.update({"torque_waist": 0.0, "torque_peak": 5.0})
     assert al.lam["torque_peak"] == pytest.approx(base["torque_peak"] + 5.0)
-    assert al.lam["torque"] == pytest.approx(base["torque"])
-    for g in ("velocity", "joint_box", "collision", "terminal"):
-        assert al.lam[g] == base[g]                 # untouched groups: absent
+    assert al.lam["torque_waist"] == pytest.approx(base["torque_waist"])
+    for g in ("velocity_waist", "joint_box_waist", "collision", "terminal"):
+        assert al.lam[g] == base[g]
 
     al2 = AugmentedLagrangian(ALConfig(rho=1.0, decay=1.0))
-    al2.update({"torque": 5.0, "torque_peak": 0.0})
-    assert al2.lam["torque"] == pytest.approx(base["torque"] + 5.0)
+    al2.update({"torque_waist": 5.0, "torque_peak": 0.0})
+    assert al2.lam["torque_waist"] == pytest.approx(base["torque_waist"] + 5.0)
     assert al2.lam["torque_peak"] == pytest.approx(base["torque_peak"])
 
 
@@ -203,20 +206,23 @@ def test_peak_lambda_rises_while_the_mean_lambda_does_not(violating):
     viol = {k: out.violations[k] for k in out.violations}
     mean_v = float(viol["torque"].mean())
     peak_v = float(viol["torque_peak"].mean())
-    # ``decay`` and ``ema`` are separate relaxation machinery; switch them off
-    # so the assertion is about the SIGN of the violation-driven term alone.
+    hier = {g: float(viol[g].mean()) for g in CONSTRAINT_GROUPS
+            if g.startswith("torque_") and g != "torque_peak"}
+    cap = 2.0 * max(hier.values())
+    hot = max(hier, key=hier.get)
     al = AugmentedLagrangian(phase2_al_config(
-        target={g: (2.0 * mean_v if g == "torque" else 0.0)
+        target={g: (0.0 if g == "torque_peak"
+                    else cap if g.startswith("torque_") else 0.0)
                 for g in CONSTRAINT_GROUPS},
         ema=0.0, decay=1.0,
     ))
-    lam_t, lam_p = [al.lam["torque"]], [al.lam["torque_peak"]]
+    lam_t, lam_p = [al.lam[hot]], [al.lam["torque_peak"]]
     for _ in range(20):
         al.update(viol)
-        lam_t.append(al.lam["torque"])
+        lam_t.append(al.lam[hot])
         lam_p.append(al.lam["torque_peak"])
-    print(f"mean violation {mean_v:.3e} (target {2 * mean_v:.3e}), "
-          f"peak violation {peak_v:.4f} (target 0)")
+    print(f"mean violation {mean_v:.3e}, hier[{hot}] {hier[hot]:.3e} "
+          f"(target {cap:.3e}), peak {peak_v:.4f} (target 0)")
     print(f"  lam_torque      {lam_t[0]:.4f} -> {lam_t[-1]:.4f}")
     print(f"  lam_torque_peak {lam_p[0]:.4f} -> {lam_p[-1]:.4f}")
     assert all(b > a for a, b in zip(lam_p, lam_p[1:])), lam_p
@@ -229,47 +235,71 @@ def test_al_weights_reach_the_two_halves_separately(violating):
     # A dict ``lam_init`` must name EVERY group -- ``_per_group`` raises on a
     # missing one rather than silently defaulting it -- so appending a group to
     # ``CONSTRAINT_GROUPS`` reaches every literal like this one.
-    al = AugmentedLagrangian(ALConfig(lam_init={"torque": 2.0, "torque_peak": 7.0,
-                                                "velocity": 1.0, "joint_box": 1.0,
-                                                "collision": 1.0, "terminal": 1.0,
-                                                "collision_peak": 1.0}))
+    init = {g: 1.0 for g in CONSTRAINT_GROUPS}
+    for g in CONSTRAINT_GROUPS:
+        if g.startswith("torque_") and g != "torque_peak":
+            init[g] = 2.0
+    init["torque_peak"] = 7.0
+    al = AugmentedLagrangian(ALConfig(lam_init=init))
     out = _fwd(b, cost, weights=al.weights())
-    expect = (2.0 * cost.cfg.w_torque * out.raw["torque"]
-              + 7.0 * cost.cfg.w_torque_peak * out.raw["torque_peak"])
-    assert torch.equal(out.terms["torque"], expect)
+    from amortized_opt.lagrangian import ACTUATOR_SEGMENT_NAMES, limit_group_name
+    warning = cost.cfg.w_torque * out.raw["torque"]
+    peak = 7.0 * cost.cfg.w_torque_peak * out.raw["torque_peak"]
+    hard = sum(
+        2.0 * out.violations[limit_group_name("torque", s)]
+        for s in ACTUATOR_SEGMENT_NAMES
+    )
+    expect = warning + peak + hard
+    assert torch.allclose(out.terms["torque"], expect, atol=1e-12)
+    # mean softplus does not scale with segment λ
+    one = _fwd(b, cost, weights={"torque": 1.0, "torque_peak": 7.0})
+    assert torch.allclose(one.raw["torque"], out.raw["torque"], atol=1e-12)
 
 
 # ================================================== 3. the term, term by term ==
 def test_the_two_halves_are_priced_independently(violating):
     b, cost, _o = violating
+    from amortized_opt.lagrangian import ACTUATOR_SEGMENT_NAMES, limit_group_name
     ref = _fwd(b, cost, weights={"torque": 1.0, "torque_peak": 1.0})
-    mean_half = cost.cfg.w_torque * ref.raw["torque"]
+    warning = cost.cfg.w_torque * ref.raw["torque"]
     peak_half = cost.cfg.w_torque_peak * ref.raw["torque_peak"]
-    assert torch.equal(ref.terms["torque"], mean_half + peak_half)
+    hard = sum(
+        ref.violations[limit_group_name("torque", s)]
+        for s in ACTUATOR_SEGMENT_NAMES
+    )
+    assert torch.allclose(ref.terms["torque"], warning + peak_half + hard, atol=1e-12)
 
-    # moving one multiplier leaves the OTHER half bit-identical
+    # moving one multiplier: warning stays put; λ_seg scales live; λ_peak
+    # scales the ReLU peak product.
     for wt, wp_ in ((5.0, 1.0), (1.0, 9.0), (0.0, 4.0), (3.0, 0.0)):
         out = _fwd(b, cost, weights={"torque": wt, "torque_peak": wp_})
-        assert torch.equal(out.terms["torque"], wt * mean_half + wp_ * peak_half)
-    # ... and the peak knob alone cannot move the mean half: at w_torque = 0 the
-    # term is a pure multiple of the peak.
+        expect = warning + wt * hard + wp_ * peak_half
+        assert torch.allclose(out.terms["torque"], expect, atol=1e-12)
+        assert torch.allclose(out.raw["torque"], ref.raw["torque"], atol=1e-12)
     only_peak = _fwd(b, cost, weights={"torque": 0.0, "torque_peak": 2.0})
-    assert torch.equal(only_peak.terms["torque"], 2.0 * peak_half)
+    assert torch.allclose(only_peak.terms["torque"], warning + 2.0 * peak_half, atol=1e-12)
 
 
 def test_zero_peak_weight_is_bit_identical_to_the_mean_only_term():
     b = _batch(amp=ONE_ELEMENT_AMP)
     cost = _cost()                      # w_torque_peak = 0.0, the pinned default
     assert cost.cfg.w_torque_peak == 0.0
+    from amortized_opt.lagrangian import ACTUATOR_SEGMENT_NAMES, limit_group_name
     out = _fwd(b, cost)
-    assert torch.equal(out.terms["torque"], cost.cfg.w_torque * out.raw["torque"])
+    warning = cost.cfg.w_torque * out.raw["torque"]
+    hard = sum(
+        out.violations[limit_group_name("torque", s)]
+        for s in ACTUATOR_SEGMENT_NAMES
+    )
+    assert torch.allclose(out.terms["torque"], warning + hard, atol=1e-12)
     # ... and stays so however hard the peak multiplier is turned up
     for wp_ in (0.0, 1.0, 1e3):
         hot = _fwd(b, cost, weights={"torque_peak": wp_})
         assert torch.equal(hot.terms["torque"], out.terms["torque"])
-    # the group multiplier still scales the whole (mean-only) term
+    # family λ scales the hard wall, not the warning
     doubled = _fwd(b, cost, weights={"torque": 2.0})
-    assert torch.equal(doubled.terms["torque"], 2.0 * out.terms["torque"])
+    assert torch.allclose(cost.cfg.w_torque * doubled.raw["torque"], warning, atol=1e-12)
+    assert torch.allclose(doubled.terms["torque"], warning + 2.0 * hard, atol=1e-12)
 
 
 # ============================================================== 4. plumbing ==
@@ -277,23 +307,28 @@ def test_metric_names_line_up_with_the_key_tuples():
     assert METRIC_NAMES[VIOL_OFFSET:VIOL_OFFSET + len(VIOL_KEYS)] == tuple(
         f"v_{k}" for k in VIOL_KEYS
     )
-    assert METRIC_NAMES[VIOL_OFFSET] == "v_terminal"
-    # ``torque_peak``'s index is pinned where it has always been; the tail moved
-    # when ``collision_peak`` was appended after it.  Both assertions together
-    # are the append-only contract: old indices fixed, new group at the end.
-    assert METRIC_NAMES[VIOL_OFFSET + 5] == "v_torque_peak"
-    assert METRIC_NAMES[VIOL_OFFSET + len(VIOL_KEYS) - 1] == "v_collision_peak"
+    assert METRIC_NAMES[VIOL_OFFSET + VIOL_KEYS.index("torque_peak")] == "v_torque_peak"
+    assert METRIC_NAMES[VIOL_OFFSET + len(VIOL_KEYS) - 1] == "v_velocity_peak"
+    assert METRIC_NAMES[VIOL_OFFSET + VIOL_KEYS.index("collision_peak")] == "v_collision_peak"
+    assert "v_torque_waist" in METRIC_NAMES
     # 5 losses + len(TERM_KEYS).  The literal is here to catch an ACCIDENTAL
     # shift; a deliberate append to TERM_KEYS updates it (7 terms -> 12 before
     # section 7d added ``effort``, 8 -> 13 after, 9 -> 14 with ``waist_aim``,
-    # 10 -> 15 with ``waist_yaw_vel``).  ``collision_peak`` is a VIOLATION
-    # group, not a term, so it does not move this offset -- it extends the
-    # block that starts at it.
+    # 10 -> 15 with ``waist_yaw_vel``, 12 -> 17 with ``tip_crossover``,
+    # 13 -> 18 with ``terminal_aim``, 14 -> 19 with ``waist_pr_band``,
+    # 15 -> 20 with ``waist_pr_terminal``, 16 -> 21 with ``waist_upright``,
+    # 17 -> 22 with ``torque_static``).
+    # ``collision_peak`` is a VIOLATION group, not a term, so it does not
+    # move this offset -- it extends the block that starts at it.
     from amortized_opt.train_cost import LOSS_KEYS, TERM_KEYS
 
-    assert VIOL_OFFSET == len(LOSS_KEYS) + len(TERM_KEYS) == 15
+    assert VIOL_OFFSET == len(LOSS_KEYS) + len(TERM_KEYS) == 22
     assert set(VIOL_KEYS) == set(CONSTRAINT_GROUPS)
     assert len(METRIC_NAMES) == len(set(METRIC_NAMES))
+    assert "c_tip_crossover" in METRIC_NAMES
+    assert "c_terminal_aim" in METRIC_NAMES
+    assert "d_tip_lat" in METRIC_NAMES
+    assert "d_tip_cross" in METRIC_NAMES
 
 
 def test_cost_tuple_reports_the_new_violation(violating):
@@ -301,7 +336,7 @@ def test_cost_tuple_reports_the_new_violation(violating):
 
     b, cost, out = violating
     ctx = _ctx(b["B"], kl=b["kl"], kr=b["kr"])
-    _tot, _terms, viol, _diag = cost_tuple(
+    _tot, _terms, viol, _diag, _gate = cost_tuple(
         cost, b["q0"], b["wp"], b["v0"], ctx, None, None
     )
     assert viol.numel() == len(VIOL_KEYS)
@@ -314,7 +349,10 @@ def test_cost_tuple_reports_the_new_violation(violating):
 
 def test_resume_without_the_group_seeds_it_from_lam_torque():
     """An old checkpoint's AL state must not silently drop the peak price."""
-    old = AugmentedLagrangian(ALConfig(groups=CONSTRAINT_GROUPS[:5]))
+    old = AugmentedLagrangian(ALConfig(
+        groups=("torque", "velocity", "joint_box", "collision", "terminal"),
+        rho=1.0,
+    ))
     old.update({g: 0.4 for g in old.groups})
     state = old.state_dict()
     assert "torque_peak" not in state["lam"]
@@ -328,8 +366,9 @@ def test_resume_without_the_group_seeds_it_from_lam_torque():
     assert seeded.lam["torque_peak"] == seeded.lam["torque"] == state["lam"]["torque"]
     assert seeded.lam["torque"] != 1.0            # the migration is doing work
     # every other group is carried over untouched
-    for g in CONSTRAINT_GROUPS[:5]:
+    for g in ("torque", "velocity", "joint_box", "collision", "terminal"):
         assert seeded.lam[g] == state["lam"][g]
+    assert seeded.lam["torque_left_wrist"] == state["lam"]["torque"]
     # ... and the migrated state does not mutate the caller's dict
     assert "torque_peak" not in state["lam"]
 
@@ -373,19 +412,18 @@ def test_demonstration_one_over_limit_element():
     viol = {k: out.violations[k] for k in out.violations}
     al = AugmentedLagrangian(phase2_al_config(ema=0.0, decay=1.0))
     print("  20 AL updates, pure integral (ema 0, decay 1):")
-    print("  step   lam_torque   lam_torque_peak")
+    print("  step   lam_left_wrist   lam_torque_peak")
     for s in range(21):
         if s % 5 == 0:
-            print(f"  {s:4d}   {al.lam['torque']:10.5f}   "
+            print(f"  {s:4d}   {al.lam['torque_left_wrist']:10.5f}   "
                   f"{al.lam['torque_peak']:14.5f}")
         al.update(viol)
 
-    # ... and where the DEFAULT dynamics (decay 0.999) put each multiplier:
-    # lam* = rho * v / (1 - decay).
     cfg = phase2_al_config()
-    for g, v in (("torque", mean_v), ("torque_peak", peak_v)):
+    wrist_v = float(out.violations["torque_left_wrist"][0])
+    for g, v in (("torque_left_wrist", wrist_v), ("torque_peak", peak_v)):
         eq = cfg.rho[g] * v / (1.0 - cfg.decay)
-        print(f"  default-config equilibrium lam_{g:11s} = {eq:8.4f} "
+        print(f"  default-config equilibrium lam_{g:20s} = {eq:8.4f} "
               f"(rho {cfg.rho[g]:.1e} x violation {v:.4f})")
     assert peak_v > mean_v
 
@@ -394,11 +432,21 @@ def test_no_group_can_be_dropped_from_the_al_view(violating):
     """Every constraint group the cost reports is a group the AL integrates."""
     _b, _c, out = violating
     reported = {k for k in out.violations}
-    assert reported == set(CONSTRAINT_GROUPS), reported ^ set(CONSTRAINT_GROUPS)
+    assert set(CONSTRAINT_GROUPS) <= reported, set(CONSTRAINT_GROUPS) - reported
+    # Family names stay as the global element-mean alias (not AL groups).
+    assert {"torque", "velocity", "joint_box"} <= reported
     al = AugmentedLagrangian(phase2_al_config(decay=1.0))
     before = dict(al.lam)
     al.update(out.violations)
-    assert all(al.lam[g] >= before[g] for g in CONSTRAINT_GROUPS)
+    rec = al.history[-1]
+    assert all(g in rec for g in CONSTRAINT_GROUPS)
+    for g in CONSTRAINT_GROUPS:
+        if al.avg_violation[g] > al.target[g]:
+            assert al.lam[g] > before[g], (g, al.avg_violation[g], al.target[g],
+                                           before[g], al.lam[g])
+        else:
+            assert al.lam[g] <= before[g], (g, al.avg_violation[g], al.target[g],
+                                            before[g], al.lam[g])
 
 
 def test_the_full_batch_shape_of_the_new_group(violating):

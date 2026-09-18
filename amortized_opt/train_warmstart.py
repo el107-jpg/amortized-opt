@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -42,10 +43,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .constants import G1_UPPER_BODY_JOINTS
-from .limits import isaac_effort_limits, isaac_velocity_limits
+from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
+from .limits import ETA_VELOCITY, isaac_effort_limits, isaac_velocity_limits
 from .model import AmortizedOptimizer, ModelConfig
 from .tokenizer import joint_group_masks
+from .warmstart import waist_slice
 from .warmstart_data import NoiseConfig, ScenarioConfig, WarmstartPool
 
 __all__ = [
@@ -55,6 +57,9 @@ __all__ = [
     "TrainConfig",
     "batch_sampler",
     "forward_loss",
+    "apply_waist_follow",
+    "waist_identity_gain",
+    "waist_follow_probe",
     "load_checkpoint",
     "make_step",
     "save_checkpoint",
@@ -75,6 +80,16 @@ METRIC_NAMES: tuple[str, ...] = (
     "rmse_vel_rads",
     "rmse_acc_rads2",
     "rmse_torque_nm",
+    #: Torque RMSE in units of EACH JOINT'S OWN rating -- the normalized-space
+    #: RMSE, before any scale is multiplied back in.  ``rmse_torque_nm`` above
+    #: undoes the scale in a rating-AVERAGED sense (``mean(scale^2)``), so it is
+    #: dominated by the 88 N*m waist and says almost nothing about the 5 N*m
+    #: wrists, which are the joints that saturate.  This one weights every
+    #: joint by its own motor.
+    "rmse_torque_frac",
+    #: ...and the same error restricted to the four wrist pitch/yaw joints,
+    #: back in N*m against their own 5 N*m rating.
+    "rmse_torque_wrist_nm",
     "rmse_fk_pos_m",
     "rmse_fk_vel_mps",
     "n_elem",
@@ -95,6 +110,13 @@ class LossWeights:
     #: Huber transition, in the units each term is measured in.
     huber_traj: float = 0.1
     huber_aux: float = 0.1
+    #: Weak encoder-head mimic (yaw → aim, P/R → 0).  Only trains residual
+    #: MLPs; the decoder token is stopgrad.  0 keeps phase-1 bit-identical
+    #: when gain is also 0.
+    mimic: float = 0.0
+    #: Identity Jacobian: ``(∂ q_hold / ∂ s − 1)²`` on the frozen hold
+    #: window, so the decoder passes the encoder set-point through.  0 is off.
+    gain: float = 0.0
 
 
 class LossScales:
@@ -113,6 +135,13 @@ class LossScales:
         t = lambda a: torch.as_tensor(np.asarray(a, float), device=device, dtype=dtype)
         self.vel = t(isaac_velocity_limits(joint_names)).view(1, 1, -1)
         self.torque = t(isaac_effort_limits(joint_names)).view(1, 1, -1)
+        #: The four 5 N*m wrist pitch/yaw motors -- the ONLY joints that
+        #: actually saturate, and the ones a rating-averaged N*m figure hides
+        #: behind the 88 N*m waist.  Used for the ``rmse_torque_wrist_nm``
+        #: diagnostic; not part of any loss.
+        self.wrist_mask = t(
+            [1.0 if re.search(r"wrist_(pitch|yaw)", n) else 0.0 for n in joint_names]
+        ).view(1, 1, -1)
         self.acc = float(accel)
         self.fk_pos = float(fk_pos)
         self.fk_vel = float(fk_vel)
@@ -148,30 +177,43 @@ def forward_loss(
     aux_fk_vel: torch.Tensor,
     scales: LossScales,
     weights: LossWeights,
+    enc=None,
+    aux_elem_mask=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One refinement iteration + every masked loss.  Returns ``(loss, metrics)``.
 
     ``metrics`` is a 1-D tensor in :data:`METRIC_NAMES` order.  Everything here
     is static-shape and branch-free so ``torch.compile`` sees one graph per
     horizon bucket.
+
+    Optional ``enc`` skips the in-graph encode (follow mix encodes eagerly).
+    Optional ``aux_elem_mask`` replaces ``elem_mask`` on vel/acc/torque only,
+    so iv-row waist aux can be dropped without silencing the traj Huber.
     """
-    enc = module.encode_context(context) if hasattr(module, "encode_context") else \
-        module.module.encode_context(context)
+    if enc is None:
+        enc = module.encode_context(context) if hasattr(module, "encode_context") else \
+            module.module.encode_context(context)
     out = module(init, state, enc, masks)
 
     em = masks.elem_mask.to(target.dtype)
+    em_aux = em if aux_elem_mask is None else aux_elem_mask.to(target.dtype)
     pm = masks.point_mask.to(target.dtype).unsqueeze(-1).expand_as(aux_fk_pos)
 
     l_traj, se_traj, _n = _masked_huber(out.traj, target, em, weights.huber_traj)
     l_vel, se_vel, _ = _masked_huber(
-        out.vel / scales.vel, aux_vel / scales.vel, em, weights.huber_aux
+        out.vel / scales.vel, aux_vel / scales.vel, em_aux, weights.huber_aux
     )
     l_acc, se_acc, _ = _masked_huber(
-        out.acc / scales.acc, aux_acc / scales.acc, em, weights.huber_aux
+        out.acc / scales.acc, aux_acc / scales.acc, em_aux, weights.huber_aux
     )
     l_tau, se_tau, n_elem = _masked_huber(
-        out.torque / scales.torque, aux_torque / scales.torque, em, weights.huber_aux
+        out.torque / scales.torque, aux_torque / scales.torque, em_aux, weights.huber_aux
     )
+    # Wrist-only torque error, in N*m against the wrists' own 5 N*m rating.
+    # Same residual, a different reduction -- diagnostic only, no gradient.
+    wm = em * scales.wrist_mask
+    d_tau_w = (out.torque - aux_torque).detach() * wm
+    se_tau_w = (d_tau_w * d_tau_w).sum() / wm.sum().clamp_min(1.0)
     l_fp, se_fp, _ = _masked_huber(
         out.fk_pos / scales.fk_pos, aux_fk_pos / scales.fk_pos, pm, weights.huber_aux
     )
@@ -204,6 +246,8 @@ def forward_loss(
             (se_vel.detach() * vs).sqrt(),
             se_acc.detach().sqrt() * scales.acc,
             (se_tau.detach() * ts).sqrt(),
+            se_tau.detach().sqrt(),          # rmse_torque_frac (normalized space)
+            se_tau_w.sqrt(),                 # rmse_torque_wrist_nm
             se_fp.detach().sqrt() * scales.fk_pos,
             se_fv.detach().sqrt() * scales.fk_vel,
             n_elem.detach(),
@@ -247,6 +291,217 @@ def unpack(batch: dict):
         batch["init"], batch["state"], batch["context"], batch["masks"], batch["target"],
         a["vel"], a["acc"], a["torque"], a["fk_pos"], a["fk_vel"],
     )
+
+
+def _core(module):
+    return module.module if hasattr(module, "module") else module
+
+
+def _heads_on(module) -> bool:
+    cfg = _core(module).cfg
+    return bool(cfg.waist_sp_head or cfg.waist_pr_sp_head)
+
+
+def _follow_active(cfg: TrainConfig, weights: LossWeights, module) -> bool:
+    return _heads_on(module) and (
+        float(weights.mimic) > 0.0 or float(weights.gain) > 0.0
+    )
+
+
+def _elem_huber(pred: torch.Tensor, target: torch.Tensor, beta: float = 0.1):
+    d = pred - target
+    a = d.abs()
+    return torch.where(a < beta, 0.5 * d * d / beta, a - 0.5 * beta).mean()
+
+
+def make_decode_step(
+    module: torch.nn.Module,
+    scales: LossScales,
+    weights: LossWeights,
+    *,
+    compile_mode: str | None = "default",
+    fullgraph: bool = False,
+):
+    """Like :func:`make_step` but takes a precomputed ``enc`` and aux mask."""
+
+    def fn(init, state, enc, masks, target, av, aa, at, afp, afv, aux_em):
+        return forward_loss(
+            module, init, state, None, masks, target, av, aa, at, afp, afv,
+            scales, weights, enc=enc, aux_elem_mask=aux_em,
+        )
+
+    if compile_mode is None:
+        return fn
+    return torch.compile(fn, mode=compile_mode, fullgraph=fullgraph, dynamic=False)
+
+
+def apply_waist_follow(module, batch, enc, cfg: TrainConfig, *, generator=None):
+    """Mimic + stopgrad token substitute.  Does not touch ``init`` or ``target``.
+
+    The decoder sees the announced set-point; residual MLPs train only through
+    ``l_mimic``.  Identity Jacobian is :func:`waist_identity_gain` (separate
+    decode, frozen hold mask).  ``generator`` is unused (kept so old call
+    sites still type-check).
+    """
+    from .train_cost import substitute_waist_setpoints
+
+    del generator
+    ctx = batch["context"]
+    device = enc.memory.device
+    dtype = enc.memory.dtype
+    yaw_now = ctx.yaw_now.to(device=device, dtype=dtype)
+    base_yaw = torch.where(
+        ctx.aim_valid.to(device=device, dtype=torch.bool),
+        ctx.aim_yaw.to(device=device, dtype=dtype),
+        yaw_now,
+    )
+
+    l_mimic = enc.memory.new_zeros(())
+    if enc.waist_yaw_sp is not None:
+        l_mimic = l_mimic + _elem_huber(enc.waist_yaw_sp, base_yaw.detach())
+    if enc.waist_pr_sp is not None:
+        l_mimic = l_mimic + _elem_huber(
+            enc.waist_pr_sp, torch.zeros_like(enc.waist_pr_sp)
+        )
+
+    yaw_use = None if enc.waist_yaw_sp is None else enc.waist_yaw_sp.detach()
+    pr_use = None if enc.waist_pr_sp is None else enc.waist_pr_sp.detach()
+    enc_dec = substitute_waist_setpoints(
+        module, enc,
+        yaw_sp=yaw_use, pr_sp=pr_use,
+        yaw_now=yaw_now if yaw_use is not None else None,
+        base_yaw=base_yaw if yaw_use is not None else None,
+    )
+    return enc_dec, batch["target"], batch["masks"].elem_mask, l_mimic, {"n_iv": 0}
+
+
+def _index_encoding(enc, sl):
+    opt = lambda v: None if v is None else v[sl]  # noqa: E731
+    return type(enc)(
+        enc.memory[sl], enc.mask[sl],
+        opt(enc.waist_yaw_sp), opt(enc.waist_yaw_res),
+        opt(enc.waist_pr_sp), opt(enc.waist_pr_res),
+    )
+
+
+def _encoding_float(enc):
+    """fp32 copy so substitute + VJP do not run in bf16."""
+    opt = lambda v: None if v is None else v.float()  # noqa: E731
+    return type(enc)(
+        enc.memory.detach().float(), enc.mask,
+        opt(None if enc.waist_yaw_sp is None else enc.waist_yaw_sp.detach()),
+        opt(None if enc.waist_yaw_res is None else enc.waist_yaw_res.detach()),
+        opt(None if enc.waist_pr_sp is None else enc.waist_pr_sp.detach()),
+        opt(None if enc.waist_pr_res is None else enc.waist_pr_res.detach()),
+    )
+
+
+def _index_masks(masks, sl):
+    kw = {}
+    for name in masks.__dataclass_fields__:
+        t = getattr(masks, name)
+        kw[name] = t[sl] if torch.is_tensor(t) else t
+    return type(masks)(**kw)
+
+
+def _hold_mask(elem_mask: torch.Tensor, col: int, hold_wp: int) -> torch.Tensor:
+    """Frozen hold window: last ``hold_wp`` valid knots.  Independent of ``s``."""
+    em = elem_mask[..., col]
+    idx = torch.arange(em.shape[1], device=em.device, dtype=em.dtype).view(1, -1)
+    H_w = (em * (idx + 1.0)).amax(-1).clamp_min(1.0)
+    start = (H_w - float(hold_wp)).clamp_min(0.0)
+    return (idx >= start.unsqueeze(-1)) & (idx < H_w.unsqueeze(-1)) & (em > 0.5)
+
+
+def _hold_mean(series: torch.Tensor, hold_m: torch.Tensor) -> torch.Tensor:
+    n = hold_m.float().sum(-1).clamp_min(1.0)
+    return (series * hold_m.float()).sum(-1) / n
+
+
+def waist_identity_gain(module, batch, enc, cfg: TrainConfig) -> tuple[torch.Tensor, dict]:
+    """``mean((∂q_hold/∂s − 1)²)`` on a batch slice.  Leaf ``s`` is stopgrad(sp).
+
+    Hold mask does not depend on ``s``.  Encoder residual MLPs are not in
+    this graph.  Runs eager fp32 (no autocast) so the VJP is well-defined.
+    """
+    from .train_cost import substitute_waist_setpoints
+
+    core = _core(module)
+    names = list(G1_UPPER_BODY_JOINTS)
+    ctx = batch["context"]
+    B = enc.memory.shape[0]
+    frac = float(cfg.waist_gain_frac)
+    n = B if frac >= 1.0 else max(int(frac * B), 1) if frac > 0.0 else B
+    n = min(n, B)
+    sl = slice(0, n)
+
+    enc_s = _encoding_float(_index_encoding(enc, sl))
+    masks = _index_masks(batch["masks"], sl)
+    init = batch["init"][sl].float()
+    state = batch["state"][sl].float()
+    yaw_now = ctx.yaw_now[sl].float()
+    base_yaw = torch.where(ctx.aim_valid[sl], ctx.aim_yaw[sl].float(), yaw_now)
+
+    yaw_leaf = pr_leaf = None
+    if enc_s.waist_yaw_sp is not None:
+        yaw_leaf = enc_s.waist_yaw_sp.detach().float().requires_grad_(True)
+    if enc_s.waist_pr_sp is not None:
+        pr_leaf = enc_s.waist_pr_sp.detach().float().requires_grad_(True)
+    if yaw_leaf is None and pr_leaf is None:
+        z = enc.memory.new_zeros(())
+        return z, {"n": 0, "gain_yaw": float("nan"), "gain_pr": float("nan")}
+
+    enc_g = substitute_waist_setpoints(
+        module, enc_s,
+        yaw_sp=yaw_leaf, pr_sp=pr_leaf,
+        yaw_now=yaw_now if yaw_leaf is not None else None,
+        base_yaw=base_yaw if yaw_leaf is not None else None,
+    )
+    # Flash / mem-efficient SDPA have no double backward; the identity
+    # Jacobian needs create_graph=True, so force the math kernel.
+    sdp = torch.nn.attention.sdpa_kernel
+    backend = torch.nn.attention.SDPBackend.MATH
+    with torch.autocast(device_type="cuda", enabled=False), sdp(backend):
+        out = core(init, state, enc_g, masks)
+    em = masks.elem_mask
+    hold_wp = int(cfg.waist_hold_wp)
+    terms: list[torch.Tensor] = []
+    info: dict = {"n": n}
+
+    if yaw_leaf is not None:
+        yi = names.index("waist_yaw_joint")
+        hm = _hold_mask(em, yi, hold_wp)
+        hold = _hold_mean(out.traj[..., yi], hm)
+        g = torch.autograd.grad(
+            hold, yaw_leaf, torch.ones_like(hold), create_graph=True, retain_graph=True,
+        )[0]
+        terms.append((g - 1.0).square().mean())
+        info["gain_yaw"] = float(g.detach().mean())
+    else:
+        info["gain_yaw"] = float("nan")
+
+    if pr_leaf is not None:
+        pi = names.index("waist_pitch_joint")
+        ri = names.index("waist_roll_joint")
+        hm = _hold_mask(em, pi, hold_wp)
+        hold_p = _hold_mean(out.traj[..., pi], hm)
+        hold_r = _hold_mean(out.traj[..., ri], hm)
+        gp = torch.autograd.grad(
+            hold_p, pr_leaf, torch.ones_like(hold_p), create_graph=True, retain_graph=True,
+        )[0]
+        gr = torch.autograd.grad(
+            hold_r, pr_leaf, torch.ones_like(hold_r), create_graph=True, retain_graph=True,
+        )[0]
+        terms.append(
+            (gp[:, 0] - 1.0).square().mean() + gp[:, 1].square().mean()
+            + gr[:, 0].square().mean() + (gr[:, 1] - 1.0).square().mean()
+        )
+        info["gain_pr"] = float(0.5 * (gp[:, 0].detach().mean() + gr[:, 1].detach().mean()))
+    else:
+        info["gain_pr"] = float("nan")
+
+    loss = terms[0] if len(terms) == 1 else (terms[0] + terms[1]) * 0.5
+    return loss, info
 
 
 # ============================================================== sampling =====
@@ -323,6 +578,28 @@ class TrainConfig:
 
     seed: int = 0
     device: str = "cuda:1"
+
+    #: WHICH torque the aux torque head is regressed onto.  ``False`` (default)
+    #: is the RNEA segment max every phase-1 checkpoint before 2026-08-16 was
+    #: trained on; ``True`` is the DEMANDED PD tracking torque, the quantity
+    #: :attr:`~amortized_opt.cost.CostConfig.w_track_torque` prices.  The label
+    #: itself is baked into the pool
+    #: (:class:`~amortized_opt.warmstart_data.WarmstartPool.aux_torque_tracking`);
+    #: this field records the choice in the checkpoint and :func:`train`
+    #: refuses to run if the two disagree, so a checkpoint can never claim one
+    #: definition while its head learned the other.
+    aux_torque_tracking: bool = False
+
+    #: Removed: jitter + rewritten-target mix.  Non-zero is a hard error;
+    #: use :attr:`LossWeights.gain` (identity Jacobian) instead.
+    waist_follow_frac: float = 0.0
+    waist_follow_jitter: float = 0.3
+    waist_pr_follow_jitter: float = 0.1
+    #: Frozen hold window (waypoints) for the identity Jacobian and the probe.
+    waist_hold_wp: int = 10
+    #: Fraction of the batch that pays for ``∂q_hold/∂s`` (operating point,
+    #: no token noise).  1 = every row.
+    waist_gain_frac: float = 1.0
 
     def lr_at(self, step: int) -> float:
         if step < self.warmup_steps:
@@ -453,6 +730,14 @@ def train(
     log: bool = True,
 ) -> dict:
     """The phase-1 loop.  Returns a summary dict; writes checkpoints + JSONL."""
+    for name, pool in (("train_pool", train_pool), ("val_pool", val_pool)):
+        got = bool(getattr(pool, "aux_torque_tracking", False))
+        if got != bool(cfg.aux_torque_tracking):
+            raise ValueError(
+                f"{name}.aux_torque_tracking={got} but "
+                f"TrainConfig.aux_torque_tracking={cfg.aux_torque_tracking}; the "
+                "torque label is baked into the pool, so these must agree"
+            )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(cfg.device)
@@ -474,6 +759,24 @@ def train(
     # three more specializations (one per bucket) for 12 batches every 500
     # steps.  Eager val costs ~1 s per eval; the extra compiles cost ~100 s.
     eval_fn = make_step(model, scales, weights, compile_mode=None)
+
+    if float(cfg.waist_follow_frac) > 0.0:
+        raise ValueError(
+            "waist_follow_frac is removed; set LossWeights.gain so "
+            "∂q_hold/∂s = 1 (no token jitter, no rewritten target)"
+        )
+    if (weights.mimic > 0.0 or weights.gain > 0.0) and not _heads_on(model):
+        raise ValueError(
+            "mimic / gain require ModelConfig.waist_sp_head or waist_pr_sp_head"
+        )
+    follow = _follow_active(cfg, weights, model)
+    decode_fn = (
+        make_decode_step(
+            model, scales, weights,
+            compile_mode=cfg.compile_mode, fullgraph=cfg.compile_fullgraph,
+        )
+        if follow else None
+    )
 
     rng = np.random.default_rng(cfg.seed)
     gen = torch.Generator(device=train_pool.device)
@@ -521,10 +824,33 @@ def train(
             if amp is not None
             else torch.autocast(device_type="cuda", enabled=False)
         )
+        g_info: dict = {}
         with ctx:
-            loss, metrics = step_fn(*unpack(batch))
+            if follow:
+                enc = (
+                    model.encode_context(batch["context"])
+                    if hasattr(model, "encode_context")
+                    else model.module.encode_context(batch["context"])
+                )
+                enc_d, target, aux_em, l_mimic, _info = apply_waist_follow(
+                    model, batch, enc, cfg, generator=gen,
+                )
+                a = batch["aux"]
+                loss, metrics = decode_fn(
+                    batch["init"], batch["state"], enc_d, batch["masks"], target,
+                    a["vel"], a["acc"], a["torque"], a["fk_pos"], a["fk_vel"], aux_em,
+                )
+                if weights.mimic > 0.0:
+                    loss = loss + weights.mimic * l_mimic
+            else:
+                loss, metrics = step_fn(*unpack(batch))
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        # Second backward: identity Jacobian.  Must not share the live Huber
+        # graph (a 1024-row create_graph decode on top of BC OOM'd 32 GB).
+        if follow and weights.gain > 0.0:
+            l_gain, g_info = waist_identity_gain(model, batch, enc, cfg)
+            (weights.gain * l_gain).backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
 
@@ -537,11 +863,17 @@ def train(
                    "grad_norm": float(gnorm), "steps_per_s": cfg.log_every / (now - t_last),
                    "elapsed_s": now - t_start}
             rec.update({k: float(v) for k, v in zip(METRIC_NAMES, run_acc / max(run_n, 1))})
+            if g_info:
+                rec["gain_yaw"] = g_info.get("gain_yaw")
+                rec["gain_pr"] = g_info.get("gain_pr")
             emit(rec)
             if log:
                 print(
                     f"[{step+1:6d}] loss {rec['loss']:.4f} traj {rec['rmse_traj_rad']*1000:7.1f} mrad "
-                    f"tau {rec['rmse_torque_nm']:6.2f} Nm fk {rec['rmse_fk_pos_m']*100:5.2f} cm "
+                    f"tau {rec['rmse_torque_nm']:6.2f} Nm "
+                    f"({rec['rmse_torque_frac']:.3f} rat, "
+                    f"wrist {rec['rmse_torque_wrist_nm']:5.2f} Nm) "
+                    f"fk {rec['rmse_fk_pos_m']*100:5.2f} cm "
                     f"| {rec['steps_per_s']:.1f} it/s",
                     flush=True,
                 )
@@ -694,3 +1026,92 @@ def imitation_report(
         rep[f"aux_{k}_rmse"] = rmse
         rep[f"aux_{k}_rel"] = rmse / max(rms, 1e-12)
     return rep
+
+
+@torch.no_grad()
+def waist_follow_probe(
+    model: torch.nn.Module,
+    pool: WarmstartPool,
+    *,
+    batch_size: int = 64,
+    n_batches: int = 8,
+    seed: int = 0,
+    yaw_deltas: tuple[float, ...] = (0.30, -0.30, 0.15, -0.15),
+) -> dict:
+    """Causal token-read check: decode original init against ``sp+Δ``.
+
+    Never used as a training or val loss.  Reports ``corr(Δ, hold−aim)``,
+    gain, and hold RMSE to ``sp_use`` vs aim.  A decoder that merely clones
+    the quintic scores corr ≈ 0; one that reads the token tracks Δ.
+    """
+    from .train_cost import substitute_waist_setpoints, waist_sp_bound
+
+    rng = np.random.default_rng(seed)
+    gen = torch.Generator(device=pool.device)
+    gen.manual_seed(int(seed) + 17)
+    core = _core(model)
+    if not core.cfg.waist_sp_head:
+        raise ValueError("waist_follow_probe requires waist_sp_head")
+    names = list(G1_UPPER_BODY_JOINTS)
+    yaw_i = names.index("waist_yaw_joint")
+    bound = float(waist_sp_bound())
+    was_training = model.training
+    model.eval()
+    deltas, hold_minus_aim, err_sp, err_aim = [], [], [], []
+    n_iv_hold = 0
+    for b, idx in batch_sampler(pool, batch_size, rng=rng, steps=int(n_batches)):
+        batch = pool.batch(b, idx, generator=gen, hold_init=False)
+        enc = core.encode_context(batch["context"])
+        ctx = batch["context"]
+        yaw_now = ctx.yaw_now.to(enc.waist_yaw_sp.dtype)
+        aim = torch.where(ctx.aim_valid.to(torch.bool), ctx.aim_yaw.to(yaw_now.dtype), yaw_now)
+        em = batch["masks"].elem_mask
+        B, H = em.shape[:2]
+        # cycle signed deltas across the batch
+        dlt = torch.as_tensor(
+            [yaw_deltas[i % len(yaw_deltas)] for i in range(B)],
+            device=enc.waist_yaw_sp.device, dtype=enc.waist_yaw_sp.dtype,
+        )
+        sp_use = (enc.waist_yaw_sp + dlt).clamp(-bound, bound)
+        enc_d = substitute_waist_setpoints(
+            core, enc, yaw_sp=sp_use, yaw_now=yaw_now, base_yaw=aim,
+        )
+        out = core(batch["init"], batch["state"], enc_d, batch["masks"])
+        idx_t = torch.arange(H, device=em.device, dtype=em.dtype).view(1, H)
+        H_w = (em[..., yaw_i] * (idx_t + 1.0)).amax(-1).clamp_min(1.0)
+        q0y = batch["q0"][:, yaw_i]
+        step = float(ETA_VELOCITY) * float(isaac_velocity_limits(names)[yaw_i]) * float(CONTROL_DT)
+        need = torch.ceil(1.875 * (sp_use - q0y).abs() / max(step, 1e-9))
+        hi = H_w.clamp_min(1.0)
+        lo = torch.minimum(torch.full_like(hi, 10.0), hi)
+        kstar = need.clamp(min=lo, max=hi)
+        t = torch.arange(H, device=em.device, dtype=em.dtype).view(1, H)
+        hold_m = (t >= (kstar - 1.0).unsqueeze(-1)) & (em[..., yaw_i] > 0.5)
+        n = hold_m.float().sum(-1).clamp_min(1.0)
+        hold = (out.traj[..., yaw_i] * hold_m.float()).sum(-1) / n
+        ok = (H_w >= 2.0) & (hold_m.any(-1))
+        if not bool(ok.any()):
+            continue
+        n_iv_hold += int(ok.sum())
+        deltas.append(dlt[ok].detach().cpu())
+        hold_minus_aim.append((hold - aim)[ok].detach().cpu())
+        err_sp.append((hold - sp_use)[ok].abs().detach().cpu())
+        err_aim.append((hold - aim)[ok].abs().detach().cpu())
+    if was_training:
+        model.train()
+    if not deltas:
+        return {"n": 0, "corr": 0.0, "gain": 0.0,
+                "rmse_to_sp": float("nan"), "rmse_to_aim": float("nan")}
+    d = torch.cat(deltas).numpy()
+    y = torch.cat(hold_minus_aim).numpy()
+    corr = float(np.corrcoef(d, y)[0, 1]) if d.size > 2 else 0.0
+    var = float(np.var(d))
+    gain = float(np.cov(d, y)[0, 1] / var) if var > 1e-12 else 0.0
+    return {
+        "n": int(n_iv_hold),
+        "corr": corr if np.isfinite(corr) else 0.0,
+        "gain": gain if np.isfinite(gain) else 0.0,
+        "rmse_to_sp": float(torch.cat(err_sp).pow(2).mean().sqrt()),
+        "rmse_to_aim": float(torch.cat(err_aim).pow(2).mean().sqrt()),
+        "mean_abs_delta": float(np.abs(d).mean()),
+    }

@@ -312,23 +312,56 @@ class BatchedSchedule:
         k = torch.round(tth / self.cfg.dt).long().clamp_min(1)
         return torch.where(active, k.clamp_max(self.cfg.cap_wp), torch.full_like(k, -1))
 
-    def context(self) -> ContextInputs:
-        """The encoder's ``ContextInputs``, one row per env, on device."""
+    def context(self, yaw_now: torch.Tensor | None = None,
+                waist_cfg=None) -> ContextInputs:
+        """The encoder's ``ContextInputs``, one row per env, on device.
+
+        ``yaw_now`` is the CURRENT measured waist yaw, ``(B,)`` (a scalar
+        broadcasts).  When given, the waist-sp-head conditioning fields are
+        filled: ``yaw_now`` verbatim, ``aim_yaw`` from the analytic
+        :func:`~amortized_opt.waist_aim.aim_yaw` law over this tick's ACTIVE
+        goals AND each hand's upcoming future hits, weighted by time to hit, in
+        the PELVIS frame (goal positions are env-frame in this table, so
+        ``PELVIS_IN_ENV`` is subtracted -- the same frame handling as
+        ``rhythm.build_context_inputs``), and ``aim_valid`` all-True.  Without
+        it the three fields keep their zero defaults and a waist-sp-head
+        checkpoint is conditioned on "hold 0 rad" -- so pass it wherever such a
+        checkpoint can be deployed (``IsaacMPC._encoding`` does).
+
+        The aim is recomputed on EVERY call rather than cached per goal
+        segment, because ``aim_yaw``'s reach gate and deadband are RELATIVE to
+        ``yaw_current``, which moves every tick -- a per-segment cache would
+        gate from a stale torso frame.  Cost is one ~0.1 ms host-side numpy
+        solve per env, fine at play-time batch sizes; the large-B training
+        loops do not pass ``yaw_now`` and keep today's zero fallback.
+        """
         cfg = self.cfg
         tth, gd, gp, gv, gvalid, gactive = self.goal()
         # An out-of-range goal is not the goal: it becomes future[0], exactly as
         # ``goal_snapshot`` does when ``horizon_cap`` rejects ``nxt[0]``.
         shift = (gvalid & ~gactive).long()                             # (B,2)
+        # THE ANCHOR for the future tokens (``ContextInputs.future_gap``), the
+        # same rule ``rhythm.build_context_inputs`` applies: the CURRENT goal's
+        # strike when the hand has one, else now.  A hand in ``shift`` has no
+        # current goal -- its out-of-range hit became future[0] -- so it takes
+        # the from-now fallback, which is what ``gactive`` already encodes.
+        # Anchoring on the ABSOLUTE hit time rather than on ``tth`` keeps the
+        # subtraction free of the query instant, so the tokens are bit-constant
+        # across the ticks of one goal segment; going through ``tth`` re-rounds
+        # by ~1e-7 every tick and the segment-cache invariant is then only
+        # approximately true.
+        t_goal, *_ = self._gather(0)                                   # (B,2) abs
+        t_anchor = torch.where(gactive, t_goal, self._query_time().unsqueeze(-1))
         F = int(cfg.num_future)
         ft = []; fd = []; fp = []; fv = []; fval = []
         for j in range(F):
             t, d, p, w, v = self._gather_shifted(1 + j, shift)
-            ft.append(t - self._query_time().unsqueeze(-1))
+            ft.append(t - t_anchor)
             fd.append(d); fp.append(p); fv.append(w); fval.append(v)
         stack = lambda xs, dim=2: torch.stack(xs, dim=dim)             # noqa: E731
-        f_tth = stack(ft)
+        f_gap = stack(ft)
         f_val = stack(fval)
-        return ContextInputs(
+        ctx = ContextInputs(
             drum_pos=self.drum_pos, drum_axis=self.drum_axis,
             drum_radius=self.drum_radius, drum_height=self.drum_height,
             drum_valid=self.drum_valid,
@@ -339,9 +372,61 @@ class BatchedSchedule:
             future_drum=torch.where(f_val, stack(fd), torch.zeros_like(stack(fd))),
             future_pos=stack(fp) * f_val.unsqueeze(-1),
             future_vel=stack(fv) * f_val.unsqueeze(-1),
-            future_tth=torch.where(f_val, f_tth, torch.zeros_like(f_tth)),
+            future_gap=torch.where(f_val, f_gap, torch.zeros_like(f_gap)),
             future_valid=f_val,
         )
+        if yaw_now is not None:
+            self._fill_aim(ctx, yaw_now, gp, gactive, waist_cfg)
+        return ctx
+
+    def _fill_aim(self, ctx: ContextInputs, yaw_now, goal_pos: torch.Tensor,
+                  goal_active: torch.Tensor, waist_cfg) -> None:
+        """Fill ``yaw_now`` / ``aim_yaw`` / ``aim_valid`` -- see :meth:`context`."""
+        from amortized_opt.waist_aim import WaistAimConfig, aim_yaw
+
+        yn = torch.as_tensor(yaw_now, device=self.device).reshape(-1)
+        if yn.numel() == 1:
+            yn = yn.expand(self.B)
+        yn_h = yn.detach().to("cpu", torch.float64).numpy()
+        # env -> pelvis: the frame the aim law's shoulder offsets live in,
+        # copied from ``rhythm.build_context_inputs``.
+        p = (goal_pos - self._pelvis).detach().cpu().numpy()
+        act = goal_active.detach().cpu().numpy()
+        # THE FUTURE HITS VOTE TOO, weighted by time to hit alone -- the same
+        # aggregate ``rhythm.build_context_inputs`` builds from the snapshot,
+        # off the tokens this method has just filled.  ``future_gap`` is stated
+        # relative to the hand's current goal strike (or to now when it has
+        # none), and the aim law's clock is FROM NOW, so undo the anchoring
+        # once here -- the same algebra ``_regoal`` uses in the roller.
+        tth = ctx.goal_tth.detach().to("cpu", torch.float64).numpy()
+        anchor = np.where(act, tth, 0.0)                              # (B, 2)
+        f_pos = (ctx.future_pos - self._pelvis).detach().cpu().numpy()
+        f_val = ctx.future_valid.detach().cpu().numpy()
+        f_now = ctx.future_gap.detach().to("cpu", torch.float64).numpy() \
+            + anchor[:, :, None]                                      # (B, 2, F)
+        wcfg = waist_cfg if waist_cfg is not None else WaistAimConfig()
+        av = np.zeros(self.B)
+        for b in range(self.B):
+            targets = {
+                hand: p[b, hi] for hi, hand in enumerate(HANDS) if act[b, hi]
+            }
+            gtth = {
+                hand: float(tth[b, hi])
+                for hi, hand in enumerate(HANDS) if act[b, hi]
+            }
+            futs = {
+                hand: [
+                    (f_pos[b, hi, j], float(f_now[b, hi, j]))
+                    for j in range(f_val.shape[2])
+                    if f_val[b, hi, j]
+                ]
+                for hi, hand in enumerate(HANDS)
+            }
+            av[b] = aim_yaw(targets, cfg=wcfg, yaw_current=float(yn_h[b]),
+                            goal_tth=gtth, futures=futs)
+        ctx.yaw_now = yn.to(self.dtype)
+        ctx.aim_yaw = torch.as_tensor(av, device=self.device, dtype=self.dtype)
+        ctx.aim_valid = torch.ones(self.B, device=self.device, dtype=torch.bool)
 
     def _gather_shifted(self, k: int, shift: torch.Tensor):
         """``_gather(k - shift)`` -- the out-of-range goal reappears as future 0."""
@@ -414,6 +499,10 @@ class BatchedSchedule:
             start_shaft_allowed=start_shaft,
             elev_required=one("elev") * af,
             drum_head_centers=drum_heads_from_context(self.drum_pos),
+            # Radii travel with the centres: ``KitRandomization.per_drum_radius``
+            # resizes the collision cylinder, and this schedule already carries
+            # the per-env column the drum tokens are built from.
+            drum_radii=self.drum_radius,
         )
 
     # -------------------------------------------------------------- clock ---

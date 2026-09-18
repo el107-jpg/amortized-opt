@@ -15,8 +15,9 @@ import pytest
 import torch
 
 import amortized_opt as A
-from amortized_opt.constants import N_DOF
+from amortized_opt.constants import N_DOF, ready_joint_pos
 from amortized_opt.cost import CostConfig, FusedCost, StrikeContext
+from amortized_opt.fk import stick_axis_local
 
 _HERE = Path(__file__).resolve().parent
 FIXTURE = _HERE / "data" / "trajopt_hpipm_fixture.npz"
@@ -263,6 +264,36 @@ def test_gradients_are_finite_at_training_scale():
     assert float(wp.grad.abs().max()) > 0.0
 
 
+def test_elevation_near_pole_gradients_are_finite():
+    """Stick along the head normal used to NaN ``asin'(±1)`` in ``terminal_elev``."""
+    H, B = 8, 2
+    cost = FusedCost(CostConfig(), max_horizon=H, device="cpu", dtype=torch.float32)
+    q0 = torch.as_tensor(ready_joint_pos(), dtype=torch.float32).expand(B, -1).contiguous()
+    v0 = torch.zeros(B, N_DOF)
+    kl = torch.full((B,), H, dtype=torch.long)
+    kr = torch.full((B,), H, dtype=torch.long)
+    R, _ = cost.fk.frame(q0, "left_wrist")
+    u = (
+        R @ torch.as_tensor(stick_axis_local("left"), dtype=torch.float32).view(1, 3, 1)
+    ).squeeze(-1)
+    for tilt in (0.0, 1e-3):
+        wp = q0.unsqueeze(1).expand(B, H, N_DOF).contiguous().clone().requires_grad_(True)
+        n = -u + tilt * torch.tensor([1.0, 0.0, 0.0])
+        n = n / n.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        ctx = _synthetic_ctx(B, cost.n_drums, "cpu", torch.float32, kl=kl, kr=kr)
+        ctx.n_out[:, 0] = n
+        ctx.n_out[:, 1] = n
+        out = cost.forward(q0, wp, v0, ctx)
+        out.raw["terminal_elev"].sum().backward()
+        assert torch.isfinite(out.raw["terminal_elev"]).all(), tilt
+        assert torch.isfinite(wp.grad).all(), tilt
+        wp2 = q0.unsqueeze(1).expand(B, H, N_DOF).contiguous().clone().requires_grad_(True)
+        out2 = cost.forward(q0, wp2, v0, ctx)
+        out2.total.sum().backward()
+        assert torch.isfinite(out2.total).all(), tilt
+        assert torch.isfinite(wp2.grad).all(), tilt
+
+
 # ------------------------------------------------------------------ device --
 def test_no_device_host_sync(cuda_device):
     H, B = 50, 32
@@ -345,9 +376,18 @@ def test_lagrangian_weights_reach_the_cost():
     ctx = _synthetic_ctx(B, cost.n_drums, "cpu", torch.float64, kl=k, kr=k)
     base = cost.forward(q0, wp, v0, ctx)
     doubled = cost.forward(q0, wp, v0, ctx, weights={"torque": 2.0})
-    assert torch.allclose(
-        doubled.terms["torque"], 2.0 * base.terms["torque"], atol=1e-12
+    warning = cost.cfg.w_torque * base.raw["torque"]
+    # warning (cfg.w * softplus mean) is invariant to λ
+    assert torch.allclose(cost.cfg.w_torque * doubled.raw["torque"], warning, atol=1e-12)
+    # hard half (terms - warning) scales with λ: family key broadcasts onto
+    # every torque_* live residual.  Peak is off (w_torque_peak=0).
+    from amortized_opt.lagrangian import ACTUATOR_SEGMENT_NAMES, limit_group_name
+    hard = sum(
+        base.violations[limit_group_name("torque", s)]
+        for s in ACTUATOR_SEGMENT_NAMES
     )
+    assert torch.allclose(base.terms["torque"] - warning, hard, atol=1e-12)
+    assert torch.allclose(doubled.terms["torque"] - warning, 2.0 * hard, atol=1e-12)
     assert torch.allclose(doubled.terms["collision"], base.terms["collision"])
 
 
@@ -365,3 +405,26 @@ def test_violations_are_zero_when_feasible():
     for g in ("torque", "velocity", "joint_box"):
         assert float(out.violations[g].max()) == 0.0, g
         assert float(out.raw[g].min()) > 0.0, g  # softplus floor
+
+
+def test_terminal_aim_is_not_al_scaled():
+    """``lam_terminal`` must not multiply the in-plane aim pull."""
+    torch.manual_seed(5)
+    H, B = 8, 2
+    cfg = CostConfig(
+        w_terminal_aim=10.0, w_terminal_region=0.0,
+        w_terminal_velocity=0.0, w_terminal_elev=0.0,
+    )
+    cost = FusedCost(cfg, max_horizon=H, device="cpu", dtype=torch.float64)
+    q0 = torch.randn(B, N_DOF, dtype=torch.float64) * 0.2
+    wp = q0.unsqueeze(1) + torch.cumsum(
+        torch.randn(B, H, N_DOF, dtype=torch.float64) * 0.03, dim=1
+    )
+    v0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    k = torch.full((B,), H)
+    ctx = _synthetic_ctx(B, cost.n_drums, "cpu", torch.float64, kl=k, kr=k)
+    a = cost.forward(q0, wp, v0, ctx, weights={"terminal": 1.0})
+    b = cost.forward(q0, wp, v0, ctx, weights={"terminal": 4.0})
+    assert torch.allclose(a.terms["terminal_aim"], b.terms["terminal_aim"])
+    assert float(a.raw["terminal_aim"].mean()) >= 0.0
+    assert "terminal_aim" in a.terms

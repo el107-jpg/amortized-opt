@@ -151,17 +151,35 @@ halves disagree about the target is the failure mode §7c already paid for once
 
 ### DECISION 2 — context re-encoding every tick vs caching per hit segment
 
-The brief asks for *"context-encoder caching per hit segment"*. That is not
-free here: `goal_tth` and `future_tth` are **inputs to the encoder** and they
-tick down every 20 ms, so caching feeds the decoder a stale time-to-hit. This is
+The brief asks for *"context-encoder caching per hit segment"*. That was not
+free here: `goal_tth` and `future_tth` were **inputs to the encoder** and both
+ticked down every 20 ms, so caching fed the decoder a stale time-to-hit. This is
 precisely the bug `MPCRoller._tick_tth` exists to prevent
 (*"without this every harvested replay row tells the model a stale time-to-hit
 while the mask says something else — a silent distribution bug"*). I defaulted
 to `encode_every_tick=True` (correct) and left the cache as a flag. The encoder
 is 2 layers at d=256 over ~16 tokens against a 6-layer d=384 decoder over 51
 tokens, so the saving is small; the measured share is in the report.
-**Needs a decision:** accept the correctness default, or accept staleness for
-the throughput.
+
+**Resolved by making the encoder's inputs segment-constant instead.** The
+per-tick re-encode was not merely a cost: it is what let the robot's own state
+echo back into the encoder every tick and run the waist away in closed loop.
+`future_tth` is now `future_gap` — the gap from the CURRENT goal's strike to
+each future hit, which does not move inside a goal segment (and is the
+musically meaningful quantity: how long the hand has to relocate after this
+hit). `goal_tth` was the remaining from-now input and has now moved to the
+DECODER: it rides `WaypointMasks.hit_tth` into the state token
+(`ModelConfig.dec_tth_feats`) and the goal token stops embedding it
+(`enc_goal_tth=False`). Old checkpoints and pools are incompatible by design;
+the pool cache's `CONTEXT_FIELDS` schema marker refuses them loudly.
+
+With that, every encoder input is constant inside a goal segment by
+construction, so `MPCConfig.encode_every_tick` now defaults to **False** and
+`IsaacMPC._encode_key` rebuilds the encoding on a segment boundary (per-hand
+cursor + goal activity, so a re-goal and a horizon-cap promotion both count), on
+a reset, or when the `yaw_cond` conditioning yaw has moved past `enc_yaw_tol`
+(0.05 rad) — the one remaining slowly-varying input. `True` stays as the A/B
+escape hatch.
 
 ### DECISION 3 — the inertial feedforward term
 

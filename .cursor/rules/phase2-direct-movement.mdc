@@ -1,0 +1,25 @@
+---
+description: Phase-2 training recipe — direct decoder torso, no cost curriculum
+alwaysApply: true
+---
+
+# Phase-2 default recipe (rhythm Bellman)
+
+**Torso:** decoder-owned direct movements — no encoder yaw/P/R set-point heads.
+
+- **On:** `w_waist_upright`, `w_waist_yaw_vel`, `w_waist_pr_vel`, `w_waist_pr_terminal`, `waist_pr_box` (±0.2 rad P/R + ±80° yaw), AL limits (torque / joint_box / peaks).
+- **Off:** joint **velocity** limits (`W_VELOCITY=0`, `W_VELOCITY_PEAK=0`), `--waist-sp-head`, `--w-waist-aim`, `w_waist_pr_band`, tether/smooth/hold-band/distill, `WAIST_PR_SP`, `WAIST_PR_EMA`.
+
+**Cost weights:** full from step 0 (`WeightSchedule` default = `snap_full()`). Let AL λ adjust; do not reintroduce limit/strike/waist/peak ramps unless A/Bing.
+
+**Temporal consistency:** replay init tie on every sampled MPC row
+(`w_mpc_init_tie=50`); retain online differentiable TC on 5% of the batch
+(`tc_frac=0.05`).
+
+**Still phased in (aux, not cost curriculum):** suffix Bellman (`suffix_warmup`).
+BPTT is **off** under the default LS fork (`BPTT_START_FRAC=2`); restore with
+`LINE_SEARCH=0` (onset ~0.67).
+
+**Launch:** `scripts/_run_rhythm_bellman.sh` is the source of truth for flags and pool cache key.
+Default: `LINE_SEARCH=1`, `grad_balance=""`, tag `rhythm_bellman_nf1_ls`.
+Prior PCGrad+BPTT arm: `LINE_SEARCH=0 TAG=rhythm_bellman_nf1_direct`.

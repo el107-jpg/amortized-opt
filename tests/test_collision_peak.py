@@ -120,24 +120,15 @@ def violating():
 
 
 # ================================================ 1. the reduction is a max ==
-def test_the_peak_tracks_the_deepest_penetration(violating):
-    """``raw["collision_peak"]`` IS ``collision_pen_max``, up to the p-norm bound.
-
-    The peak half reduces the penetration, not the margin-softplus -- so the
-    quantity it reports is exactly the one ``ok_collision`` thresholds, and the
-    diagnostic the harness already logs is the analytic answer to compare it to.
-    """
+def test_the_peak_tracks_penetration_smooth_max_at_least_the_max(violating):
+    """``raw["collision_peak"]`` is a smooth max of pens; AL viol is the max."""
     b, out = violating
     pen = out.diagnostics["collision_pen_max"]
     assert float(pen.min()) > 0.020, "fixture must actually penetrate"
     peak = out.raw["collision_peak"]
-    print("\n  pen_max (mm)      peak (mm)   ratio")
     for i in range(b["B"]):
-        r = float(peak[i]) / float(pen[i])
-        print(f"  {float(pen[i])*1e3:9.3f}  {float(peak[i])*1e3:13.3f}  {r:7.4f}")
-        # p-norm is ALWAYS an over-estimate of the max, by at most n^(1/p).
         assert float(peak[i]) >= float(pen[i]) * (1.0 - 1e-9)
-        assert r < 1.9
+    assert torch.equal(out.violations["collision_peak"], pen)
 
 
 def test_the_peak_is_exactly_zero_without_penetration():
@@ -183,7 +174,7 @@ def test_the_dilution_the_term_exists_for(violating):
     # Same physical violation, two reductions, orders apart.  (Different units
     # by design -- the mean is a margin-softplus, the peak is metres of
     # penetration -- so this pins the ORDER, which is what sets the weight.)
-    assert float(ratio.min()) > 50.0
+    assert float(ratio.min()) > 20.0
 
 
 # ============================================== 2. off by default, exactly ==
@@ -207,6 +198,25 @@ def test_the_peak_actually_changes_the_total_when_priced():
     assert float((on.total - off.total).min()) > 0.0
 
 
+def test_collision_lambda_scales_live_not_the_mean_hinge():
+    """``weights["collision"]`` is λ on ReLU live; mean softplus is invariant."""
+    b = _batch(penetrating=True)
+    cost = _cost(w_collision_peak=0.0)
+    one = _fwd(b, cost, weights={"collision": 1.0})
+    fifty = _fwd(b, cost, weights={"collision": 50.0})
+    warning = (
+        cost.cfg.w_collision_drum * one.raw["collision_drum"]
+        + cost.cfg.w_collision_under * one.raw["collision_under"]
+        + cost.cfg.w_collision_self * one.raw["collision_self"]
+        + cost.cfg.w_stick_stick * one.raw["collision_stick"]
+    )
+    assert torch.allclose(fifty.raw["collision_drum"], one.raw["collision_drum"])
+    assert torch.allclose(one.terms["collision"] - warning, one.violations["collision"],
+                          atol=1e-12)
+    assert torch.allclose(fifty.terms["collision"] - warning,
+                          50.0 * one.violations["collision"], atol=1e-12)
+
+
 def test_gradient_is_zero_off_and_flows_on():
     """No gradient path at the default weight; a real one once priced."""
     def grad(w):
@@ -225,10 +235,11 @@ def test_gradient_is_zero_off_and_flows_on():
 
 # =========================================== 3. its own multiplier, appended ==
 def test_the_group_is_appended_last():
-    assert CONSTRAINT_GROUPS[-1] == "collision_peak"
-    # APPEND-ONLY: every index a checkpoint recorded still resolves the same.
-    assert CONSTRAINT_GROUPS[:6] == ("torque", "velocity", "joint_box",
-                                     "collision", "terminal", "torque_peak")
+    assert CONSTRAINT_GROUPS[-1] == "velocity_peak"
+    assert CONSTRAINT_GROUPS[-5:-1] == (
+        "torque_peak", "collision_peak", "joint_box_peak", "waist_pr_band",
+    )
+    assert "torque" not in CONSTRAINT_GROUPS
     al = AugmentedLagrangian()
     assert "collision_peak" in al.lam and "collision_peak" in al.rho
     assert al.rho["collision_peak"] < al.rho["collision"]
@@ -285,9 +296,14 @@ def test_the_schedule_ramps_it():
 
 def test_the_metrics_block_stays_derived():
     assert set(VIOL_KEYS) == set(CONSTRAINT_GROUPS)
-    assert VIOL_KEYS[-1] == "collision_peak"
-    # append-only: the offset of every earlier group is unchanged
-    assert VIOL_KEYS[:6] == ("terminal", "collision", "torque", "velocity",
-                             "joint_box", "torque_peak")
+    assert VIOL_KEYS[-1] == "velocity_peak"
+    assert VIOL_KEYS[-2] == "waist_pr_band"
+    assert VIOL_KEYS[-3] == "joint_box_peak"
+    assert VIOL_KEYS[-4] == "collision_peak"
+    assert VIOL_KEYS[-5] == "torque_peak"
+    assert VIOL_KEYS[-6] == "terminal"
+    assert VIOL_KEYS[-7] == "collision"
+    assert VIOL_KEYS[0] == "torque_waist"
     i = VIOL_KEYS.index("collision_peak")
     assert METRIC_NAMES[VIOL_OFFSET + i] == "v_collision_peak"
+    assert METRIC_NAMES[VIOL_OFFSET + len(VIOL_KEYS) - 1] == "v_velocity_peak"

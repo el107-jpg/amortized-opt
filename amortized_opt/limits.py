@@ -22,14 +22,16 @@ Provenance, per symbol:
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from .constants import G1_DRUM_POSTURE_LIMITS_RAD, G1_UPPER_BODY_JOINTS, default_urdf_path
 
 # ------------------------------------------------------------------ effort --
 ISAAC_G1_EFFORT_LIMITS_NM: dict[str, float] = {
     "waist_yaw_joint": 88.0,
-    "waist_pitch_joint": 25.0,
-    "waist_roll_joint": 25.0,
+    # Dual 5020 parallel linkage (``unitree_rl_lab`` ``effort_limit_sim=50``).
+    "waist_pitch_joint": 50.0,
+    "waist_roll_joint": 50.0,
     "left_shoulder_pitch_joint": 25.0,
     "left_shoulder_roll_joint": 25.0,
     "left_shoulder_yaw_joint": 25.0,
@@ -149,6 +151,44 @@ def isaac_effort_limits(joint_names=G1_UPPER_BODY_JOINTS) -> np.ndarray:
     return _lookup(ISAAC_G1_EFFORT_LIMITS_NM, joint_names)
 
 
+#: Soft distal wrists (Isaac rating 5 N*m).  Brief unsaturated PD demand spikes
+#: here are mostly reflected Kd·q̈ at the first substep of a tick; IdealPD
+#: clamps to the real rating and tip tracking barely moves.  The cost hinge /
+#: ``ok_torque`` gate may scale these joints' *scoring* limits via
+#: :func:`scale_soft_wrist_effort` without changing the plant clamp.
+SOFT_WRIST_EFFORT_JOINTS: tuple[str, ...] = (
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+
+
+def scale_soft_wrist_effort(
+    effort_limits: np.ndarray,
+    joint_names=G1_UPPER_BODY_JOINTS,
+    *,
+    scale: float = 1.0,
+) -> np.ndarray:
+    """Copy of ``effort_limits`` with soft-wrist ratings multiplied by ``scale``.
+
+    ``scale=1`` is a no-op (same array values).  Plant / IdealPD clamps must
+    keep calling :func:`isaac_effort_limits` unscaled -- this helper is only
+    for the cost hinge and the eval torque gate.
+    """
+    out = np.asarray(effort_limits, dtype=float).copy()
+    s = float(scale)
+    if s == 1.0:
+        return out
+    if not np.isfinite(s) or s <= 0.0:
+        raise ValueError(f"soft-wrist effort scale must be > 0, got {scale!r}")
+    names = tuple(joint_names)
+    for i, n in enumerate(names):
+        if n in SOFT_WRIST_EFFORT_JOINTS:
+            out[i] *= s
+    return out
+
+
 def isaac_velocity_limits(joint_names=G1_UPPER_BODY_JOINTS) -> np.ndarray:
     """Per-joint speed ratings (rad/s) in ``joint_names`` order."""
     return _lookup(ISAAC_G1_VELOCITY_LIMITS_RADS, joint_names)
@@ -170,13 +210,113 @@ def isaac_runtime_stiffness(joint_names=G1_UPPER_BODY_JOINTS) -> np.ndarray:
 
 
 def isaac_runtime_damping(joint_names=G1_UPPER_BODY_JOINTS) -> np.ndarray:
-    """Damping the plant actually runs (base x scale) -- 2x the CLAUDE.md table."""
+    """Damping the plant actually runs (base x scale) -- 4x the CLAUDE.md table."""
     return isaac_damping(joint_names) * G1_PD_DAMPING_SCALE
 
 
 def isaac_armature(joint_names=G1_UPPER_BODY_JOINTS) -> np.ndarray:
     """Reflected rotor inertia (kg*m^2), flat 0.01 across every group."""
     return np.full(len(joint_names), ISAAC_G1_ARMATURE_DEFAULT, dtype=float)
+
+
+# ------------------------------------------------------- available torque ----
+#: The ONE definition of "how much torque this joint has at this speed".
+#:
+#: Every consumer -- the cost's RNEA hinge, the tracking-torque hinge, the
+#: plant's optional effort clamp and the eval harness's ``ok_torque`` gate --
+#: calls the two functions below rather than re-deriving the formula, so a
+#: change of derate law cannot land in one of them and not the others.
+#:
+#:     available(qd) = eta * min( tau_rating,
+#:                                sat_scale * tau_rating
+#:                                            * clamp(1 - |qd| / v_rating, 0, 1) )
+#:
+#: with the ``min`` dropped entirely when ``derate == "none"`` (then the answer
+#: is just ``eta * tau_rating`` and ``qd`` is ignored).  The ``min`` against the
+#: undereated rating is what :meth:`FusedCost._torque` has always computed; it
+#: binds only when ``sat_scale > 1``, i.e. when the caller claims the actuator
+#: can transiently exceed its own rating at zero speed.  Writing it out rather
+#: than assuming ``sat_scale <= 1`` is what keeps this hoist bit-for-bit.
+#:
+#: ``eta`` is the CONSERVATISM MARGIN, not physics: the cost hinges at
+#: ``eta = ETA_TORQUE`` (0.80) so training has headroom, while a pass/fail gate
+#: or a plant clamp that is meant to model the hardware passes ``eta = 1.0``.
+_DERATE_MODES: tuple[str, ...] = ("none", "linear")
+
+
+def _check_derate(derate: str) -> str:
+    if derate not in _DERATE_MODES:
+        raise ValueError(f"derate must be one of {_DERATE_MODES}, got {derate!r}")
+    return derate
+
+
+def available_torque_np(
+    qd: np.ndarray,
+    *,
+    effort_limit: np.ndarray | None = None,
+    velocity_limit: np.ndarray | None = None,
+    eta: float = ETA_TORQUE,
+    saturation_scale: float = 1.0,
+    derate: str = "linear",
+    joint_names=G1_UPPER_BODY_JOINTS,
+) -> np.ndarray:
+    """Per-joint usable torque (N*m) at speed ``qd`` -- numpy.
+
+    ``qd`` broadcasts against ``effort_limit`` / ``velocity_limit``, which
+    default to the Isaac ratings in ``joint_names`` order, so the usual call is
+    ``available_torque_np(qd)`` with ``qd`` of shape ``(..., n)``.
+    """
+    _check_derate(derate)
+    tau = (
+        isaac_effort_limits(joint_names) if effort_limit is None
+        else np.asarray(effort_limit, dtype=float)
+    )
+    if derate == "none":
+        return float(eta) * tau
+    vel = (
+        isaac_velocity_limits(joint_names) if velocity_limit is None
+        else np.asarray(velocity_limit, dtype=float)
+    )
+    sat = float(saturation_scale) * tau
+    d = sat * np.clip(1.0 - np.abs(np.asarray(qd, dtype=float)) / vel, 0.0, 1.0)
+    return float(eta) * np.minimum(np.broadcast_to(tau, d.shape), d)
+
+
+def available_torque_torch(
+    qd: torch.Tensor,
+    effort_limit: torch.Tensor,
+    velocity_limit: torch.Tensor,
+    *,
+    eta: float = ETA_TORQUE,
+    saturation_scale: float = 1.0,
+    derate: str = "linear",
+) -> torch.Tensor:
+    """Per-joint usable torque (N*m) at speed ``qd`` -- torch, differentiable.
+
+    ``effort_limit`` / ``velocity_limit`` are tensors already shaped to
+    broadcast against ``qd`` (e.g. ``(1, 1, n)`` against a ``(B, K, n)`` rate
+    array).  The arithmetic is written in the exact order the cost's torque
+    block used before this was hoisted, so the hoist is bit-for-bit.
+    """
+    _check_derate(derate)
+    if derate == "none":
+        return float(eta) * effort_limit
+    sat = float(saturation_scale) * effort_limit
+    d = sat * (1.0 - qd.abs() / velocity_limit).clamp(0.0, 1.0)
+    return float(eta) * torch.minimum(effort_limit.expand_as(d), d)
+
+
+def available_torque(qd, **kw):
+    """Dispatching front end: torch in -> torch out, anything else -> numpy.
+
+    The torch form needs its limit tensors explicitly (there is no device or
+    dtype to guess); the numpy form defaults them to the Isaac ratings.
+    """
+    if isinstance(qd, torch.Tensor):
+        eff = kw.pop("effort_limit")
+        vel = kw.pop("velocity_limit", None)
+        return available_torque_torch(qd, eff, vel, **kw)
+    return available_torque_np(qd, **kw)
 
 
 # ------------------------------------------------------------ position box --

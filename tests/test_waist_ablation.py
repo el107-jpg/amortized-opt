@@ -306,3 +306,88 @@ def test_the_replay_pool_never_derives_the_reference_from_its_own_init():
     from amortized_opt.train_cost import ReplayPool
 
     assert ReplayPool.waist_ref_from_seed is False
+
+
+def test_an_unharvested_replay_pool_returns_no_reference(small_pool):
+    """``waist_ref_from_seed=False`` + no harvest must mean NO anchor at all.
+
+    Before 2026-08-13 the replay pool always allocated a ``waist_ref`` column
+    of zeros and the read path checked ``"waist_ref" in d`` before the class
+    attribute -- so with harvesting off, every replay row would have been
+    priced toward yaw = 0 the moment anything stopped masking the term.
+    """
+    from amortized_opt.train_cost import ReplayPool
+
+    replay = ReplayPool(small_pool, 64, buckets=[POOL_H])   # waist_ref=False
+    assert "waist_ref" not in replay.data[POOL_H]
+    assert replay.waist_ref(POOL_H) is None
+    # ...and the harvesting configuration does carry (and require) the column
+    harvesting = ReplayPool(small_pool, 64, buckets=[POOL_H], waist_ref=True)
+    assert "waist_ref" in harvesting.data[POOL_H]
+    row = {k: v[:2] for k, v in small_pool.data[POOL_H].items()}
+    with pytest.raises(ValueError, match="waist_ref"):
+        harvesting.add(POOL_H, row)   # a wave WITHOUT the reference is a bug
+
+
+def test_the_seed_itself_pays_zero_waist_aim(small_pool):
+    """Producer/consumer knot alignment (the off-by-one regression).
+
+    The reference rows are knots 1..H (``StrikeContext.waist_yaw_ref``), and so
+    are the trajectory's waypoint rows -- so a trajectory EXACTLY equal to the
+    seed must read ``raw["waist_aim"] == 0``.  Before 2026-08-13 the cost
+    indexed the reference as knots 0..H-1, reading the fresh pool's ramp one
+    knot ahead of where the seed actually is.
+    """
+    batch = small_pool.batch(POOL_H, torch.arange(8), noise=False)
+    cost = FusedCost(
+        phase2_cost_config(w_waist_aim=500.0, waist_aim_yaw_only=True),
+        max_horizon=POOL_H, device="cpu",
+    )
+    ct = cost.forward(batch["q0"], batch["seed"], batch["v0"], batch["strike"],
+                      lengths=None, weights=None)
+    assert float(ct.raw["waist_aim"].abs().max()) < 1e-9
+
+    # sensitivity: the OLD convention (rows = knots 0..H-1, i.e. the same ramp
+    # shifted one knot late) must NOT read zero, or this test pins nothing
+    from dataclasses import replace as dc_replace
+
+    ref = batch["strike"].waist_yaw_ref
+    q0_yaw = batch["q0"][:, I_YAW].unsqueeze(1)
+    shifted = dc_replace(batch["strike"],
+                         waist_yaw_ref=torch.cat([q0_yaw, ref[:, :-1]], dim=1))
+    ct2 = cost.forward(batch["q0"], batch["seed"], batch["v0"], shifted,
+                       lengths=None, weights=None)
+    assert float(ct2.raw["waist_aim"].abs().max()) > 1e-7
+
+
+def test_bptt_second_solve_keeps_waist_yaw_ref_none(small_pool):
+    """``Phase2Config.waist_sp_from_head``'s docstring says BPTT keeps
+    ``waist_yaw_ref=None``; before 2026-08-13 the fresh ``pool.batch`` strike
+    carried the seed's analytic ramp into the chain and fought the learned
+    anchor with ``w_bptt * w_waist_aim`` of gradient."""
+    from types import SimpleNamespace
+
+    from amortized_opt.train_cost import Phase2Config, _bptt_term
+
+    model = build_model(_model_cfg_for(small_pool), "cpu")
+    cfg = Phase2Config(compile_mode=None, device="cpu", bptt_batch=4)
+    captured = {}
+
+    def bptt_fn(init, state, q0, v0, enc1, masks1, s1, gl1, k_first,
+                term2, enc2, masks2, s2, gl2, elen2, w, kp, kd,
+                hand, normal, e_rest, qn, qdn, tvn):
+        captured["s1"], captured["s2"] = s1, s2
+        z = torch.zeros(())
+        return z, z
+
+    n_arm = small_pool.data[POOL_H]["q0"].shape[-1]
+    sim = SimpleNamespace(sample_gains=lambda n, generator=None: (
+        torch.ones(n, n_arm), torch.ones(n, n_arm), None))
+    gen = torch.Generator()
+    _bptt_term(small_pool, SimpleNamespace(), bptt_fn, sim, cfg, POOL_H,
+               torch.device("cpu"), torch.float32, gen, None, {}, model=model)
+    assert captured["s1"].waist_yaw_ref is None
+    assert captured["s2"].waist_yaw_ref is None
+    # ...deliberately: the pool batch it was built from DOES carry a reference
+    b = small_pool.batch(POOL_H, torch.arange(2), noise=False)
+    assert b["strike"].waist_yaw_ref is not None

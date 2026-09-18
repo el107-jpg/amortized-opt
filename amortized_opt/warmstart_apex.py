@@ -90,12 +90,13 @@ import torch
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, ready_joint_pos
 from .fk import ChainFK
 from .idle_home import resolve_idle_home
-from .ik import tip_jacobian, tip_position
+from .ik import adjust_arm_terminal, tip_jacobian, tip_position
 from .limits import isaac_velocity_limits, urdf_position_limits
 from .rhythm import (
     HANDS,
     DrumKit,
     RhythmClip,
+    aim_inputs_from_snapshot,
     build_context_inputs,
     default_rcc_dir,
     goal_snapshot,
@@ -174,6 +175,26 @@ class ApexConfig:
     #: this (m).  ``None`` keeps every apex, however poor.
     max_outside: float | None = 0.25
 
+    # ---- re-aiming the library terminal (2026-08-13) ----------------------
+    #: Damped-least-squares steps that move the chosen terminal's ARM joints so
+    #: its stick tip lands on the aim point that is ACTUALLY there.
+    #:
+    #: ``GoalPoseLibrary`` is keyed on ``(hand, drum, waist_yaw)`` and stores a
+    #: joint pose, so it is blind to both ``KitRandomization`` and the fitted
+    #: stick.  Measured over 60 randomized kits at the shipped jitter, the
+    #: library terminal misses the head centre by a median 12.9 cm; 3 steps
+    #: bring that to 0.06 cm, and 10 cm of per-drum jitter then costs almost
+    #: nothing over 4 cm (0.11 vs 0.06 cm).  Without it the jitter is
+    #: UNLEARNABLE in phase 1 -- the context carries the randomized geometry
+    #: while the target ignores it.
+    #:
+    #: 0 disables, reproducing the pre-2026-08-13 target exactly.
+    correct_terminal_steps: int = 3
+    #: DLS damping, metres of tip error per radian.  0.05 converges in 3 steps
+    #: without overshooting the two cross-body reaches, whose targets are
+    #: genuinely outside the workspace at some jitters.
+    correct_terminal_damping: float = 0.05
+
     def __post_init__(self) -> None:
         if self.terminal_mode not in ("nearest_apex", "nearest_yaw"):
             raise ValueError(f"terminal_mode must be nearest_apex|nearest_yaw, "
@@ -242,6 +263,7 @@ class ApexSolver:
         center_env: torch.Tensor,     # (B, 3) cylinder centre, ENV frame
         *,
         head_centers: torch.Tensor | None = None,  # (B, D, 3) env, randomized kit
+        head_radii: torch.Tensor | None = None,    # (B, D) radii of the same kit
         rng: np.random.Generator | None = None,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
@@ -332,8 +354,17 @@ class ApexSolver:
             if head_centers is not None:
                 hc = head_centers.detach().to(self.dtype).unsqueeze(0)
                 hc = hc.repeat(S, 1, 1, 1).reshape(S * B, *hc.shape[2:])
+            # Radii follow the centres seed-for-seed: a screen that knows where
+            # the drums moved but not how big they are is still the fix-B
+            # disagreement.
+            hr = None
+            if head_radii is not None:
+                hr = head_radii.detach().to(self.dtype).unsqueeze(0)
+                hr = hr.repeat(S, 1, 1).reshape(S * B, *hr.shape[2:])
             with torch.no_grad():
-                _pen, det = self.sdf.forward(q, drum_head_centers=hc, return_details=True)
+                _pen, det = self.sdf.forward(
+                    q, drum_head_centers=hc, drum_radii=hr, return_details=True
+                )
             min_sdf = det.min_sdf.detach()
         else:
             min_sdf = torch.zeros(S * B, device=self.device, dtype=self.dtype)
@@ -637,7 +668,7 @@ def generate_apex_scenarios(
     stats: dict = {
         "requested": int(n), "accepted": 0, "reject_idle": 0, "reject_velocity": 0,
         "reject_library": 0, "dual_active": 0, "asymmetric": 0, "short_horizon": 0,
-        "single_idle": 0, "rest": 0,
+        "single_idle": 0, "rest": 0, "terminal_corrected": 0,
         "peak_rate_ratio": [], "peak_rate_ratio_init": [],
         "apex_solved": 0, "apex_inside": 0, "apex_collision_free": 0,
         "apex_no_room": 0, "apex_rejected_outside": 0,
@@ -676,11 +707,14 @@ def generate_apex_scenarios(
             hit: dict[str, int] = {}
             goals: dict[str, tuple[str, float] | None] = {}
             aim: dict[str, np.ndarray] = {}
+            # Future-aware aim inputs (one helper, same as the context token's).
+            _t, aim_tth, aim_futures = aim_inputs_from_snapshot(snap, frame="env")
             for hand in HANDS:
                 g = snap.goal[hand]
                 if not g.active:
                     hit[hand] = -1
                     goals[hand] = None
+                    aim_tth.pop(hand, None)
                     continue
                 k = int(np.clip(round(g.time_to_hit / cfg.dt), 1, H))
                 hit[hand] = k
@@ -714,11 +748,19 @@ def generate_apex_scenarios(
             # the torso holds mid-reach, which is where the apex is solved.
             base = warmstart_trajectory(
                 q0, qd0, horizon=Hb, goals={h: None for h in HANDS}, library=library,
-                aim_targets=aim or None, dt=cfg.dt, joint_names=names,
+                aim_targets=aim or None, aim_tth=aim_tth, aim_futures=aim_futures,
+                dt=cfg.dt, joint_names=names,
                 waist_cfg=cfg.waist_cfg, q_bounds=q_bounds,
+                waist_upright_ease_wp=cfg.waist_upright_ease_wp,
             )
+            sticks = None
+            if cfg.stick_rand is not None:
+                sticks = (cfg.stick_rand.sample(rng, "left"),
+                          cfg.stick_rand.sample(rng, "right"))
             recs.append({
+                "sticks": sticks,
                 "q0": q0, "qd0": qd0, "hit": hit, "goals": goals, "aim": aim,
+                "aim_tth": aim_tth, "aim_futures": aim_futures,
                 "active": active, "Hb": Hb, "k_max": k_max, "snap": snap,
                 "kit": kit_s, "waist": np.asarray(base.q, float),
                 "yaw_target": float(base.yaw_target),
@@ -749,10 +791,12 @@ def generate_apex_scenarios(
                 for i in rows
             ])
             heads = np.stack([recs[i]["kit"].positions_in("env") for i in rows])
+            radii = np.stack([recs[i]["kit"].radii for i in rows])
             t = lambda a: torch.as_tensor(  # noqa: E731
                 np.asarray(a, float), device=solver.device, dtype=solver.dtype
             )
-            res = solver.solve(hand, t(q_ref), t(centers), head_centers=t(heads), rng=rng)
+            res = solver.solve(hand, t(q_ref), t(centers), head_centers=t(heads),
+                               head_radii=t(radii), rng=rng)
             q_apex = res["q"].detach().cpu().numpy()
             outside = res["outside"].detach().cpu().numpy()
             min_sdf = res["min_sdf"].detach().cpu().numpy()
@@ -764,14 +808,17 @@ def generate_apex_scenarios(
                     "dz": float(tips[j][2] - recs[i]["aim"][hand][2]),
                 }
 
-        # ---------------- pass 3: targets + filter ----------------------------
-        for i, r in enumerate(recs):
-            Hb, hit, goals = r["Hb"], r["hit"], r["goals"]
-            apex_arm: dict[str, np.ndarray | None] = {}
+        # ---- pass 2.5: apex_arm per rec, then RE-AIM the library terminal ---
+        # ``apex_arm`` is hoisted out of pass 3 so the terminal correction can
+        # use the SAME branch choice pass 3 does (``select_terminal`` keys on
+        # the apex) instead of duplicating the rejection logic.
+        apex_arm_of: list[dict[str, np.ndarray | None]] = []
+        for i, _r in enumerate(recs):
+            per: dict[str, np.ndarray | None] = {}
             for hand in HANDS:
                 a = apex[hand].get(i)
                 if a is None:
-                    apex_arm[hand] = None
+                    per[hand] = None
                     continue
                 stats["apex_solved"] += 1
                 stats["apex_outside_m"].append(a["outside"])
@@ -782,9 +829,74 @@ def generate_apex_scenarios(
                     stats["apex_collision_free"] += 1
                 if acfg.max_outside is not None and a["outside"] > acfg.max_outside:
                     stats["apex_rejected_outside"] += 1
-                    apex_arm[hand] = None
+                    per[hand] = None
                     continue
-                apex_arm[hand] = a["q"][arm_slice(hand, names)]
+                per[hand] = a["q"][arm_slice(hand, names)]
+            apex_arm_of.append(per)
+
+        # The library is keyed on (hand, drum, waist_yaw) and stores a JOINT
+        # pose, so it cannot know where KitRandomization put the head or what
+        # stick is fitted.  Correct it toward the aim point that is actually
+        # there -- batched, because that is 200x cheaper than per scenario.
+        term_fix: dict[str, dict[int, np.ndarray]] = {h: {} for h in HANDS}
+        #: the PRE-correction ``select_terminal`` pick, kept so the
+        #: terminal_moved stat can compare apex pick vs yaw pick (the corrected
+        #: pose always differs from every library entry, which measures nothing)
+        term_pick: dict[str, dict[int, np.ndarray]] = {h: {} for h in HANDS}
+        if acfg.correct_terminal_steps > 0:
+            for hand in HANDS:
+                acols = arm_slice(hand, names)
+                rows = [i for i, r in enumerate(recs) if r["goals"][hand] is not None]
+                if not rows:
+                    continue
+                qs, aims = [], []
+                for i in rows:
+                    r = recs[i]
+                    e = select_terminal(library, hand, r["goals"][hand][0],
+                                        yaw_target=r["yaw_target"],
+                                        apex_arm=apex_arm_of[i][hand], cfg=acfg)
+                    term_pick[hand][i] = np.asarray(e.arm_q, float)
+                    # The WAIST the correction solves against must be the
+                    # waist the trajectory will actually be at when it strikes:
+                    # the yaw ramp does not necessarily arrive at
+                    # ``yaw_target`` by ``k_hit``, and correcting against the
+                    # target yaw instead of the reached one leaves a residual
+                    # that scales with whatever the ramp still had to travel.
+                    k_hit = int(np.clip(r["hit"][hand], 1, r["waist"].shape[0] - 1))
+                    q = np.zeros(len(names))
+                    q[:3] = r["waist"][k_hit, :3]
+                    q[acols] = e.arm_q
+                    qs.append(q)
+                    aims.append(np.asarray(r["aim"][hand], float))
+                tt = lambda a: torch.as_tensor(  # noqa: E731
+                    np.asarray(a), device=solver.device, dtype=solver.dtype)
+                # A randomized stick moves the tip, so the correction has to
+                # aim the stick this scenario actually carries.  ``correct_tip``
+                # takes PER-ROW sticks (the stick is just a per-row constant
+                # local offset), so this stays ONE batched call per hand even
+                # when every scenario drew its own stick -- grouping by spec
+                # would degenerate to batch-1 under continuous randomization.
+                hi_ = 0 if hand == "left" else 1
+                sticks_rows = [
+                    None if recs[i]["sticks"] is None else recs[i]["sticks"][hi_]
+                    for i in rows
+                ]
+                stick_arg = (None if all(sp is None for sp in sticks_rows)
+                             else sticks_rows)
+                qc = adjust_arm_terminal(
+                    solver.fk, tt(np.stack(qs)), tt(np.stack(aims)), hand,
+                    steps=int(acfg.correct_terminal_steps),
+                    damping=float(acfg.correct_terminal_damping),
+                    q_bounds=q_bounds, joint_names=names, stick=stick_arg,
+                ).detach().cpu().numpy()
+                for j, i in enumerate(rows):
+                    term_fix[hand][i] = qc[j, acols]
+                stats["terminal_corrected"] += len(rows)
+
+        # ---------------- pass 3: targets + filter ----------------------------
+        for i, r in enumerate(recs):
+            Hb, hit, goals = r["Hb"], r["hit"], r["goals"]
+            apex_arm = apex_arm_of[i]
 
             # ``idle_home`` reaches the base (both-hands-idle) call through
             # ``**warmstart_kwargs``, which parks BOTH arms; the apex spline then
@@ -792,18 +904,26 @@ def generate_apex_scenarios(
             # hand keeps the retraction and an active one keeps its apex.
             ws = apex_warmstart_trajectory(
                 r["q0"], r["qd0"], horizon=Hb, goals=goals, library=library,
-                apex_arm=apex_arm, aim_targets=r["aim"] or None, dt=cfg.dt,
+                apex_arm=apex_arm, aim_targets=r["aim"] or None,
+                aim_tth=r["aim_tth"], aim_futures=r["aim_futures"], dt=cfg.dt,
                 joint_names=names, cfg=acfg, q_bounds=q_bounds,
                 waist_cfg=cfg.waist_cfg,
+                waist_upright_ease_wp=cfg.waist_upright_ease_wp,
+                terminal_arm={h: term_fix[h].get(i) for h in HANDS},
                 idle_home=idle_home, idle_settle_wp=cfg.idle_settle_wp,
             )
-            # how often "nearest apex" moved the terminal off the yaw pick
+            # how often "nearest apex" moved the terminal off the yaw pick --
+            # compared on the PRE-correction pick: the DLS-corrected pose always
+            # differs from ``library.select`` and would pin the ratio at ~1.0
             for hand in HANDS:
                 if goals[hand] is None:
                     continue
                 stats["terminal_seen"] += 1
+                pick = term_pick[hand].get(i)
+                if pick is None:  # correction off: ws carries the raw pick
+                    pick = ws.terminal_arm[hand]
                 ref = library.select(hand, goals[hand][0], ws.yaw_target)
-                if float(np.linalg.norm(ref.arm_q - ws.terminal_arm[hand])) > 1e-9:
+                if float(np.linalg.norm(ref.arm_q - pick)) > 1e-9:
                     stats["terminal_moved"] += 1
 
             if debug_out is not None:
@@ -828,7 +948,9 @@ def generate_apex_scenarios(
             ctx = build_context_inputs(
                 r["kit"], r["snap"], num_drums=cfg.num_drums, num_future=cfg.num_future,
                 frame="env", device="cpu", dtype=torch.float64,
-                idle_home=idle_home,
+                idle_home=idle_home, sticks=r["sticks"],
+                yaw_now=r["q0"][names.index("waist_yaw_joint")],
+                waist_cfg=cfg.waist_cfg,
             )
             rec = out[Hb]
             rec["q0"].append(r["q0"].astype(np.float32))
@@ -1071,6 +1193,7 @@ def generate_apex_pool(
     init_mode: str = "mix",
     init_mix: float = 0.5,
     white_noise: bool = False,
+    aux_torque_tracking: bool = False,
 ) -> ApexWarmstartPool:
     cfg = cfg or ScenarioConfig()
     acfg = apex_cfg or ApexConfig()
@@ -1083,6 +1206,7 @@ def generate_apex_pool(
     pool = ApexWarmstartPool(
         raw["buckets"], cfg=cfg, noise=noise, device=device, dtype=dtype,
         fk=fk, rnea=rnea, stats=stats,
+        aux_torque_tracking=bool(aux_torque_tracking),
     )
     pool.default_init_mode = str(init_mode)
     pool.init_mix = float(init_mix)
@@ -1100,6 +1224,7 @@ def apex_plan_for_case(
     horizon: int,
     joint_names=G1_UPPER_BODY_JOINTS,
     waist_cfg=None,
+    waist_upright_ease_wp: int | None = None,
 ) -> ApexWarmStart:
     """The apex warm start for one :class:`~amortized_opt.eval_harness.EvalCase`.
 
@@ -1125,6 +1250,7 @@ def apex_plan_for_case(
             q0, v0, horizon=H, goals={h: None for h in HANDS}, library=library,
             aim_targets=aim, dt=float(case.dt), joint_names=names,
             waist_cfg=waist_cfg, q_bounds=q_bounds,
+            waist_upright_ease_wp=waist_upright_ease_wp,
         )
         k_ref = int(np.clip(round(0.5 * k_hit), 1, max(k_hit - 1, 1)))
         q_ref = q0.copy()
@@ -1142,6 +1268,7 @@ def apex_plan_for_case(
         q0, v0, horizon=H, goals=goals, library=library, apex_arm=apex_arm,
         aim_targets=aim, dt=float(case.dt), joint_names=names, cfg=cfg,
         q_bounds=q_bounds, waist_cfg=waist_cfg,
+        waist_upright_ease_wp=waist_upright_ease_wp,
     )
 
 
@@ -1152,6 +1279,7 @@ def apex_case_planner(
     solver: ApexSolver | None = None,
     joint_names=G1_UPPER_BODY_JOINTS,
     waist_cfg=None,
+    waist_upright_ease_wp: int | None = None,
 ):
     """The apex teacher, as an eval-harness planner (``plan(case) -> PlanResult``)."""
     from .eval_harness import PlanResult
@@ -1164,6 +1292,7 @@ def apex_case_planner(
         ws = apex_plan_for_case(
             case, library=lib, solver=sol, cfg=cfg, horizon=int(case.N),
             joint_names=joint_names, waist_cfg=waist_cfg,
+            waist_upright_ease_wp=waist_upright_ease_wp,
         )
         return PlanResult(Q=np.asarray(ws.q, float), meta={"converged": True})
 
@@ -1194,6 +1323,9 @@ class ApexModelPlanner:
     joint_names: tuple[str, ...] = G1_UPPER_BODY_JOINTS
     amp_dtype: torch.dtype | None = None
     waist_cfg: object = None
+    #: Waist pitch/roll ease-to-upright window of the seed; must match the
+    #: checkpoint's ``ScenarioConfig.waist_upright_ease_wp``.  ``None`` = hold.
+    waist_upright_ease_wp: int | None = None
 
     def __post_init__(self) -> None:
         from .planner import ModelPlanner
@@ -1210,6 +1342,7 @@ class ApexModelPlanner:
             buckets=self.buckets, num_drums=self.num_drums, num_future=self.num_future,
             library=self.library, kit=self.kit, joint_names=self.joint_names,
             amp_dtype=self.amp_dtype, waist_cfg=self.waist_cfg,
+            waist_upright_ease_wp=self.waist_upright_ease_wp,
         )
         if self.init == "apex":
             inner = self._inner
@@ -1218,6 +1351,7 @@ class ApexModelPlanner:
                 ws = apex_plan_for_case(
                     case, library=self.library, solver=self.solver, cfg=self.apex_cfg,
                     horizon=int(H), joint_names=self.joint_names, waist_cfg=self.waist_cfg,
+                    waist_upright_ease_wp=self.waist_upright_ease_wp,
                 )
                 return np.asarray(ws.target, float)
 

@@ -19,11 +19,14 @@ import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from amortized_opt.limits import G1_PD_DAMPING_SCALE
+
 __all__ = [
     "ActorConfig",
     "AuxCostConfig",
     "CriticConfig",
     "EnvConfig",
+    "OrthGradConfig",
     "PpoConfig",
     "PpoRunConfig",
     "CheckpointChoice",
@@ -249,6 +252,13 @@ class ActorConfig:
     #: in this stack.  Recorded as a future knob in README.
     ar1_beat_schedule: bool = False
 
+    #: Stop refining the striking arm for this many waypoints before contact
+    #: (copy the previous plan through).  Default 0 (lead alone).  Must match
+    #: ``EnvConfig.freeze_wp`` so collection's IsaacMPC and the PPO replay
+    #: freeze the same ticks.
+    freeze_wp: int = 0
+    freeze_waist: bool = True
+
 
 @dataclass
 class CriticConfig:
@@ -310,6 +320,49 @@ class AuxCostConfig:
 
 
 @dataclass
+class OrthGradConfig:
+    """Always-project the PPO gradient onto the analytic cost's nullspace.
+
+    Option A: ``g = g_cost + orth(g_rl, g_cost)`` at the executed first
+    waypoint, with the tail of the plan receiving cost only.  Cost keeps
+    pricing torque / collision / box / smoothness on the knot that actually
+    runs; PPO may only slide in the first-order nullspace of that cost, which
+    is the small plant-mismatch residual (PD lag, lookahead, procrastination)
+    that FusedCost cannot see.
+
+    Projection is in **trajectory space** at waypoint 0, not in parameter
+    space: flattening ``H x 17`` would subtract a multiple of the tail cost
+    from the "RL" gradient and silently reweight the DAgger term.  The critic
+    and the Gaussian ``std`` never enter the combine -- they have no cost
+    gradient.
+    """
+
+    enabled: bool = True
+    #: Scale the FULL-horizon cost gradient so its per-sample Frobenius norm
+    #: equals this multiple of ``||g_rl0||``.  1.0 = equal magnitude, which is
+    #: what keeps PPO's 17-dim KL budget intact.  The first Isaac run used the
+    #: un-normalized ``g_cost`` (aux ~4000 vs surrogate ~0.08) and railed KL
+    #: at 0.07 before NaNing the plan on iter 5.
+    cost_to_rl_norm: float = 1.0
+    #: Mix on the projected PPO leftover at waypoint 0, at PPO's native scale
+    #: (not inflated to ``||g_cost0||``).
+    rl_to_cost_norm: float = 1.0
+    #: Multiply the combined traj-grad after the match.  0.2 is the step that
+    #: keeps a 17-dim Gaussian at σ=0.45 inside ``desired_kl=0.015``: the Isaac
+    #: orth runs at 1.0 spent ~0.07 nats on the *first* Adam step (target 0.015)
+    #: and railed the LR floor.  The adaptive controller can raise LR if this
+    #: undershoots.  Relative cost/RL mix is unchanged.
+    traj_grad_scale: float = 0.2
+    #: Fraction of the *parallel* PPO component at waypoint 0 that is allowed
+    #: back in.  0 = hard nullspace (default).  1 = full PPO leftover at the
+    #: executed knot on top of scaled cost.  The tail stays cost-only either
+    #: way.  0.1 is a small leak so PPO can slightly fight FusedCost on the
+    #: knot that actually runs.
+    wp0_leak: float = 0.0
+    eps: float = 1e-8
+
+
+@dataclass
 class PpoConfig:
     """Executed-prefix PPO.  17-dim action, so the MLP stack's budgets transfer.
 
@@ -331,26 +384,22 @@ class PpoConfig:
     value_loss_coef: float = 0.5
     use_clipped_value_loss: bool = True
     max_grad_norm: float = 1.0
-    #: 3e-5, NOT rsl_rl's 1e-3 or the 1e-4 this package started at.  Measured:
-    #: at 1e-4 the 20-iteration Isaac smoke railed the adaptive controller at
-    #: the 1e-5 floor 28 times, with KL median 0.021 against a 0.015 target and
-    #: clip_frac median 0.41 (max 0.65) where a healthy PPO run sits at
-    #: 0.1-0.2.  That is the update moving the policy far too far per step --
-    #: the documented in-repo railing failure, reproduced.
-    #:
-    #: The documented alternative, if throughput matters more than caution:
-    #: keep 1e-4 and drop ``num_learning_epochs`` 3 -> 2, which cuts the number
-    #: of LR adjustments per iteration from 12 to 8 and roughly halves the
-    #: per-iteration policy movement.  A pilot at both is the right call; this
-    #: default is the conservative one.
-    learning_rate: float = 3.0e-5
+    #: 1e-5, down from the 3e-5 that still spent ~0.07 nats/step on the Isaac
+    #: orth runs (target 0.015).  Pair with ``lr_min=1e-6`` and
+    #: ``OrthGradConfig.traj_grad_scale=0.2``.  The adaptive controller raises
+    #: LR if a minibatch undershoots ``desired_kl / 2``.
+    learning_rate: float = 1.0e-5
     schedule: str = "adaptive"              # "adaptive" | "fixed"
-    #: rsl_rl's own floor.  Documented failure mode: the adaptive controller
-    #: rails HERE and the run silently stops learning, so the floor is logged
-    #: every iteration and a warning fires when it is hit.
-    lr_min: float = 1.0e-5
+    #: Below rsl_rl's 1e-5 floor.  The Isaac orth runs railed at 1e-5 with
+    #: minibatch KL still ~0.07 (target 0.015); a floor at the spent step size
+    #: just pins the accelerator.  The adaptive controller may raise this.
+    lr_min: float = 1.0e-6
     lr_max: float = 1.0e-3
     normalize_advantage: bool = True
+    #: After a minibatch whose KL already exceeds ``2 * desired_kl``, skip the
+    #: rest of this iteration's epochs.  Without this the first Isaac orth run
+    #: took 12 oversized steps per iter (3 epochs x 4 minibatches) and NaNed.
+    kl_early_stop: bool = True
     #: Steps of rollout per env per iteration.
     num_steps_per_env: int = 48
     #: Gradient-accumulation chunk INSIDE a minibatch.  A minibatch of
@@ -383,7 +432,7 @@ class EnvConfig:
     pin_pelvis: bool = True
     freeze_legs: bool = True
     use_ideal_pd: bool = True
-    pd_damping_scale: float = 2.0
+    pd_damping_scale: float = G1_PD_DAMPING_SCALE
     hit_mode: str = "geometric"
     randomize_kit: bool = False
     lag_substeps: tuple[int, int] = (0, 0)
@@ -417,6 +466,20 @@ class EnvConfig:
     lead_key: str = "best_strike_s"
     hit_lead_s: float = 0.0
     freeze_wp: int = 0
+    #: Keep the Unitree USD ``init_state`` (play_isaac ``--isaac_ready``).
+    #: Default False overwrites to ``amortized_opt.ready_joint_pos``, which is
+    #: what play_isaac and phase-2 start from (shoulder pitch −1.20, not +0.3).
+    isaac_ready: bool = False
+    #: Delay every clip so the first HAND hit is at this time (seconds).
+    #: ``1.0`` is play_isaac ``--first_hit_s 1.0`` / idle-family training from
+    #: rest.  ``0`` plays native RCC first-hit times (play_isaac's flag default
+    #: is off; PPO defaults to 1.0 so the first plan is on the trained clock).
+    first_hit_s: float = 1.0
+    #: Idle after the last hit before ``on_done`` chains the next clip, holding
+    #: leftover ``q``.  ``load_rcc`` already puts this in ``clip.duration``
+    #: (``post_buffer_s=1.0``); PPO has to wait on duration or the last-hit
+    #: cursor fires ``done`` immediately.  ``0`` restores that immediate chain.
+    clip_gap_s: float = 1.0
     #: The QP safety filter rewrites the executed command, which changes the
     #: action the log-prob was computed for.  OFF in v1; DECISION NEEDING
     #: REVIEW in README.
@@ -432,6 +495,7 @@ class PpoRunConfig:
     critic: CriticConfig = field(default_factory=CriticConfig)
     ppo: PpoConfig = field(default_factory=PpoConfig)
     aux: AuxCostConfig = field(default_factory=AuxCostConfig)
+    orth: OrthGradConfig = field(default_factory=OrthGradConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
 
     max_iterations: int = 2000
@@ -528,12 +592,22 @@ class PpoRunConfig:
                 f"plant_regime='analytic' with cmd_lead_s="
                 f"{self.env.cmd_lead_s!r}; the analytic plant is the one the "
                 f"'fit' preset is correct for.")
-        if self.env.hit_lead_s or self.env.freeze_wp:
+        if self.env.hit_lead_s:
             raise ValueError(
-                "hit_lead_s / freeze_wp are OFF in the deployment config "
+                "hit_lead_s is OFF in the deployment config "
                 "(README 7c decision 2: the 3-mechanism stack is WORSE than the "
-                "lead alone on the latency metric). Layer them only against a "
+                "lead alone on the latency metric). Layer it only against a "
                 "measured residual.")
+        if self.env.freeze_wp < 0:
+            raise ValueError("freeze_wp must be >= 0")
+        if self.env.first_hit_s < 0.0:
+            raise ValueError("first_hit_s must be >= 0 (0 disables the pad)")
+        if self.env.clip_gap_s < 0.0:
+            raise ValueError("clip_gap_s must be >= 0 (0 chains on last hit)")
+        if int(self.actor.freeze_wp) != int(self.env.freeze_wp):
+            raise ValueError(
+                "actor.freeze_wp must match env.freeze_wp; otherwise the "
+                "PPO replay mean diverges from IsaacMPC on the frozen ticks")
 
     def validate(self) -> None:
         self.assert_lead_convention()
@@ -545,6 +619,14 @@ class PpoRunConfig:
                 "evenly for the flat minibatch generator")
         if not (0.0 < self.actor.noise_std_init <= self.actor.noise_std_max):
             raise ValueError("noise_std_init must be in (0, noise_std_max]")
+        if self.orth.rl_to_cost_norm < 0.0:
+            raise ValueError("orth.rl_to_cost_norm must be >= 0")
+        if self.orth.cost_to_rl_norm < 0.0:
+            raise ValueError("orth.cost_to_rl_norm must be >= 0")
+        if self.orth.traj_grad_scale < 0.0:
+            raise ValueError("orth.traj_grad_scale must be >= 0")
+        if not (0.0 <= self.orth.wp0_leak <= 1.0):
+            raise ValueError("orth.wp0_leak must be in [0, 1]")
 
     # --------------------------------------------------------------- paths ---
     def run_dir(self) -> Path:

@@ -95,8 +95,11 @@ def test_single_violator_tracks_the_true_max(mode, true_max):
 @pytest.mark.parametrize("mode", ["pnorm", "lse"])
 @pytest.mark.parametrize("background", [0.005, 0.02, 0.1])
 def test_the_softplus_floor_does_not_drown_the_peak(mode, background):
-    """A feasible row still pays ``beta * log 2``-ish per element; ~850 of those
-    must not accumulate into the smooth max the way they do into the mean."""
+    """Uniform background on a synthetic array (the reduction, not the hinge).
+
+    A 0.02 background on a ReLU peak is only from actual ReLU, not a
+    softplus floor -- this test feeds ``smooth_max`` a hand-made ``h``.
+    """
     h, mask, n_valid = _one_violator(3.0, background=background)
     true = (h * mask).amax(dim=(1, 2))
     peak = smooth_max(h, mask, mode, 12.0, 0.05)
@@ -232,6 +235,15 @@ def _ctx(b, cost, device="cpu", dtype=torch.float64):
                           kl=b["kl"].to(device), kr=b["kr"].to(device))
 
 
+def _torque_hard(out):
+    """Default-λ=1 sum of per-segment ReLU lives (the hard wall, no peak)."""
+    from amortized_opt.lagrangian import ACTUATOR_SEGMENT_NAMES, limit_group_name
+    return sum(
+        out.violations[limit_group_name("torque", s)]
+        for s in ACTUATOR_SEGMENT_NAMES
+    )
+
+
 def _fwd(cfg_kw, cost_batch, **fwd_kw):
     b = cost_batch
     cost = FusedCost(CostConfig(**cfg_kw), max_horizon=b["H"], device="cpu",
@@ -240,106 +252,98 @@ def _fwd(cfg_kw, cost_batch, **fwd_kw):
 
 
 def test_zero_weight_is_bit_identical_to_the_old_term(cost_batch):
-    """The default MUST not move a single bit of any existing run."""
+    """Default ``w_torque_peak = 0`` is warning + per-segment live, no peak."""
     cost, out = _fwd({}, cost_batch)
     assert cost.cfg.w_torque_peak == 0.0          # the pinned default
-    expect = cost.cfg.w_torque * out.raw["torque"]
-    assert torch.equal(out.terms["torque"], expect)
+    warning = cost.cfg.w_torque * out.raw["torque"]
+    hard = _torque_hard(out)
+    assert torch.allclose(out.terms["torque"], warning + hard, atol=1e-12)
 
     _, explicit = _fwd({"w_torque_peak": 0.0}, cost_batch)
     assert torch.equal(explicit.terms["torque"], out.terms["torque"])
 
-    # ... and the AL multiplier still scales the whole group.
+    # doubling family λ scales the hard wall, not the warning
     _, doubled = _fwd({}, cost_batch, weights={"torque": 2.0})
-    assert torch.allclose(doubled.terms["torque"], 2.0 * out.terms["torque"],
-                          atol=1e-14)
+    assert torch.allclose(cost.cfg.w_torque * doubled.raw["torque"], warning, atol=1e-12)
+    assert torch.allclose(doubled.terms["torque"], warning + 2.0 * hard, atol=1e-12)
 
 
-def test_peak_output_is_well_formed_and_brackets_the_true_max(cost_batch):
-    """``raw["torque_peak"]`` is a tight, one-sided estimate of the true max.
-
-    Tight for ``pnorm``: its error is MULTIPLICATIVE and bounded by
-    ``n_valid ** (1/p)`` (1.6x at n = 391, p = 12), and only saturates that
-    bound when every element sits at the max.  ``lse``'s error is ADDITIVE
-    (``T * log n_valid`` = 0.30 N*m at n = 391, T = 0.05), so on a comfortably
-    feasible row -- true max 0.04 N*m of pure softplus floor -- it reads 8x
-    high.  That floor is exactly why ``pnorm`` is the default; the assertions
-    below pin both behaviours rather than pretending they are the same.
-    """
+def test_peak_output_is_smooth_max_at_least_the_hard_max(cost_batch):
+    """``raw["torque_peak"]`` is a smooth max of ReLU excess; AL viol is the max."""
     b = cost_batch
-    for mode in ("pnorm", "lse"):
-        cost, out = _fwd({"w_torque_peak": 1.0, "torque_peak_mode": mode}, cost_batch)
-        peak = out.raw["torque_peak"]
-        true = out.diagnostics["torque_hinge_max"]
-        n_valid = out.counts["torque"]
-        assert peak.shape == (b["B"],)
-        assert torch.isfinite(peak).all()
-        assert bool((peak >= 0.0).all())
-        assert peak.grad_fn is not None or not peak.requires_grad
-        assert bool((true > 0.0).all()), "batch never trips the hinge"
-        assert bool((peak >= 0.99 * true).all()), float((peak / true).min())
-        assert bool((peak >= 0.90 * true).all())
-        if mode == "pnorm":
-            assert bool((peak <= 1.60 * true).all()), float((peak / true).max())
-            assert bool((peak <= true * n_valid.pow(1.0 / cost.cfg.torque_peak_p)).all())
-        else:
-            bias = cost.cfg.torque_peak_temp * n_valid.log()
-            assert bool((peak <= true + bias + 1e-9).all()), float((peak - true).max())
-        print(f"[{mode}] peak/true_max over the batch: "
-              f"{[round(float(x), 4) for x in (peak / true)]}")
+    cost, out = _fwd({"w_torque_peak": 1.0}, cost_batch)
+    peak = out.raw["torque_peak"]
+    true = out.diagnostics["torque_excess_max"]
+    assert peak.shape == (b["B"],)
+    assert torch.isfinite(peak).all()
+    assert bool((peak >= 0.0).all())
+    over = true > 0.0
+    if bool(over.any()):
+        assert bool((peak[over] >= true[over] - 1e-12).all())
+    zero = ~over
+    if bool(zero.any()):
+        assert float(peak[zero].abs().max()) == 0.0
+    assert torch.equal(out.violations["torque_peak"], true)
 
 
 def test_peak_weight_strictly_raises_the_term(cost_batch):
     _, base = _fwd({}, cost_batch)
-    for mode in ("pnorm", "lse"):
-        _, hot = _fwd({"w_torque_peak": 1.0, "torque_peak_mode": mode}, cost_batch)
-        assert bool((hot.raw["torque_peak"] > 0).all())
-        assert bool((hot.terms["torque"] > base.terms["torque"]).all())
-        # and the curriculum knob multiplies only the peak half
-        _, hot2 = _fwd({"w_torque_peak": 1.0, "torque_peak_mode": mode}, cost_batch,
-                       weights={"torque_peak": 3.0})
-        expect = base.terms["torque"] + 3.0 * hot.raw["torque_peak"]
-        assert torch.allclose(hot2.terms["torque"], expect, atol=1e-12)
+    _, hot = _fwd({"w_torque_peak": 1.0}, cost_batch)
+    if bool((hot.raw["torque_peak"] > 0).any()):
+        assert bool((hot.terms["torque"] >= base.terms["torque"]).all())
+        assert bool((hot.terms["torque"] > base.terms["torque"]).any())
+    # the curriculum knob multiplies only the peak half (λ_peak * w_peak * smooth_max)
+    _, hot2 = _fwd({"w_torque_peak": 1.0}, cost_batch,
+                   weights={"torque_peak": 3.0})
+    expect = base.terms["torque"] + 3.0 * hot.raw["torque_peak"]
+    assert torch.allclose(hot2.terms["torque"], expect, atol=1e-12)
 
 
-def test_one_adam_step_on_the_peak_lowers_the_worst_element(cost_batch):
-    """The whole point: the peak term is a usable descent direction on the MAX."""
-    b = cost_batch
+def test_one_adam_step_on_the_peak_lowers_the_worst_element():
+    """The whole point: the peak term is a usable descent direction on the MAX ReLU."""
+    # A motionless hold is feasible (ReLU peak = 0, no gradient).  Displace
+    # one wrist knot so exactly one (knot, joint) element is over the hard
+    # effort limit -- the shape the peak group exists for.
+    H, B = 12, 4
+    wrist_cols = (8, 9, 15, 16)
+    q0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    v0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    wp = q0.unsqueeze(1).repeat(1, H, 1)
+    for b in range(B):
+        wp[b, 3 + b, wrist_cols[b % len(wrist_cols)]] = 0.10 * (-1.0) ** b
+    kl = torch.full((B,), H, dtype=torch.long)
+    kr = torch.full((B,), H, dtype=torch.long)
     cost = FusedCost(CostConfig(w_torque=0.0, w_torque_peak=1.0),
-                     max_horizon=b["H"], device="cpu", dtype=torch.float64)
-    ctx = _ctx(b, cost)
-    wp = b["wp"].clone().requires_grad_(True)
+                     max_horizon=H, device="cpu", dtype=torch.float64, dt=0.02)
+    ctx = _synthetic_ctx(B, "cpu", torch.float64, kl=kl, kr=kr)
+    wp = wp.clone().requires_grad_(True)
 
-    def hinge_max():
+    def excess_max():
         with torch.no_grad():
-            o = cost.forward(b["q0"], wp, b["v0"], ctx)
-        return o.diagnostics["torque_hinge_max"].clone()
+            o = cost.forward(q0, wp, v0, ctx)
+        return o.diagnostics["torque_excess_max"].clone()
 
-    before = hinge_max()
-    # Adam normalizes the step, so one step moves EVERY waypoint dim by ~lr
-    # whether or not it feeds the peak; 1e-3 is big enough for that dense
-    # perturbation to raise a different element above the one being pushed
-    # down.  1e-4 is inside the linear regime and the max falls on every row.
+    before = excess_max()
+    assert bool((before > 0).all()), before
     opt = torch.optim.Adam([wp], lr=1.0e-4)
     opt.zero_grad(set_to_none=True)
-    out = cost.forward(b["q0"], wp, b["v0"], ctx)
+    out = cost.forward(q0, wp, v0, ctx)
     out.terms["torque"].sum().backward()
     assert torch.isfinite(wp.grad).all()
     assert float(wp.grad.abs().max()) > 0.0
     opt.step()
-    after = hinge_max()
-    print("torque_hinge_max before -> after one Adam step: "
+    after = excess_max()
+    print("torque_excess_max before -> after one Adam step: "
           f"{[round(float(x), 3) for x in before]} -> "
           f"{[round(float(x), 3) for x in after]}")
     assert bool((after < before).all()), (before, after)
 
-    # ... and 20 of them keep going, without the mean half of the term.
     opt = torch.optim.Adam([wp], lr=1.0e-4)
     for _ in range(20):
         opt.zero_grad(set_to_none=True)
-        cost.forward(b["q0"], wp, b["v0"], ctx).terms["torque"].sum().backward()
+        cost.forward(q0, wp, v0, ctx).terms["torque"].sum().backward()
         opt.step()
-    far = hinge_max()
+    far = excess_max()
     print(f"  after 21 steps: mean {float(before.mean()):.4f} -> "
           f"{float(far.mean()):.4f}")
     assert float(far.mean()) < float(before.mean())
@@ -404,13 +408,37 @@ def test_smooth_max_rejects_partial_dims():
 
 # ------------------------------------------------- the mismatch, measured --
 def test_the_mismatch_this_fix_addresses_is_real(cost_batch):
-    """Document the ratio: peak / mean on a real batch that trips the hinge."""
+    """Document the ratio: ReLU peak / softplus mean on a batch that trips."""
     _, out = _fwd({"w_torque_peak": 1.0}, cost_batch)
     mean = out.raw["torque"].detach()
     peak = out.raw["torque_peak"].detach()
     cnt = out.counts["torque"]
-    print("per-sample  n_valid / mean(hinge) / peak(hinge) / ratio:")
+    print("per-sample  n_valid / mean(softplus) / peak(ReLU) / ratio:")
     for i in range(mean.numel()):
+        ratio = float(peak[i] / mean[i]) if float(mean[i]) else 0.0
         print(f"  {int(cnt[i]):4d}  {float(mean[i]):10.4f}  {float(peak[i]):10.4f}  "
-              f"{float(peak[i] / mean[i]):8.1f}x")
-    assert bool((peak > mean).all())
+              f"{ratio:8.1f}x")
+    # feasible rows: ReLU peak is 0, softplus mean is the floor.  Violating
+    # rows: peak exceeds the diluted mean.
+    over = peak > 0
+    if bool(over.any()):
+        assert bool((peak[over] > mean[over]).all())
+    else:
+        assert float(peak.abs().max()) == 0.0
+        assert bool((mean > 0).all())
+
+
+def test_relu_peak_is_zero_on_a_feasible_hold():
+    """A gravity-only hold: softplus mean is the floor, ReLU peak is 0."""
+    H, B = 12, 2
+    q0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    wp = q0.unsqueeze(1).repeat(1, H, 1)
+    v0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    kl = torch.full((B,), H, dtype=torch.long)
+    cost = FusedCost(CostConfig(w_torque_peak=1.0), max_horizon=H,
+                     device="cpu", dtype=torch.float64, dt=0.02)
+    out = cost.forward(q0, wp, v0, _synthetic_ctx(B, "cpu", torch.float64, kl=kl, kr=kl))
+    assert float(out.raw["torque"].min()) > 0.0
+    assert float(out.raw["torque_peak"].abs().max()) == 0.0
+    assert float(out.violations["torque_peak"].abs().max()) == 0.0
+    assert torch.equal(out.violations["torque_peak"], out.diagnostics["torque_excess_max"])

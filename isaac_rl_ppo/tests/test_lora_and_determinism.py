@@ -175,6 +175,22 @@ def test_mean_correction_starts_as_the_identity(actor, scheduled):
     assert torch.equal(plan.mean, plan.raw_first)
 
 
+def test_freeze_wp_copies_striking_arm_from_init(actor, scheduled):
+    """Replay must freeze the same ticks IsaacMPC.plan does."""
+    actor.cfg.freeze_wp = 5
+    actor.cfg.freeze_waist = True
+    sched, _kit, B = scheduled
+    inputs = make_inputs(actor, sched, B, seed=10)
+    inputs.hit_index.fill_(3)
+    with torch.no_grad():
+        plan = actor.plan(inputs)
+    for h in (0, 1):
+        cols = actor.arm_cols[h]
+        assert torch.equal(plan.traj[:, :, cols], inputs.init[:, :, cols])
+    assert torch.equal(plan.traj[:, :, actor.waist_cols],
+                       inputs.init[:, :, actor.waist_cols])
+
+
 # ================================================== aux-cost gradient flow ====
 def test_aux_cost_gradients_reach_the_lora_parameters(actor, scheduled, run_cfg):
     """The analytic cost must actually train the subspace it is supposed to.

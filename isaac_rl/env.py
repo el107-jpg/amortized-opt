@@ -11,7 +11,7 @@ carrying 6 000 lines of dead configuration that can still fire.
 What IS carried is everything about the plant, because the per-joint reference
 lead and the whole phase-2 training distribution were identified against it:
 
-* ``get_g1_cfg(use_ideal_pd=True, pd_damping_scale=2.0, freeze_legs=True)`` --
+* ``get_g1_cfg(use_ideal_pd=True, pd_damping_scale=G1_PD_DAMPING_SCALE, freeze_legs=True)`` --
   the composed USD with the drumsticks welded onto the wrist bodies;
 * the drum-kit USD, spawned per env the same way (``AssetBase`` is abstract, so
   the ``UsdFileCfg`` spawn function is called directly);
@@ -141,13 +141,14 @@ def build_isaac_cfg(cfg: DrumRLEnvCfg):
                 friction_combine_mode="max",
             ),
             # CCD was added at 1/120 because a 3 m/s tip travels ~17 mm per
-            # physics step -- more than TIP_RADIUS = 14 mm -- so PhysX could
-            # resolve the contact past first penetration.  At 1/250 that travel
-            # is 12 mm, i.e. inside the tip radius, so CCD is no longer load
-            # bearing.  It is kept ON anyway for this scaffold: turning it off
-            # is a change to contact behaviour and belongs in the same A/B as
-            # the rest of the contact-parameter randomization (RL priority 2),
-            # not smuggled in with the rate change.
+            # physics step -- more than the tip radius -- so PhysX could
+            # resolve the contact past first penetration.  At 1/250 that
+            # travel is still ~12 mm, which EXCEEDS TIP_RADIUS = 10 mm, so a
+            # fast strike can cross more than a full tip radius in one step
+            # and CCD remains load bearing at this rate too.  Keep it ON.
+            # (When the tip was 14 mm the 12 mm travel sat inside the radius
+            # and CCD was merely precautionary; the smaller tip re-inverts
+            # that arithmetic.)
             physx=I["PhysxCfg"](enable_ccd=True),
         )
         robot_cfg = get_g1_cfg(
@@ -502,9 +503,19 @@ def _install():
                 return
             jp = self.robot.data.default_joint_pos.clone()
             jv = torch.zeros_like(jp)
-            jp[:, self.joint_ids] = q
+            # ``q`` may be given either FULL (num_envs rows) or already sliced to
+            # ``env_ids``.  The old ``jp[:, joint_ids] = q`` wrote to EVERY row,
+            # so it only worked when every env reset on the same tick -- a
+            # partial reset raised "value tensor of shape [k, 17] cannot be
+            # broadcast to indexing result of shape [num_envs, 17]".  Scatter
+            # into the selected rows instead.  (The ``_foh_prev`` line below
+            # already handled the same full-vs-sliced ambiguity.)
+            jid = torch.as_tensor(self.joint_ids, device=self.device).reshape(-1).long()
+            q_sub = q[env_ids] if q.shape[0] == self.num_envs else q
+            jp[env_ids[:, None], jid[None, :]] = q_sub
             if qd is not None:
-                jv[:, self.joint_ids] = qd
+                qd_sub = qd[env_ids] if qd.shape[0] == self.num_envs else qd
+                jv[env_ids[:, None], jid[None, :]] = qd_sub
             self.robot.write_joint_state_to_sim(jp[env_ids], jv[env_ids], None, env_ids)
             self.robot.write_root_pose_to_sim(self._pin_pose[env_ids], env_ids)
             self.robot.write_root_velocity_to_sim(self._pin_vel[env_ids], env_ids)

@@ -15,6 +15,7 @@ import pytest
 import torch
 
 import amortized_opt as A
+from amortized_opt.grad_balance import GRAD_BALANCE_GROUPS
 from amortized_opt.lagrangian import AugmentedLagrangian
 from amortized_opt.pd_sim import BatchedPDSim, PDSimConfig
 from amortized_opt.phase2_data import (
@@ -28,20 +29,27 @@ from amortized_opt.train_cost import (
     Phase2Config,
     ReplayPool,
     WeightSchedule,
+    default_weight_schedule,
+    _sample_fresh_batch,
+    _splice_frontier_batch,
     _wtensors,
     apply_bounce,
     bounce_tip_velocity,
     build_costs,
+    cost_grad_balance_tuple,
     effective_hits,
     group_lengths,
     make_bptt_step,
     encode,
     make_cost_step,
     make_tc_step,
+    measure_torque_directional_curvature,
+    mpc_init_tie_loss,
     per_element_lengths,
     phase2_al_config,
     phase2_cost_config,
     ramp_seed,
+    stage_a_pass,
     temporal_consistency_loss,
 )
 
@@ -104,7 +112,7 @@ def test_one_step_reduces_cost(bits, compile_mode):
 
     opt = torch.optim.Adam(model.parameters(), lr=1e-5)
     try:
-        loss0, m0, _ = step_fn(*args)
+        loss0, m0, _, _ = step_fn(*args)
     except Exception as exc:  # noqa: BLE001
         # This box pairs Isaac's prebundled torch with the conda env's Triton;
         # inductor emits kernels that Triton cannot parse ("type object
@@ -119,11 +127,75 @@ def test_one_step_reduces_cost(bits, compile_mode):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
     with torch.no_grad():
-        loss1, m1, _ = step_fn(*args)
+        loss1, m1, _, _ = step_fn(*args)
     assert torch.isfinite(loss0) and torch.isfinite(loss1)
     assert float(loss1) < float(loss0), f"{float(loss0):.4f} -> {float(loss1):.4f}"
     # ...and it is the COST that fell, not only the auxiliary heads.
     assert float(m1[1]) < float(m0[1])
+
+
+def test_grad_balance_cost_tuple_matches_named_terms(bits):
+    pool, model, _p2, costs, _sim = bits
+    batch = _batch(pool, 8, seed=7)
+    enc = encode(model, batch["context"])
+    out = model(batch["init"], batch["state"], enc, batch["masks"])
+    al = AugmentedLagrangian(phase2_al_config())
+    weights = _wtensors(
+        WeightSchedule().multipliers(0), al.weights(),
+        torch.device(DEV), torch.float32,
+    )
+    payload = cost_grad_balance_tuple(
+        costs[pool.buckets[0]], batch["q0"], out.traj, batch["v0"],
+        batch["strike"], batch["lengths"], weights,
+    )
+    direct = costs[pool.buckets[0]].forward(
+        batch["q0"], out.traj, batch["v0"], batch["strike"],
+        lengths=batch["lengths"], weights=weights,
+    )
+    assert torch.allclose(payload[0], direct.total)
+    expected = torch.stack([
+        sum(direct.terms[k].mean() for k in term_keys)
+        for term_keys, _al_keys in GRAD_BALANCE_GROUPS.values()
+    ])
+    assert torch.allclose(payload[5], expected)
+    assert torch.allclose(
+        payload[6], direct.balance_terms["joint_box_waist"].mean(),
+    )
+
+
+def test_torque_directional_curvature_probe_is_finite(bits):
+    pool, model, _p2, costs, _sim = bits
+    batch = _batch(pool, 4, seed=13)
+    enc = encode(model, batch["context"])
+    out = model(batch["init"], batch["state"], enc, batch["masks"])
+    al = AugmentedLagrangian(phase2_al_config())
+    weights = _wtensors(
+        WeightSchedule().multipliers(0), al.weights(),
+        torch.device(DEV), torch.float32,
+    )
+    cfg = Phase2Config(device=DEV, torque_curvature_rows=2)
+    traj_before = out.traj.detach().clone()
+    rnea_dtype = costs[pool.buckets[0]].rnea.axis.dtype
+    device_type = "cuda" if out.traj.is_cuda else "cpu"
+    with torch.autocast(device_type, dtype=torch.bfloat16):
+        metrics = measure_torque_directional_curvature(
+            costs[pool.buckets[0]], cfg, traj=out.traj, q0=batch["q0"],
+            v0=batch["v0"], strike=batch["strike"], lengths=batch["lengths"],
+            weights=weights,
+        )
+    assert metrics["torque_curve_ok"] == 1.0
+    assert np.isfinite(metrics["torque_curve_rho_1p0mrad"])
+    assert np.isfinite(metrics["torque_curve_fd_safe_mrad"])
+    assert metrics["torque_curve_hvp_ok"] == 1.0
+    assert np.isfinite(metrics["torque_curve_dHd"])
+    assert metrics["torque_curve_selected_step_mrad"] in (2.0, 1.0, 0.5, 0.25)
+    assert metrics["torque_curve_fd_legacy_unreliable"] == 1.0
+    for step in ("5p0", "2p0", "1p0", "0p5", "0p25"):
+        assert np.isfinite(metrics[f"torque_curve_gradfd_dHd_{step}mrad"])
+        assert metrics[f"torque_curve_active_cross_total_{step}mrad"] >= 0.0
+    # Diagnostic transaction: caller data and plant precision are untouched.
+    assert torch.equal(out.traj.detach(), traj_before)
+    assert costs[pool.buckets[0]].rnea.axis.dtype == rnea_dtype
 
 
 # ============================================ 2. temporal consistency =======
@@ -142,6 +214,35 @@ def test_temporal_consistency_is_zero_when_consistent():
     bad[:, 0] += 0.5
     loss2, _ = temporal_consistency_loss(traj, bad, mask, mask)
     assert float(loss2) > 0.0
+
+
+def test_mpc_init_tie_masks_fresh_rows_and_padded_tail():
+    torch.manual_seed(1)
+    B, H, n = 3, 6, A.N_DOF
+    init = torch.randn(B, H, n)
+    traj = init.clone().requires_grad_(True)
+    mask = torch.ones_like(traj)
+    mpc = torch.tensor([True, False, True])
+
+    # Fresh row disagreement and the repeated/padded final knot are ignored.
+    changed = traj.clone()
+    changed[1, :-1] += 2.0
+    changed[:, -1] += 3.0
+    loss0, count = mpc_init_tie_loss(changed, init, mask, mpc)
+    assert float(loss0) == pytest.approx(0.0, abs=1e-12)
+    assert float(count) == 2 * (H - 1) * n
+
+    # A disagreement on a marked replay row is priced and differentiates only
+    # the current output; stored history remains detached.
+    changed = traj.clone()
+    changed[0, 0, 0] += 0.5
+    loss1, _ = mpc_init_tie_loss(changed, init, mask, mpc)
+    assert float(loss1) > 0.0
+    loss1.backward()
+    assert traj.grad is not None
+    assert float(traj.grad[0, 0, 0].abs()) > 0.0
+    assert float(traj.grad[1].abs().max()) == 0.0
+    assert float(traj.grad[:, -1].abs().max()) == 0.0
 
 
 def test_tc_step_runs_and_is_differentiable(bits):
@@ -269,9 +370,16 @@ def test_al_state_save_resume_is_bit_exact(tmp_path):
     assert other.lam == al.lam
     assert other.avg_violation == al.avg_violation
     assert other.steps == al.steps
+    assert other.pen == al.pen
+    assert other.err_prev == al.err_prev
+    assert other._d == al._d
+    assert other._seen == al._seen
     # ...and it CONTINUES identically rather than merely restoring
     v = {g: 0.05 for g in al.groups}
     assert al.update(v) == other.update(v)
+    assert al.pen == other.pen
+    assert al.err_prev == other.err_prev
+    assert al._d == other._d
 
 
 def test_checkpoint_round_trip_carries_the_multipliers(bits, tmp_path):
@@ -291,6 +399,7 @@ def test_checkpoint_round_trip_carries_the_multipliers(bits, tmp_path):
     ck = load_phase2_checkpoint(tmp_path / "c.pt", al=al2)
     assert ck["step"] == 42
     assert al2.lam == al.lam and al2.steps == al.steps
+    assert al2.pen == al.pen and al2.err_prev == al.err_prev
 
 
 # ================================================ 6. schedule + roller ======
@@ -305,6 +414,35 @@ def test_weight_schedule_ramps_monotonically():
     # the stage-A groups never move
     for k in (0, 500, 50_000):
         assert s.multipliers(k)["collision"] == 1.0
+
+
+def test_weight_schedule_default_is_full_at_step_zero():
+    m = default_weight_schedule().multipliers(0)
+    for k in ("torque", "velocity", "joint_box", "terminal_velocity",
+              "waist_yaw_vel", "waist_pr_vel", "torque_peak", "joint_box_peak"):
+        assert m[k] == pytest.approx(1.0), k
+    # Phase2Config uses the same factory.
+    assert Phase2Config().schedule.multipliers(0)["torque"] == pytest.approx(1.0)
+
+
+def test_weight_schedule_snap_full_is_one_at_step_zero():
+    s = WeightSchedule(
+        ramp_start=10_000, ramp_end=30_000, lo_limits=0.05, lo_strike=0.1,
+        torque_peak_start=0, torque_peak_ramp=1000,
+        collision_peak_start=0, collision_peak_ramp=1000,
+        waist_start=0, waist_ramp=300,
+        effort_start=0, effort_ramp=300,
+        idle_start=0, idle_ramp=300,
+        tip_crossover_start=0, tip_crossover_ramp=300,
+    ).snap_full()
+    m = s.multipliers(0)
+    for k in ("torque", "velocity", "joint_box", "terminal_velocity",
+              "terminal_elev", "torque_peak", "velocity_peak", "collision_peak",
+              "joint_box_peak",
+              "waist_box", "posture_upright", "waist_aim",
+              "waist_pr_terminal",
+              "effort", "posture_idle", "tip_crossover"):
+        assert m[k] == pytest.approx(1.0), k
 
 
 def test_ramp_seed_hits_the_terminal_and_holds():
@@ -344,3 +482,146 @@ def test_roller_produces_usable_mpc_contexts(bits):
     assert batch["init"].shape == (8, b, A.N_DOF)
     assert torch.isfinite(batch["init"]).all()
     assert batch["strike"].drum_head_centers is not None
+
+
+def test_stage_a_unlocks_at_30_of_81():
+    base = dict(n=81, ok_collision=0.90, elbow_down=1.0)
+    assert not stage_a_pass({**base, "accepted": 29})
+    assert stage_a_pass({**base, "accepted": 30})
+    assert not stage_a_pass({**base, "accepted": 81, "ok_collision": 0.5})
+    assert not stage_a_pass({**base, "accepted": 81, "elbow_down": 0.5})
+
+
+def test_phase2_turns_on_weak_terminal_aim():
+    assert phase2_cost_config().w_terminal_aim == pytest.approx(10.0)
+    assert phase2_cost_config().w_torque * 1.0 == pytest.approx(
+        phase2_cost_config().w_joint_box * 0.05
+    )
+    assert phase2_cost_config().w_torque * 1.0 == pytest.approx(
+        phase2_cost_config().w_velocity * 0.5
+    )
+    assert A.CostConfig().w_terminal_aim == pytest.approx(0.0)
+    assert phase2_cost_config().terminal_aim_deadband_m == pytest.approx(0.02)
+
+
+def test_sample_fresh_batch_draws_live_post_hit(bits):
+    from amortized_opt.phase2_data import KIND_POST_HIT
+
+    pool, *_ = bits
+    b = pool.buckets[0]
+    live = ReplayPool(pool, 64, buckets=[b], recency_bias=0.0)
+    n = min(16, pool.size(b))
+    cols = {k: v[:n].contiguous() for k, v in pool.data[b].items()}
+    cols["kind"] = torch.full((n,), KIND_POST_HIT, device=pool.device, dtype=torch.long)
+    live.add(b, cols)
+    g = torch.Generator(device=pool.device)
+    g.manual_seed(0)
+    batch = _sample_fresh_batch(
+        pool, b, 8, generator=g,
+        kind_fracs={KIND_POST_HIT: 1.0},
+        live_post_hit=live, noise=False,
+    )
+    assert int(batch["kind"].shape[0]) == 8
+    assert (batch["kind"] == KIND_POST_HIT).all()
+    assert batch["mpc_init"].all()
+
+
+def test_sample_fresh_batch_concats_pool_and_live(bits):
+    """Live post-hit rows omit ``waist_yaw_ref`` under head-mode harvest;
+    mixing them with the fresh pool must not crash on ``None`` cat."""
+    from amortized_opt.phase2_data import KIND_POST_HIT
+
+    pool, *_ = bits
+    b = pool.buckets[0]
+    live = ReplayPool(pool, 64, buckets=[b], recency_bias=0.0)
+    n = min(16, pool.size(b))
+    cols = {k: v[:n].contiguous() for k, v in pool.data[b].items()}
+    cols["kind"] = torch.full((n,), KIND_POST_HIT, device=pool.device, dtype=torch.long)
+    live.add(b, cols)
+    other = next(int(k) for k, c in pool.kind_counts().items() if int(k) != KIND_POST_HIT and c > 0)
+    g = torch.Generator(device=pool.device)
+    g.manual_seed(1)
+    batch = _sample_fresh_batch(
+        pool, b, 16, generator=g,
+        kind_fracs={other: 0.4, KIND_POST_HIT: 0.6},
+        live_post_hit=live, noise=False,
+    )
+    assert int(batch["q0"].shape[0]) == 16
+    assert 0 < int(batch["mpc_init"].sum()) < 16
+    assert batch["strike"].waist_yaw_ref is None or torch.is_tensor(
+        batch["strike"].waist_yaw_ref
+    )
+
+
+def test_sample_fresh_idle_far_from_cloud_only(bits):
+    """Idle/far remainder is cloud collocations; post-hit stays live."""
+    from amortized_opt.frontier import FrontierCloud, FrontierConfig, ingest_pool
+    from amortized_opt.phase2_data import KIND_FAR_FETCHED, KIND_POST_HIT, KIND_RHYTHM_IDLE
+
+    pool, *_ = bits
+    b = pool.buckets[0]
+    cloud = FrontierCloud(
+        FrontierConfig(enabled=True, traj_stride=10_000, buckets=tuple(pool.buckets)),
+        device=torch.device(pool.device),
+        q_lo=pool.q_lo, q_hi=pool.q_hi,
+    )
+    ingest_pool(cloud, pool)
+    assert cloud.size(b) >= 16
+    g = torch.Generator(device=pool.device)
+    g.manual_seed(2)
+    all_cloud = _sample_fresh_batch(
+        pool, b, 8, generator=g,
+        kind_fracs={KIND_RHYTHM_IDLE: 0.3, KIND_FAR_FETCHED: 0.1, KIND_POST_HIT: 0.6},
+        live_post_hit=None, noise=False,
+        frontier=cloud, frontier_idle_far=True,
+    )
+    assert int(all_cloud["q0"].shape[0]) == 8
+    assert (all_cloud["cid"] > 0).all()
+    assert not bool(all_cloud["mpc_init"].any())
+
+    live = ReplayPool(pool, 64, buckets=[b], recency_bias=0.0)
+    n = min(16, pool.size(b))
+    cols = {k: v[:n].contiguous() for k, v in pool.data[b].items()}
+    cols["kind"] = torch.full((n,), KIND_POST_HIT, device=pool.device, dtype=torch.long)
+    live.add(b, cols)
+    g.manual_seed(3)
+    mixed = _sample_fresh_batch(
+        pool, b, 32, generator=g,
+        kind_fracs={KIND_RHYTHM_IDLE: 0.4, KIND_POST_HIT: 0.6},
+        live_post_hit=live, noise=False,
+        frontier=cloud, frontier_idle_far=True,
+    )
+    assert int(mixed["q0"].shape[0]) == 32
+    n_cloud = int((mixed["cid"] > 0).sum())
+    n_ph = int((mixed["cid"] == 0).sum())
+    assert n_cloud > 0 and n_ph > 0
+    assert n_cloud + n_ph == 32
+    assert torch.equal(mixed["mpc_init"], mixed["cid"] == 0)
+
+
+def test_splice_frontier_into_replay_prefers_children_when_able(bits):
+    """Idle-far replay splice keeps the prefix and stamps cloud cids on the tail."""
+    from amortized_opt.frontier import FrontierCloud, FrontierConfig, ingest_pool
+
+    pool, *_ = bits
+    b = pool.buckets[0]
+    cloud = FrontierCloud(
+        FrontierConfig(enabled=True, traj_stride=10_000, buckets=tuple(pool.buckets)),
+        device=torch.device(pool.device),
+        q_lo=pool.q_lo, q_hi=pool.q_hi,
+    )
+    ingest_pool(cloud, pool)
+    g = torch.Generator(device=pool.device)
+    g.manual_seed(4)
+    base = _sample_fresh_batch(
+        pool, b, 16, generator=g, kind_fracs=None, noise=False,
+    )
+    prefix = base["q0"][:12].clone()
+    out = _splice_frontier_batch(
+        base, pool, cloud, b, 16, k=4, generator=g, inv_frac=0.0,
+        prefer_children=True,
+    )
+    assert int(out["q0"].shape[0]) == 16
+    assert torch.equal(out["q0"][:12], prefix)
+    assert (out["cid"][12:] > 0).all()
+    assert (out["cid"][:12] == 0).all()

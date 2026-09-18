@@ -25,9 +25,13 @@ struck; that hand alone gets a new goal from the rhythm and a fresh quintic
 seed built from the state the PD simulator actually reached, while the other
 hand's portion of the trajectory is left byte-for-byte untouched. This is the
 plan's "not resetting the entire init after a drum, decoupling the two arms".
-The waist columns are rebuilt only when BOTH hands reset on the same tick (or
-at episode start), so a single-hand swap cannot perturb the other hand through
-the shared waist -- see DECISIONS.
+With ``MPCGenConfig.bounce`` the striking hand also gets the BPTT placeholder
+contact impulse (tip-normal restitution) before that reseed, so the next
+quintic does not start from a stick still flying through the head. Off by
+default: the historical generator has no drum collider.
+The waist columns are rebuilt from the refreshed aim whenever ANY hand resets
+(matching Phase-B distill / the training roller), so a one-hand promote cannot
+leave aim tokens and the waist seed describing different drums.
 
 Short-horizon oversampling (the plan's normalization note, "include a few more
 training examples with shorter horizon lengths") is implemented by emitting
@@ -57,14 +61,16 @@ from .rhythm import (
     GoalSnapshot,
     HandGoal,
     RhythmClip,
+    aim_inputs_from_snapshot,
     build_context_inputs,
     goal_snapshot,
 )
 from .sdf import DrumSceneSpec, SdfPenalty
+from .ik import corrected_arm_terminals
 from .tokenizer import WaypointMasks, build_waypoint_masks
 from .waist_aim import WaistAimConfig
-from .idle_home import resolve_idle_home
-from .warmstart import GoalPoseLibrary, InitNoise, arm_slice, warmstart_trajectory
+from .idle_cylinder import derive_cylinder, resolve_idle_cylinder_library
+from .warmstart import GoalPoseLibrary, InitNoise, arm_slice, update_waist_pr_ema, waist_pr_slice, warmstart_trajectory
 
 __all__ = [
     "PlanRequest",
@@ -107,10 +113,12 @@ class PlanRequest:
     #: measured value is a zero-stiffness loop and the waist random-walks out
     #: of its box (measured: 0.79 rad past a +/-0.52 rad limit in 300 ticks).
     waist_setpoint: np.ndarray | None = None
-    #: The idle arm's park posture, so a planner that builds its own context
+    #: The idle arm's cylinder library, so a planner that builds its own context
     #: tokens (the closed-loop probe) can fill the idle token the same way the
-    #: generator seeded the idle arm.  ``None`` = no idle-home in this loop.
-    idle_home: object = None
+    #: generator seeded the idle arm.  ``None`` = no idle-cylinder in this loop.
+    idle_library: object = None
+    idle_cylinder: object = None
+    idle_home: object = None  # legacy alias; unused when idle_library is set
 
 
 @dataclass
@@ -153,6 +161,9 @@ class EpisodeResult:
     #: Ticks on which ``MPCGenConfig.freeze_wp`` suppressed the planner call and
     #: the previously committed plan was executed instead.
     frozen_ticks: int = 0
+    #: Hands that received the post-hit bounce impulse (one per fire, so a
+    #: two-hand tick counts twice).
+    bounced_hands: int = 0
 
 
 # ------------------------------------------------------------------- config --
@@ -184,13 +195,12 @@ class MPCGenConfig:
     record_min_sdf: bool = True
     #: Ticks a just-struck drum stays exempt from this hand's collision check.
     departure_exempt_wp: int = 4
-    #: THE IDLE ARM.  ``"default"`` parks a hand with no goal at the (torso-
-    #: relative) home posture in ``assets/idle_home_poses.json`` if it exists,
-    #: a path names another table, ``None`` restores the hold-in-place seed.
-    #: This MUST match what the training roller ran with -- the park pose is how
-    #: the model is told where the idle arm belongs, and a loop that stops
-    #: telling it is asking for behaviour it was never trained on.
-    idle_home_path: str | None = "default"
+    #: THE IDLE ARM.  ``"default"`` parks a hand with no goal using the idle
+    #: cylinder library in ``assets/idle_cylinder_poses.json`` if it exists,
+    #: a path names another library, ``None`` restores the hold-in-place seed.
+    #: This MUST match what the training roller ran with.
+    idle_cylinder_path: str | None = "default"
+    idle_home_path: str | None = None  # deprecated alias
     idle_settle_wp: int = 10
     #: Re-park an idle arm on EVERY tick rather than only on the tick it goes
     #: idle, which is what :class:`~amortized_opt.train_cost.MPCRoller` does.
@@ -202,6 +212,11 @@ class MPCGenConfig:
     #: the measured-rate path is positive feedback and diverges. Set False only
     #: to reproduce the old behaviour in a regression test.
     planned_yaw_bc: bool = True
+    #: Pitch/roll ease window on every seed (``warmstart_trajectory``'s
+    #: ``waist_upright_ease_wp``).  Under ``planned_yaw_bc`` the ease recovers
+    #: to the PLANNED setpoint rather than to zero -- the anchored-command
+    #: analogue of ease-to-upright.  None keeps the constant-hold seed.
+    waist_upright_ease_wp: int | None = None
     #: Per-joint slew bound on the quintic SEED, as a fraction of the speed
     #: rating. The seed is velocity-unlimited by construction; inside the MPC
     #: loop its first waypoint is executed, so it has to be admissible.
@@ -222,6 +237,15 @@ class MPCGenConfig:
     #: +/-0.52 rad limit at 3 % of the speed rating.  Set False only to
     #: reproduce that.
     clamp_cmd_to_box: bool = True
+    #: Clamp the NEXT tick's init (shifted previous plan, idle park, post-hit
+    #: quintic) into the same joint box before the planner sees it.  The command
+    #: clamp above only rewrites ``traj[0]``; ``init = concat(traj[1:], tail)``
+    #: otherwise hands the decoder knots that already left the box (probe
+    #: prefixes: waist roll past +/-0.52 on ~91 % of ticks, peak ~2.4 rad).
+    #: Freeze copies this init, so it has to be clipped *before* the freeze
+    #: window, not only after the shift.  Does not clamp the decoder OUTPUT --
+    #: that is ``ModelConfig.clamp_traj_to_box`` and is a training-graph choice.
+    clamp_init_to_box: bool = True
     #: Abort an episode whose measured state leaves the joint box by this much
     #: (rad) or goes non-finite, instead of emitting garbage samples.
     divergence_box_margin: float = 0.5
@@ -272,6 +296,12 @@ class MPCGenConfig:
     #: ``cmd_lead_s``: the lead is a function of the servo it was fitted against.
     kp_scale: float | tuple[float, ...] = 1.0
     kd_scale: float | tuple[float, ...] = 1.0
+    #: Clamp the plant's demanded torque to the joint's usable effort, as Isaac
+    #: does at deployment (``PDSimConfig.saturate_effort``).  OFF = the
+    #: historical, bit-for-bit plant.  A closed-loop probe measuring a policy
+    #: trained against a saturating plant has to saturate too, or it is
+    #: measuring a different robot.
+    saturate_effort: bool = False
     #: Strike-window impedance: soften the striking hand's elbow+wrist Kp/Kd
     #: around its hit (see :mod:`amortized_opt.impedance` -- less impact torque
     #: reflected into the shoulder and waist).  ``None`` = nominal gains, the
@@ -292,6 +322,14 @@ class MPCGenConfig:
     #: error against the LED command is by design, and the integral can fight it.
     #: Set True only for sweep experiments that test combined lead + ki.
     pid_with_lead: bool = False
+    #: Post-hit placeholder contact (the BPTT chain's ``BounceConfig`` /
+    #: :func:`~amortized_opt.train_cost.apply_bounce`).  Reflects the striking
+    #: hand's tip-normal velocity with a randomized restitution, then the
+    #: per-hand quintic reseed runs from that ``(q, qd)``.  Without it the PD
+    #: plant has no drum collider: the stick tunnels through the head and the
+    #: next stroke is seeded from a penetrating pose.  ``None`` / ``False`` =
+    #: off (historical generator).  ``True`` = default ``BounceConfig``.
+    bounce: object | None = None
     #: FREEZE WINDOW (plan doc: "at ... 100ms or 5 waypoints before the hit ...
     #: we will stop refining our trajectory").  Once a HAND's hit is within this
     #: many waypoints, THAT ARM's columns of the plan are replaced by the
@@ -312,6 +350,13 @@ class MPCGenConfig:
     #: (inside the disk).  The OTHER arm is still replanned every tick either
     #: way -- freezing the whole row was measured to diverge.
     freeze_waist: bool = True
+    #: Leaky EMA of the clipped P/R command (same update as ``MPCRoller``).
+    #: Does not change the executed command; it is the closed-loop P/R
+    #: reference the cost would read.  Off = bit-identical to the historical
+    #: generator.  Skip the update on ticks where ``freeze_waist`` copied P/R.
+    waist_pr_ema: bool = False
+    waist_pr_ema_alpha: float = 0.1
+    waist_pr_ema_leak: float = 0.02
     joint_names: tuple[str, ...] = field(default=G1_UPPER_BODY_JOINTS)
 
 
@@ -324,6 +369,7 @@ def quintic_planner(
     q_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     planned_yaw_bc: bool = True,
     slew_limit_eta: float | None = ETA_VELOCITY,
+    waist_upright_ease_wp: int | None = None,
 ) -> PlannerFn:
     """A planner that rebuilds the quintic warm start from the current state.
 
@@ -331,15 +377,33 @@ def quintic_planner(
     MPC-generator tests run against: it ignores ``init_traj`` entirely, so any
     "the loop is secretly feeding itself" bug shows up as a discontinuity
     rather than being hidden by the previous plan.
+
+    A closed-loop property of ``waist_upright_ease_wp`` worth stating once:
+    under per-tick replanning the pitch/roll ease is RE-ANCHORED at the
+    measured pose on every tick.  The ease is a zero-slope quintic smoothstep,
+    so one 20 ms tick advances it by only ``s(1/k)`` of the remaining lean
+    (~5.8 % for ``k = 5``), and the next replan starts a fresh zero-slope
+    quintic from wherever the plant actually got to -- the analytic baseline
+    therefore recovers to upright roughly 3x slower in closed loop than its
+    own open-loop seed suggests.  This is a known, accepted property of the
+    stand-in, not a bug to compensate for; the anchored-command hold path
+    (``waist_upright_ease_wp=None`` under ``planned_yaw_bc``, which pins
+    pitch/roll at the PLANNED setpoint instead of easing from the measurement)
+    is unaffected.
     """
 
     def plan(req: PlanRequest) -> np.ndarray:
         goals: dict[str, tuple[str, float] | None] = {}
         aim: dict[str, np.ndarray] = {}
+        # The seed's yaw ramp aims at the same FUTURE-aware target the context
+        # token carries (``build_context_inputs``); both come from this
+        # snapshot through the one helper.
+        _t, aim_tth, aim_futures = aim_inputs_from_snapshot(req.snapshot, frame="env")
         for hand in HANDS:
             g = req.snapshot.goal[hand]
             if not g.active or req.hit_index.get(hand, -1) < 1:
                 goals[hand] = None
+                aim_tth.pop(hand, None)
                 continue
             goals[hand] = (g.drum_name, req.hit_index[hand] * req.dt)
             aim[hand] = np.asarray(g.position, float)
@@ -350,12 +414,15 @@ def quintic_planner(
             goals=goals,
             library=req.library,
             aim_targets=aim or None,
+            aim_tth=aim_tth,
+            aim_futures=aim_futures,
             dt=req.dt,
             joint_names=G1_UPPER_BODY_JOINTS,
             waist_cfg=waist_cfg,
             q_bounds=q_bounds,
             yaw_state=req.yaw_state if planned_yaw_bc else None,
             waist_setpoint=req.waist_setpoint if planned_yaw_bc else None,
+            waist_upright_ease_wp=waist_upright_ease_wp,
             slew_limit_eta=slew_limit_eta,
         )
         out = ws.init_traj
@@ -402,7 +469,8 @@ class MPCGenerator:
         self.rnea = rnea
         self.sim = sim or BatchedPDSim(
             PDSimConfig(dt=self.cfg.dt, ki=self.cfg.ki, ki_windup=self.cfg.ki_windup,
-                        kp_scale=self.cfg.kp_scale, kd_scale=self.cfg.kd_scale),
+                        kp_scale=self.cfg.kp_scale, kd_scale=self.cfg.kd_scale,
+                        saturate_effort=bool(self.cfg.saturate_effort)),
             device=self.device, dtype=dtype, rnea=rnea,
         )
         self.sdf = sdf or SdfPenalty(
@@ -410,12 +478,23 @@ class MPCGenerator:
         )
         self.q_bounds = urdf_position_limits(self.names)
         self._arm = {h: arm_slice(h, self.names) for h in HANDS}
-        #: Idle-arm home table; ``None`` keeps the historical hold-in-place seed.
+        #: Idle-cylinder library; ``None`` keeps the historical hold-in-place seed.
         #: The DEPLOYED loop has to park exactly like the training roller does or
         #: the model is asked at run time for something it was never trained on.
-        self.idle_home = resolve_idle_home(
-            self.cfg.idle_home_path, joint_names=self.names
+        idle_path = self.cfg.idle_cylinder_path
+        if idle_path is None and self.cfg.idle_home_path is not None:
+            idle_path = self.cfg.idle_home_path
+        self.idle_library = resolve_idle_cylinder_library(
+            idle_path, joint_names=self.names
         )
+        self.idle_cylinder = None
+        if self.idle_library is not None:
+            try:
+                self.idle_cylinder = derive_cylinder(self.kit, self.fk)
+            except Exception:
+                self.idle_cylinder = self.idle_library.cylinder
+        #: Legacy alias kept for PlanRequest / probe callers.
+        self.idle_home = self.idle_library
         #: (hand, drum, absolute hit time) -> the aim point drawn for that hit.
         #: Reset per episode; see ``MPCGenConfig.sticky_goal_point``.
         self._goal_cache: dict[tuple, np.ndarray] = {}
@@ -426,6 +505,13 @@ class MPCGenerator:
         #: Measured with ``hit_lead_s = 0.01`` (half a control period): 110
         #: recorded strikes on three clips that contain 55.
         self._consumed: dict[str, float] = {h: -1e18 for h in HANDS}
+
+    def _clip_init(self, init: np.ndarray) -> np.ndarray:
+        """Project a seed into ``q_bounds``.  No-op when ``clamp_init_to_box`` is off."""
+        if not self.cfg.clamp_init_to_box:
+            return init
+        lo, hi = self.q_bounds
+        return np.clip(init, lo, hi)
 
     # ------------------------------------------------------------ helpers --
     def _t(self, a) -> torch.Tensor:
@@ -460,7 +546,22 @@ class MPCGenerator:
             out[hand] = max(k, 1) if 0 <= k <= cap else -1
         return out
 
-    def _context_row(self, snap: GoalSnapshot) -> dict[str, np.ndarray]:
+    def _context_row(
+        self,
+        snap: GoalSnapshot,
+        q: np.ndarray,
+        *,
+        yaw_now: float | None = None,
+    ) -> dict[str, np.ndarray]:
+        # ``yaw_now`` overrides the measured waist yaw for the context's aim
+        # fields.  Under ``planned_yaw_bc`` the caller passes the PLANNED yaw
+        # BC -- the same carrier (``yaw_state`` / ``PlanRequest.yaw_state``)
+        # the seed's ramp starts from.  ``aim_yaw``'s dependence on
+        # ``yaw_current`` has two DISCRETE switches (the +/-40 deg reach gate
+        # and the 0.09 rad deadband), so evaluating the context at the
+        # measured yaw while the seed uses the planned one lets >0.09 rad of
+        # tracking error flip the context's base between "hold here" and full
+        # commitment while the seed does the other.
         ctx = build_context_inputs(
             self.kit,
             snap,
@@ -468,7 +569,14 @@ class MPCGenerator:
             num_future=self.cfg.num_future,
             device="cpu",
             dtype=torch.float64,
-            idle_home=self.idle_home,
+            idle_library=self.idle_library,
+            idle_cylinder=self.idle_cylinder,
+            fk=self.fk,
+            yaw_now=(
+                float(yaw_now) if yaw_now is not None
+                else q[self.names.index("waist_yaw_joint")]
+            ),
+            waist_cfg=self.waist_cfg,
         )
         return {
             k: getattr(ctx, k)[0].numpy().copy() for k in ctx.__dataclass_fields__
@@ -490,6 +598,10 @@ class MPCGenerator:
         """Fresh noised quintic seed for ``hands`` (and optionally the waist)."""
         goals: dict[str, tuple[str, float] | None] = {}
         aim: dict[str, np.ndarray] = {}
+        # Same future-aware aim inputs the context row is tokenized from, so
+        # the ramp this seed lands on is the value the head parameterizes
+        # against (see ``_context_row`` on why the two must not diverge).
+        _t, aim_tth, aim_futures = aim_inputs_from_snapshot(snap, frame="env")
         for hand in HANDS:
             g = snap.goal[hand]
             active = g.active and hit_index[hand] >= 1
@@ -498,25 +610,42 @@ class MPCGenerator:
             # is actually heading for.
             if active:
                 aim[hand] = np.asarray(g.position, float)
+            else:
+                aim_tth.pop(hand, None)
             goals[hand] = (g.drum_name, hit_index[hand] * self.cfg.dt) if (
                 active and hand in hands
             ) else None
-        ws = warmstart_trajectory(
-            q, qd,
+        ws_kw = dict(
             horizon=self.cfg.horizon,
             goals=goals,
             library=self.library,
             aim_targets=aim or None,
+            aim_tth=aim_tth,
+            aim_futures=aim_futures,
             dt=self.cfg.dt,
             joint_names=self.names,
             waist_cfg=self.waist_cfg,
             q_bounds=self.q_bounds,
             yaw_state=yaw_state if self.cfg.planned_yaw_bc else None,
             waist_setpoint=waist_setpoint if self.cfg.planned_yaw_bc else None,
+            waist_upright_ease_wp=self.cfg.waist_upright_ease_wp,
             slew_limit_eta=self.cfg.seed_slew_eta,
-            idle_home=self.idle_home,
+            idle_library=self.idle_library,
+            idle_cylinder=self.idle_cylinder,
+            fk=self.fk,
             idle_settle_wp=self.cfg.idle_settle_wp,
         )
+        ws = warmstart_trajectory(q, qd, **ws_kw)
+        if any(goals[h] is not None for h in HANDS):
+            terms = corrected_arm_terminals(
+                self.fk,
+                [{"ws": ws, "goals": goals, "aim": aim, "hit": hit_index,
+                  "sticks": None}],
+                steps=1, q_bounds=self.q_bounds, joint_names=self.names,
+                library=self.library,
+            )[0]
+            if terms:
+                ws = warmstart_trajectory(q, qd, terminal_arm=terms, **ws_kw)
         noised = self.noise.apply(
             ws.init_traj, rng, hit_index=ws.hit_index, q_bounds=self.q_bounds,
             joint_names=self.names,
@@ -549,6 +678,7 @@ class MPCGenerator:
                 waist_cfg=self.waist_cfg, q_bounds=self.q_bounds,
                 planned_yaw_bc=cfg.planned_yaw_bc,
                 slew_limit_eta=cfg.seed_slew_eta,
+                waist_upright_ease_wp=cfg.waist_upright_ease_wp,
             )
         )
         self._goal_cache = {}
@@ -556,6 +686,7 @@ class MPCGenerator:
         yaw_i = self.names.index("waist_yaw_joint")
         q_lo, q_hi = self.q_bounds
         waist_idx = [i for i, nm in enumerate(self.names) if nm.startswith("waist_")]
+        pr_idx = waist_pr_slice(self.names)
         jy_w = waist_idx.index(yaw_i)
         cmd_step_max = (
             None if cfg.cmd_slew_eta is None
@@ -593,10 +724,12 @@ class MPCGenerator:
         hit_index = self._hit_index(snap)
         yaw_state = (float(q[yaw_i]), float(qd[yaw_i]))
         waist_cmd = q[waist_idx].copy()
+        pr_ema = q[pr_idx].copy()
         init, _, _yr = self._seed(
             q, qd, snap, hit_index, HANDS, rng, with_waist=True, yaw_state=yaw_state,
             waist_setpoint=waist_cmd,
         )
+        init = self._clip_init(init)
 
         samples: list[MPCSample] = []
         q_hist = [q.copy()]
@@ -618,6 +751,7 @@ class MPCGenerator:
         diverged = False
         diverged_step = -1
         n_frozen = 0
+        n_bounced = 0
 
         for step in range(steps):
             # ---- divergence guard (prerequisite fix A) ----
@@ -629,7 +763,10 @@ class MPCGenerator:
                 break
             t_now = t_start + step * dt
             masks = self._masks(hit_index)
-            ctx_row = self._context_row(snap)
+            ctx_row = self._context_row(
+                snap, q,
+                yaw_now=(yaw_state[0] if cfg.planned_yaw_bc else None),
+            )
             min_sdf = (
                 self._clearance(q, snap, hit_index, recent_drum)
                 if cfg.record_min_sdf
@@ -670,7 +807,10 @@ class MPCGenerator:
                 )
 
             # ---- plan, then execute exactly one control tick ----
+            init = self._clip_init(init)
             req = PlanRequest(
+                idle_library=self.idle_library,
+                idle_cylinder=self.idle_cylinder,
                 idle_home=self.idle_home,
                 q=q.copy(), qd=qd.copy(), init_traj=init, snapshot=snap, kit=self.kit,
                 library=self.library, masks=masks, hit_index=dict(hit_index),
@@ -689,6 +829,7 @@ class MPCGenerator:
             # both arms) was measured to diverge: the waist stops tracking its
             # aim for 5 ticks at a time and the idle arm stops being replanned
             # at all.
+            waist_frozen = False
             if cfg.freeze_wp > 0 and step > 0:
                 hit_any = False
                 for h in HANDS:
@@ -698,6 +839,7 @@ class MPCGenerator:
                         hit_any = True
                 if hit_any and cfg.freeze_waist:
                     traj[:, waist_idx] = init[:, waist_idx]
+                    waist_frozen = True
                 n_frozen += int(hit_any)
 
             if Minv is None or (step % max(int(cfg.minv_refresh), 1) == 0):
@@ -749,6 +891,15 @@ class MPCGenerator:
                 cmd = prev_cmd + np.clip(cmd - prev_cmd, -cmd_step_max, cmd_step_max)
             if cfg.clamp_cmd_to_box:
                 cmd = np.clip(cmd, q_lo, q_hi)
+            if cfg.waist_pr_ema and not waist_frozen:
+                pr_ema = np.asarray(
+                    update_waist_pr_ema(
+                        pr_ema, cmd[pr_idx],
+                        alpha=float(cfg.waist_pr_ema_alpha),
+                        leak=float(cfg.waist_pr_ema_leak),
+                    ),
+                    float,
+                )
             if cmd is not traj[0]:
                 traj = traj.copy()
                 traj[0] = cmd
@@ -791,6 +942,11 @@ class MPCGenerator:
             # ---- per-hand post-hit reset ----
             t_next = t_start + (step + 1) * dt
             fired = [h for h in HANDS if hit_index[h] == 0]
+            if fired and self.cfg.bounce:
+                q, qd = self._bounce_fired(q, qd, fired, snap, rng)
+                q_hist[-1] = q.copy()
+                qd_hist[-1] = qd.copy()
+                n_bounced += len(fired)
             if imp is not None:
                 imp.observe_fired(torch.tensor(
                     [["left" in fired, "right" in fired]], device=self.device))
@@ -822,7 +978,7 @@ class MPCGenerator:
             # goals, so the park pose is chosen at the yaw the waist is heading
             # for.  Hands that are re-goaling this tick are overwritten below.
             idle_hands = tuple(h for h in HANDS if new_index[h] < 0)
-            if self.idle_home is not None and cfg.park_idle_every_tick and idle_hands:
+            if self.idle_library is not None and cfg.park_idle_every_tick and idle_hands:
                 parked, _, _pyaw = self._seed(
                     q, qd, snap, new_index, (), rng, with_waist=False,
                     yaw_state=yaw_state, waist_setpoint=waist_cmd,
@@ -830,24 +986,22 @@ class MPCGenerator:
                 for h in idle_hands:
                     init[:, self._arm[h]] = parked[:, self._arm[h]]
             if reset:
-                both = len(reset) == 2
                 fresh, _, _fresh_yaw = self._seed(
-                    q, qd, snap, new_index, tuple(reset), rng, with_waist=both,
+                    q, qd, snap, new_index, tuple(reset), rng, with_waist=True,
                     yaw_state=yaw_state, waist_setpoint=waist_cmd,
                 )
                 for h in reset:
                     init[:, self._arm[h]] = fresh[:, self._arm[h]]
-                if both:
-                    widx = [i for i, nm in enumerate(self.names) if nm.startswith("waist_")]
-                    init[:, widx] = fresh[:, widx]
-                    # ``_fresh_yaw`` is the (H+1,) reference of the reseed; its
-                    # row 0 is the BC we just handed in, so the shifted plan's
-                    # own row 0 stays the right carry-forward state.
-                    yaw_state = (
-                        float(init[0, yaw_i]),
-                        float((init[1, yaw_i] - init[0, yaw_i]) / dt) if H > 1 else 0.0,
-                    )
-                    waist_cmd = init[0, waist_idx].copy()
+                # Waist rebuilds whenever any hand resets (not only both): the
+                # aim was refreshed with the new snapshot above, and the seed's
+                # waist columns track that aim -- same pin as MPCRoller._regoal.
+                widx = [i for i, nm in enumerate(self.names) if nm.startswith("waist_")]
+                init[:, widx] = fresh[:, widx]
+                yaw_state = (
+                    float(init[0, yaw_i]),
+                    float((init[1, yaw_i] - init[0, yaw_i]) / dt) if H > 1 else 0.0,
+                )
+                waist_cmd = init[0, waist_idx].copy()
                 for h in reset:
                     hit_index[h] = new_index[h]
             for h in HANDS:
@@ -855,6 +1009,7 @@ class MPCGenerator:
                 # goal is gone goes idle.
                 if not snap.goal[h].active:
                     hit_index[h] = -1
+            init = self._clip_init(init)
 
         return EpisodeResult(
             samples=samples,
@@ -866,6 +1021,7 @@ class MPCGenerator:
             diverged=diverged,
             diverged_step=diverged_step,
             frozen_ticks=int(n_frozen),
+            bounced_hands=int(n_bounced),
         )
 
     # ------------------------------------------------------------ plumbing --
@@ -941,33 +1097,6 @@ class MPCGenerator:
             future={h: [fix(h, g) for g in v] for h, v in snap.future.items()},
         )
 
-    def _stick(self, snap: GoalSnapshot) -> GoalSnapshot:
-        """Hold each scheduled hit's jittered aim point for the life of that hit.
-
-        Keyed by ``(hand, drum, absolute hit time)``, which identifies the hit
-        uniquely across the clip, so the goal token a plan is refining does not
-        move under it between ticks.  See ``MPCGenConfig.sticky_goal_point``.
-        """
-        if not self.cfg.sticky_goal_point:
-            return snap
-        cache = self._goal_cache
-        eps = 1e-6
-
-        def fix(hand: str, g):
-            if not g.active:
-                return g
-            key = (hand, int(g.drum), round(snap.t_now + float(g.time_to_hit), 6))
-            hitp = cache.get(key)
-            if hitp is None:
-                cache[key] = hitp = np.asarray(g.position, float).copy()
-            return replace(g, position=hitp)
-
-        return GoalSnapshot(
-            t_now=snap.t_now,
-            goal={h: fix(h, g) for h, g in snap.goal.items()},
-            future={h: [fix(h, g) for g in v] for h, v in snap.future.items()},
-        )
-
     def _apply_lead(self, snap: GoalSnapshot) -> GoalSnapshot:
         """Pull every scheduled hit ``cfg.hit_lead_s`` seconds earlier.
 
@@ -993,6 +1122,46 @@ class MPCGenerator:
             future={h: [adj(g) for g in v] for h, v in snap.future.items()},
         )
 
+    def _bounce_fired(
+        self,
+        q: np.ndarray,
+        qd: np.ndarray,
+        fired: list[str],
+        snap: GoalSnapshot,
+        rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """BPTT placeholder contact: reflect each firing hand's tip-normal speed.
+
+        ``q`` is left where the PD put it (plus the config's tiny joint noise);
+        only ``qd`` changes in the honest no-noise case.  Lazy-imports
+        :mod:`amortized_opt.train_cost` so the historical generator path never
+        pays for that module.
+        """
+        from .train_cost import BounceConfig, apply_bounce
+
+        spec = self.cfg.bounce
+        cfg = BounceConfig() if spec is True else spec
+        q_lo, q_hi = self.q_bounds
+        qt = self._t(q)[None]
+        qdt = self._t(qd)[None]
+        gen = torch.Generator()
+        gen.manual_seed(int(rng.integers(0, 2**63 - 1)))
+        for h in fired:
+            g = snap.goal[h]
+            if not g.active:
+                continue
+            normal = self._t(self.kit.axes[int(g.drum)])[None]
+            hi = torch.tensor(
+                [0 if h == "left" else 1], device=self.device, dtype=torch.long
+            )
+            qt, qdt = apply_bounce(
+                qt, qdt, fk=self.fk, rnea=self.rnea, hand_index=hi,
+                normal=normal, cfg=cfg, generator=gen,
+            )
+        qn = np.clip(qt[0].detach().cpu().numpy(), q_lo, q_hi)
+        vdn = qdt[0].detach().cpu().numpy()
+        return qn, vdn
+
     def _clearance(
         self,
         q: np.ndarray,
@@ -1002,7 +1171,7 @@ class MPCGenerator:
     ) -> float:
         """Signed clearance of the measured pose, with the strike exemptions.
 
-        Two drums are exempt per hand: the one it is about to strike (its tip
+        Two drums are exempt per hand: the one it is about to strike (the stick
         is meant to reach the head) and the one it has just struck, for
         ``departure_exempt_wp`` ticks afterwards. Without the second, every
         post-hit tick reports a "collision" of about one tip radius purely
@@ -1144,16 +1313,28 @@ def collate(samples: list[MPCSample], *, device=None, dtype: torch.dtype = torch
         np.stack([getattr(s, key) for s in samples]), device=device, dtype=dtype
     )
     state = torch.cat([st("q"), st("qd")], dim=-1)
+    tau0 = lambda key: torch.as_tensor(  # noqa: E731
+        [getattr(s, key) for s in samples], device=device, dtype=dtype
+    )
+    tau0_l, tau0_r = tau0("tau0_left"), tau0("tau0_right")
+    # ``hit_tth`` is not on the record and does not need to be: it is what
+    # ``MPCGenerator._masks`` passed, which ``build_waypoint_masks`` defines as
+    # ``tau0`` on an ACTIVE hand and 0 on an idle one -- and ``hit_index`` is
+    # stored, so both cases are recoverable exactly.
+    act = lambda hand: torch.as_tensor(  # noqa: E731
+        [float(s.hit_index[hand] >= 0) for s in samples], device=device, dtype=dtype
+    )
     masks = WaypointMasks(
         tau_left=st("tau_left"),
         tau_right=st("tau_right"),
-        tau0_left=torch.as_tensor([s.tau0_left for s in samples], device=device, dtype=dtype),
-        tau0_right=torch.as_tensor([s.tau0_right for s in samples], device=device, dtype=dtype),
+        tau0_left=tau0_l,
+        tau0_right=tau0_r,
         elem_mask=st("elem_mask"),
         token_mask=torch.as_tensor(
             np.stack([s.token_mask for s in samples]), device=device, dtype=torch.bool
         ),
         point_mask=st("point_mask"),
+        hit_tth=torch.stack([tau0_l * act("left"), tau0_r * act("right")], dim=-1),
     )
     keys = samples[0].context.keys()
     ctx: dict[str, torch.Tensor] = {}

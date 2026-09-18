@@ -15,38 +15,71 @@ group          what it prices
 ``terminal``   contact point inside the legal hit region, impact
                velocity against the commanded one, stick elevation
                band.  Per hand, at that hand's own hit index.
-``collision``  drum bodies, under-drum volumes and self (torso
-               capsule + head sphere) against tip / shaft / wrist
-               spheres, with the harness's target-drum and
-               departure exemptions.
+``collision``  stick capsule (butt→tip) and wrist sphere against
+               every drum body / under-volume, plus the same
+               capsule and wrist against the torso capsule and
+               head sphere.  Target-drum and departure exemptions
+               cover the stick capsule (you have to touch a drum
+               to hit it); the wrist is never exempted.
 ``torque``     RNEA (armature ON) at the sub-sampled states against
                ``eta_torque`` x the Isaac effort limits.  Priced twice: a MEAN
-               over the (knot, joint) hinge elements, plus an optional
-               SMOOTH-MAX over the same elements (``w_torque_peak``) because the
-               harness gate is a zero-tolerance max -- see :meth:`FusedCost._torque`.
-               The two halves are SEPARATE constraint groups (``torque`` and
-               ``torque_peak``) with independent multipliers.
+               softplus warning over the (knot, joint) hinge elements (fixed
+               ``cfg.w_torque``, never × λ), plus an optional SMOOTH-MAX of the
+               ReLU excess (``w_torque_peak`` × ``λ_peak``) because the harness
+               gate is a zero-tolerance max -- see :meth:`FusedCost._torque`.
+               Per-actuator-class AL groups (``torque_*``) multiply the ReLU
+               residual (``live``), which is already zero when feasible.
+               TRACKING half (off by default, ``w_track_torque`` /
+               ``w_track_torque_peak``): the same softplus warning on
+               ``tau_rnea + tau_fb``, the torque the PD servo DEMANDS while
+               tracking the plan.  It shares the ``torque`` term key and, when
+               priced, supplies the ``torque`` group's raw violation -- see
+               :meth:`FusedCost._track_torque` and the note at the top of
+               :mod:`amortized_opt.pd_sim`.
 ``effort``     optional ``w_effort`` x mean ``tau^2`` on the same RNEA
                torques -- an energy proxy, faded to zero over the
                last ``effort_fade_wp`` waypoints before each hand's
                hit so it cannot fight the impact-speed term.  A plain
                objective: no multiplier.
+``torque_static``  optional ``w_torque_static`` x mean softplus on
+               ``|RNEA(q,0,0)|`` against the effort limits -- a
+               gravity-only static proxy with no augmented-Lagrangian
+               multiplier.  With ``torque_static_only`` the coupled
+               RNEA hinge and its torque AL groups are skipped.
 ``velocity``   per-segment max ``|qd|`` against ``eta_velocity`` x
                the speed ratings.
-``joint_box``  sub-sampled ``q`` against ``eta_position`` x the
+``joint_box``  decoder **waypoints** against ``eta_position`` x the
                posture-narrowed URDF box, optionally with the waist
                PITCH/ROLL rows shrunk to ``+-waist_pr_box`` (yaw
                untouched -- the torso must spin to reach the kit).
+               The warning is a mean softplus; the peak half (when
+               enabled) is a **smooth max** of per-(waypoint, joint)
+               ReLU hard excess (max-shaped dense grad).
 ``smooth``     closed-form ``int v^2 / a^2 / j^2`` per segment.
 ``posture``    mid-range well, elbow-down preference, anti-axial
                twist, and an optional UPRIGHT well on waist
                pitch/roll (``w_waist_upright``; yaw excluded).
-============== ====================================================
+               With ``waist_pr_ref`` set the well is
+               ``mean((q_pr - stopgrad(sp))²)`` -- a decoder tax,
+               not an encoder teacher.
+``waist_pr_terminal``
+               V_f on P/R at the NEARER active hit knot (min of the
+               two hands' hit_index), always vs 0.  The later hit is
+               only context; this is the strike the committed prefix
+               is for.  Own objective term; not mixed into ``posture``.
+``waist_pr_band``
+               decoder waist P/R vs ``stopgrad(encoder sp)``, peak
+               rad.  Own AL group (not mixed into ``posture``).
+=============== ====================================================
 
-The first five are *constraint* groups: they carry an augmented-Lagrangian
-multiplier (see :mod:`amortized_opt.lagrangian`) and report a raw violation
-measure alongside the softplus penalty -- six multipliers in all, since the
-torque group's max-shaped half carries its own (``torque_peak``).  The last two
+Limit families (torque / velocity / joint_box, split by actuator class)
+plus collision, terminal, ``torque_peak``, ``collision_peak`` and
+``waist_pr_band`` are *constraint* groups: they carry an
+augmented-Lagrangian multiplier (see :mod:`amortized_opt.lagrangian`) that
+multiplies the ReLU residual (``CostTerms`` live / violations), which is
+already zero when feasible.  The softplus warning sits at a fixed
+``CostConfig.w_*`` (plus non-λ curriculum: ``limit_alpha``, terminal
+sub-ramps, waist box, peak alphas).  Smooth / posture / aim / rate wells
 are plain objective terms.
 
 Hinges
@@ -55,10 +88,10 @@ Hinges
 Every limit is ``softplus((x - lim) / beta) * beta`` as the plan specifies, with
 ``lim`` a *conservative* fraction of the hard limit (torque 80 %, velocity 70 %,
 joint box 80 %).  Softplus is strictly positive, so a perfectly feasible sample
-still pays ``beta * log 2`` per element; that constant is what buys gradient on
-the safe side of the limit, and it is why the diagnostics also report the raw
-``relu(x - hard_limit)`` excess, which *is* zero when feasible and is what the
-Lagrange multipliers are driven by.
+still pays ``beta * log 2`` per element; that constant is the warning that
+buys gradient on the safe side of the limit, priced at ``cfg.w_*`` and never
+by λ.  The hard wall is standard PHR: ``λ [g]₊ + (pen / 2) [g]₊²`` on the
+raw ``relu(x - hard_limit)`` excess, which *is* zero when feasible.
 
 Normalization
 -------------
@@ -75,6 +108,7 @@ See :meth:`FusedCost._torque`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Sequence
@@ -87,12 +121,26 @@ from .constants import (
     CONTROL_DT,
     G1_UPPER_BODY_JOINTS,
     HEAD_SPHERE,
+    PD_SUBSTEPS,
     PELVIS_IN_ENV,
+    SHAFT_TIP_CLEAR,
+    STICK_LENGTH,
+    STICK_MOUNT_POS_LEFT,
+    STICK_MOUNT_POS_RIGHT,
     STICK_RADIUS,
     TIP_RADIUS,
     TORSO_CAPSULE,
     WRIST_RADIUS,
     ready_joint_pos,
+    static_torque_tighten_divisors,
+    torque_limit_eta_scale,
+)
+from .lagrangian import (
+    ACTUATOR_SEGMENTS,
+    ACTUATOR_SEGMENT_NAMES,
+    LIMIT_FAMILIES,
+    TERM_FOR_GROUP,
+    limit_group_name,
 )
 from .fk import (
     ChainFK,
@@ -101,11 +149,14 @@ from .fk import (
     stick_shaft_offsets,
     stick_tip_offset,
 )
+from .idle_cylinder import tip_in_torso
 from .limits import (
     ETA_POSITION,
     ETA_TORQUE,
     ETA_VELOCITY,
+    available_torque_torch,
     isaac_effort_limits,
+    scale_soft_wrist_effort,
     isaac_velocity_limits,
     urdf_position_limits,
 )
@@ -115,13 +166,22 @@ from .sdf import (
     point_capsule_sdf,
     point_cylinder_sdf,
     point_sphere_sdf,
+    segment_cylinder_sdf,
+    segment_hit_region,
+    segment_segment_sdf,
 )
+# Bound separately from ``segment_segment_sdf`` so the stick-stick "default
+# off" sabotage test can patch the CROSS-HAND pair without also shifting
+# stick-vs-torso / stick-vs-head, which use the same primitive.
+cross_hand_sdf = segment_segment_sdf
 from .strike import (
+    CYMBAL_CONTACT_SIGMA_FALLBACK,
     STICK_ELEV_MAX_DEG,
     STICK_ELEV_MIN_DEG,
     STICK_TIP_SIGMA,
     contact_sigma_candidates,
     shaft_hit_allowed,
+    strike_axial_limits,
     strike_elevation_required,
 )
 from .tspline import TrajectorySpline, TrajectorySplineBuilder
@@ -133,6 +193,7 @@ __all__ = [
     "StrikeContext",
     "axial_twist_directions",
     "drum_heads_from_context",
+    "stick_cost_from_context",
     "smooth_max",
     "strike_context_from_cases",
 ]
@@ -142,6 +203,15 @@ _HANDS = ("left", "right")
 #: ``contact_sigma_candidates("cymbal_left")`` -> (0.10, 0.15, 0.20, 0.05), i.e.
 #: the bead plus the 15 cm of shaft behind it the plan calls out.
 SHAFT_SIGMAS: tuple[float, ...] = contact_sigma_candidates("cymbal_left")
+
+#: Peak groups whose differentiable hard price is already
+#: ``λ * cfg.w_*_peak * smooth_max(ReLU)``.  The linear ``λ * live`` add
+#: in :meth:`FusedCost.forward` skips these so the peak is not counted
+#: twice (AL ``live`` / PHR still use the horizon **hard max**).  PHR
+#: ``pen/2 V²`` still applies.
+_PEAK_AL_GROUPS = frozenset({
+    "torque_peak", "velocity_peak", "collision_peak", "joint_box_peak",
+})
 
 
 # ============================================================== config ======
@@ -154,9 +224,9 @@ class CostConfig:
     declared dataclass fields -- see the per-field notes.  The absolute
     magnitudes are NOT trajopt's: trajopt prices hard constraints through
     ``mu_*`` slack penalties in the 1e5..1e9 range because they must outbid a
-    jerk Hessian near 3e8.  Here the constraint groups are balanced by the
-    augmented-Lagrangian multipliers instead, so the weights below are the
-    *relative* prices at lambda = 1 and are O(1)-ish.
+    jerk Hessian near 3e8.  Here the hard wall is ``λ [g]₊ + (pen/2)[g]₊²``
+    and the softplus warning sits at a fixed ``w_*`` (never × λ), so the
+    weights below are the *relative* warning prices and are O(1)-ish.
     """
 
     # ---------------------------------------------------------- sampling --
@@ -215,10 +285,17 @@ class CostConfig:
     #: Distance from the contact point to the legal hit region.  This is the
     #: plan's "distance from the closest point within the drum head ring".
     w_terminal_region: float = 200.0
-    #: Soft pull to the AIM point once inside the region.  ``validate()`` zeroes
-    #: trajopt's ``w_strike_position``; kept at 0 here for the same reason (the
-    #: disk is what the RL detector scores) but exposed.
+    #: Soft in-plane pull toward the AIM (not the geometric head centre) after
+    #: a deadband.  ``CostConfig`` keeps this at 0 so ``validate()`` stays
+    #: bit-identical with trajopt (which zeroes ``w_strike_position``);
+    #: :func:`~amortized_opt.train_cost.phase2_cost_config` turns on a weak
+    #: weight so training does not park on the rim.  Priced as a plain
+    #: objective -- it does **not** ride ``lam_terminal``.
     w_terminal_aim: float = 0.0
+    #: In-plane metres inside which ``w_terminal_aim`` is idle.  Matches the
+    #: eval harness's 2 cm hit slack: closer than this, MPC can finish the
+    #: strike.
+    terminal_aim_deadband_m: float = 0.02
     #: Impact velocity, split normal / tangential to the commanded direction.
     w_terminal_velocity: float = 20.0
     terminal_a_normal: float = 1.0
@@ -227,13 +304,19 @@ class CostConfig:
     #: direction cosine, both of which a zero tangential weight leaves unpriced.
     terminal_a_tangential: float = 0.14
     w_terminal_elev: float = 5.0
-    terminal_axial_tol: float = 0.02   # m, harness's on-head axial band
+    #: Aim-frame axial band of the legal hit cylinder (outward normal).  Defaults
+    #: to the interior 1 cm slab from the aim to the head surface; see
+    #: :func:`~amortized_opt.strike.strike_axial_limits`.
+    terminal_axial_lo: float = field(default_factory=lambda: strike_axial_limits()[0])
+    terminal_axial_hi: float = field(default_factory=lambda: strike_axial_limits()[1])
     elev_min_deg: float = STICK_ELEV_MIN_DEG
     elev_max_deg: float = STICK_ELEV_MAX_DEG
-    #: ``"softmin"`` scores the best contact point along the legal stick span
-    #: for shaft-hittable drums (the plan's "the entire stick up to ~15 cm from
-    #: the tip will work"); ``"spec"`` uses the strike's own ``contact_sigma``,
-    #: which is what the harness scores.
+    #: ``"softmin"`` (default) scores the playing-shaft capsule on cymbals /
+    #: hi-hat -- the exact min of the legal-region hypot over
+    #: :func:`~amortized_opt.strike.shaft_hit_sigma_range`, softened over the
+    #: same critical points -- and the bead on pads.  ``"spec"`` collapses the
+    #: capsule to the strike's own ``contact_sigma`` (ablation).  Eval, probe
+    #: and the RL scorer always use the capsule, matching ``"softmin"``.
     contact_mode: str = "softmin"
     contact_softmin_temp: float = 0.01  # m
     #: ``"fd_coarse"`` = ``(p(q_k) - p(q_{k-1})) / dt`` -- the harness /
@@ -244,52 +327,47 @@ class CostConfig:
     w_collision_drum: float = 100.0
     w_collision_under: float = 100.0
     w_collision_self: float = 100.0
-    #: Price on the SMOOTH-MAX of the collision hinge, alongside the three
-    #: mean-reduced sub-costs above.  The exact counterpart of
-    #: ``w_torque_peak``, and for the same reason: ``ok_collision`` is a
-    #: zero-tolerance check that no contact point penetrates any drum, while
-    #: the mean is diluted by ``n_seen`` = ``2 x S x P x D`` -- ~2 100 elements
-    #: at bucket 25 and ~4 200 at bucket 50 -- of which the overwhelming
-    #: majority are stick points nowhere near the drum they are being scored
-    #: against.  A single point 30 mm inside a drum head therefore moves the
-    #: mean by ~1e-5 while failing the case outright.
+    #: Price on the CROSS-HAND (stick vs stick) collision mean.  The three
+    #: weights above score one hand's stick capsule and wrist against the DRUMS
+    #: and against the torso/head; the two hands' own geometry was never
+    #: compared, so nothing in the cost ever forbade the two sticks from passing
+    #: through each other.  This is that term.
     #:
-    #: UNLIKE the three means above, this half reduces the raw PENETRATION, not
-    #: the margin-softplus -- ``smooth_max`` over ``max(-sdf, 0)``.  Peaking the
-    #: hinge was tried and measured worse than the mean it was meant to fix
-    #: (2.9x gate separation against 3.9x): the softplus floors at 0.0066 m for
-    #: an element at zero clearance, every clean sample pays it, and a max over
-    #: a floor is mostly floor.  The penetration is exactly zero on a clear
-    #: element and separates 5.0x.  It is also what ``ok_collision`` thresholds
-    #: -- ``pen_count == 0``, no margin, no smoothing.  The margin and the
-    #: smoothing belong to the mean, whose job is dense shaping on the safe
-    #: side; this half's job is the gate.  See :meth:`FusedCost._collision`.
+    #: A capsule pair, same geometry the per-hand block uses against the drums:
+    #: the full 0.40 m stick plus the two wrist balls -- see
+    #: :func:`~amortized_opt.sdf.segment_segment_sdf`.
     #:
-    #: The analogy to ``torque_peak`` is REAL but WEAKER, and the difference is
-    #: worth stating: torque violations are genuinely sparse (~0.27 % of ~850
-    #: elements at the median), so a mean truly cannot see them, and the peak
-    #: separates that gate 26x against the mean's 3.4x.  Collision violations
-    #: are NOT sparse -- measured on the champion's 243-case grid, a failing
-    #: case has a median of 10 penetrating elements at a median 35 mm depth --
-    #: so the mean does partially see them.  Expect a smaller win.
-    #:
-    #: ZERO by default, so every existing checkpoint and the section-3
-    #: validation weights stay bit-identical, and the smooth-max is not even
-    #: computed.  Scale: ``raw`` here is METRES OF PENETRATION -- 0 on a clear
-    #: sample, ~0.027 at the median failing case -- so a weight around 500 puts
-    #: the failing half around 14 against a live ``terminal`` of ~65 and a
-    #: collision mean of ~1, while a clean sample pays exactly nothing.  Priced
-    #: by its OWN augmented-Lagrangian group (``collision_peak``), NOT by
-    #: ``weights["collision"]``.
+    #: ZERO by default, so every existing checkpoint and every live run is
+    #: bit-identical: at zero the term contributes an exact ``0.0 *`` product,
+    #: and the cross-hand hinge is kept OUT of the shared ``collision_peak`` /
+    #: ``viol["collision"]`` / ``collision_min_sdf`` reductions (it joins them
+    #: only once the weight is positive).  The diagnostics ``collision_stick``
+    #: and ``collision_stick_min_sdf`` are computed either way, so a run can
+    #: measure the cross-hand clearance before paying for it.  Scale: the raw is
+    #: the same margin-softplus, in metres, that ``w_collision_self`` prices.
+    w_stick_stick: float = 0.0
+    #: TIP LATERAL ORDERING (plain objective, not AL).  Softplus hinge on
+    #: ``margin - (tip_L.y - tip_R.y)`` in the torso frame, so reversed tips
+    #: (left tip more rightward than right tip) pay.  Distinct from
+    #: ``w_stick_stick``, which prices capsule clearance -- sticks can swap
+    #: sides while staying physically separated.  ZERO by default (bit-
+    #: identical totals); diagnostics ``tip_lateral_min`` /
+    #: ``tip_crossover_max`` are computed either way.
+    w_tip_crossover: float = 0.0
+    #: Metres of required ``tip_L.y - tip_R.y`` before the hinge is zero.
+    #: 0 means any reversed ordering is penalized.
+    tip_crossover_margin: float = 0.0
+    #: Softplus temperature (metres) for the tip-ordering hinge.
+    beta_tip_crossover: float = 0.01
+    #: Price on a smooth max of ReLU penetration over scored pairs, alongside
+    #: the three mean softplus sub-costs.  AL ``live`` stays the per-sample
+    #: **hard max** penetration (``ok_collision``).  ZERO by default.
+    #: See :meth:`FusedCost._collision`.
     w_collision_peak: float = 0.0
-    #: ``"pnorm"`` / ``"lse"``, exactly as ``torque_peak_mode``.
+    #: Differentiable peak shape for ``raw["collision_peak"]``.
     collision_peak_mode: str = "pnorm"
-    #: p-norm exponent.  The reduction runs on ``h / max(h)`` so the exponent
-    #: never sees a value above 1 and cannot overflow fp32.
     collision_peak_p: float = 12.0
     #: LSE temperature, METRES.  Only read when ``collision_peak_mode == "lse"``.
-    #: Two decades below ``torque_peak_temp`` because this hinge is in metres,
-    #: not newton-metres.
     collision_peak_temp: float = 5.0e-4
     #: Waypoints at the end of a hand's horizon whose contact geoms are exempt
     #: from the target drum, and at the start exempt from the drum the pose is
@@ -298,37 +376,65 @@ class CostConfig:
     start_exempt_waypoints: int = 2
     shaft_samples: int = 4
 
+    # ---- torque physics curriculum (level A -> full RNEA) -----------------
+    #: ``"full"`` -- standard coupled RNEA in the torque hinge.  ``"diag_grav"``
+    #: -- per-joint ``diag(M(q)) @ qdd + g(q)`` (no Coriolis, no off-diagonal
+    #: inertia).  ``"diag_grav_frozen"`` -- same with ``diag(M(q_ready))`` cached
+    #: at build (cheap).  Blend to full RNEA via ``weights["torque_full_blend"]``.
+    torque_physics: str = "full"
+
     # ---------------------------------------------------------- limits ----
     w_torque: float = 1.0
-    #: Price on the SMOOTH-MAX of the torque hinge, alongside ``w_torque``'s
-    #: mean.  ``ok_torque`` is a zero-tolerance max against the hard effort
-    #: limits, but the mean is diluted by ~850 elements: on the recorded eval
-    #: CSVs of the phase-2 failures the median case is over on ONE (knot, joint)
-    #: element out of ~850 (0.27 %; p90 0.51 %, worst 1.5 %) by a median
-    #: 0.87 N*m -- which moves the mean by ~0.3 % and fails the whole case.  The
-    #: mean literally cannot see what the gate checks.  ZERO by default so the
-    #: section-3 validation weights (pinned by the cost-validation tests) and
-    #: every existing checkpoint keep bit-identical behaviour; a training config
-    #: turns it on.  This half is scaled by its OWN group multiplier
-    #: ``weights["torque_peak"]`` -- an augmented-Lagrangian group driven by the
-    #: MAX raw violation, NOT by ``weights["torque"]``, which integrates a mean
-    #: ~n_valid times smaller and has no idea the peak exists.
+    #: Price on a smooth max of ReLU hard torque excess, alongside ``w_torque``'s
+    #: mean softplus.  ``ok_torque`` is a zero-tolerance max; the priced half
+    #: is ``λ_peak * w_torque_peak * smooth_max(ReLU(|τ|-lim))`` so the worst
+    #: cells share gradient without one-hot active-set jumps.  AL ``live`` for
+    #: this group stays the horizon **hard max**.  ZERO by default.
     #: See :meth:`FusedCost._torque`.
     w_torque_peak: float = 0.0
-    #: ``"pnorm"`` -- ``(sum h^p)^(1/p)``, scale-equivariant, always an
-    #: OVER-estimate of the max by at most ``n_valid^(1/p)`` (1.9x at p = 12,
-    #: n = 850, and only when every element is at the max).
-    #: ``"lse"`` -- ``T * logsumexp(h / T)``, over-estimates by at most
-    #: ``T * log(n_valid)`` (0.34 N*m at T = 0.05, n = 850) but that bias is
-    #: ADDITIVE, so it does not vanish as the peak shrinks.  ``pnorm`` is the
-    #: default for exactly that reason.
+    #: Differentiable peak shape for ``raw["torque_peak"]``.
     torque_peak_mode: str = "pnorm"
-    #: p-norm exponent.  12 keeps the single-violator estimate within ~1 % of
-    #: the true max while staying far from fp32 overflow (the reduction is
-    #: computed on ``h / max(h)``, so the exponent never sees a number > 1).
     torque_peak_p: float = 12.0
     #: LSE temperature, N*m.  Only read when ``torque_peak_mode == "lse"``.
     torque_peak_temp: float = 0.05
+
+    # ---- TRACKING TORQUE (the demand the PD controller actually makes) ----
+    #: Price on the MEAN of the tracking-torque hinge -- the same softplus, at
+    #: the same ``beta_torque``, on ``|tau_rnea + tau_fb|`` instead of
+    #: ``|tau_rnea|``.  ``tau_fb`` is the estimated PD feedback demand
+    #: (:func:`~amortized_opt.pd_sim.feedback_torque`), which is what actually
+    #: saturates at deployment: the plan's own RNEA can be clean on every joint
+    #: while the servo tracking it asks for 6x the wrist rating.
+    #:
+    #: When either tracking weight is positive the ``torque`` constraint group's
+    #: RAW VIOLATION switches to the tracking excess -- ONE multiplier on ONE
+    #: constraint, the one that describes the hardware.  ``w_torque`` /
+    #: ``w_torque_peak`` keep working unchanged (they are the rollback), and at
+    #: the default 0.0 for both weights below nothing here is computed at all:
+    #: the whole block is behind a python branch, so the cost is bit-for-bit and
+    #: cost-free.
+    w_track_torque: float = 0.0
+    #: Price on the SMOOTH-MAX of the same hinge, by the same argument that
+    #: created ``w_torque_peak`` (the gate is a max, the mean cannot see it).
+    #: Unlike ``w_torque_peak`` this is a FIXED weight with no
+    #: augmented-Lagrangian multiplier of its own -- it rides the per-joint
+    #: ``limit_alpha`` curriculum ramp the mean hinges use, and nothing else.
+    w_track_torque_peak: float = 0.0
+    #: Kernel identification (:func:`~amortized_opt.pd_sim.extract_torque_kernels`):
+    #: maximum FIR length, and the fraction of a joint's peak tap below which
+    #: the tail is truncated.
+    track_torque_taps: int = 24
+    track_torque_tol: float = 1.0e-3
+    #: Which substep of a control tick the estimate reports.  ``"max"`` -- the
+    #: worst substep, which is what an effort limit limits.  ``"last"`` is
+    #: exactly LTI but reports ~0 on the wrists (see ``simulate_pd``).
+    track_torque_reduce: str = "max"
+    #: Scoring-only multiplier on the four soft wrist pitch/yaw effort ratings
+    #: (Isaac 5 N*m).  ``1.0`` = bit-identical to the hardware table.  ``2.0``
+    #: allows brief reflected-Kd demand spikes in the cost hinge and (when the
+    #: eval scorer is built with the same value) ``ok_torque``, without
+    #: changing IdealPD's real clamp.  See :func:`scale_soft_wrist_effort`.
+    soft_wrist_effort_scale: float = 1.0
     #: STRIKE-MASKED EFFORT.  Price on the mean of ``tau^2`` (N^2 m^2) over the
     #: valid ``(knot, joint)`` elements -- an energy proxy, NOT a limit hinge, so
     #: it lives in the ``posture`` (objective) block and carries no
@@ -359,8 +465,52 @@ class CostConfig:
     #: which the inner W is free), and is full again once the hit is past.
     #: 0 disables the fade entirely and prices the strike like anything else.
     effort_fade_wp: int = 5
+    #: STATIC (gravity-only) TORQUE.  Mean softplus on ``|RNEA(q,0,0)|`` against
+    #: ``eta_torque`` x the effort limits -- a cheap pose feasibility proxy with
+    #: no AL multiplier.  Pair with ``torque_static_only`` to skip the coupled
+    #: RNEA hinge and its per-segment duals during early training experiments.
+    w_torque_static: float = 0.0
+    #: When True, skip :meth:`FusedCost._torque` entirely (zero viol/live for
+    #: all torque AL groups).  Training should also set ``w_torque`` /
+    #: ``w_torque_peak`` to 0 and omit torque groups from dual updates.
+    torque_static_only: bool = False
+    #: When True, keep :meth:`FusedCost._torque` (e.g. level-A physics) but
+    #: omit all ``torque*`` groups from dual updates.  Pair with ``w_torque_peak``
+    #: at 0 for simplified-torque experiments without augmented-Lagrangian blow-up.
+    torque_al_off: bool = False
+    #: When True (requires ``torque_static_only``), :meth:`FusedCost._torque_static`
+    #: fills the existing ``torque_*`` / ``torque_peak`` AL groups from
+    #: ``|RNEA(q,0,0)|`` excess and the hard wall ``λ [g]₊`` prices ``terms["torque"]``.
+    torque_static_al: bool = False
+    #: Per-joint static limit tightening.  ``None`` / ``"off"`` = uniform limits.
+    #: ``"decoder_measured"`` divides each joint's hard limit by the measured
+    #: dyn/static RMS ratio for the gravity-only static proxy
+    #: (``constants.static_torque_tighten_divisors``).  Coupled RNEA uses
+    #: ``constants.torque_limit_eta_scale`` (waist at full hard).
+    static_torque_tighten: str | None = None
     w_velocity: float = 1.0
+    #: Price on a smooth max of ReLU hard velocity excess over segments,
+    #: alongside ``w_velocity``'s mean softplus.  AL ``live`` stays the horizon
+    #: **hard max**.  ZERO by default.  See :meth:`FusedCost._velocity`.
+    w_velocity_peak: float = 0.0
+    #: Differentiable peak shape for ``raw["velocity_peak"]``.
+    velocity_peak_mode: str = "pnorm"
+    velocity_peak_p: float = 12.0
+    #: LSE temperature, rad/s.  Only read when ``velocity_peak_mode == "lse"``.
+    velocity_peak_temp: float = 0.05
     w_joint_box: float = 10.0
+    #: Price on a smooth max of per-(waypoint, joint) ReLU hard-box excess,
+    #: alongside ``w_joint_box``'s waypoint mean softplus warning.
+    #: ``ok_joint_limits`` is a zero-tolerance max over the plan; this half
+    #: prices ``λ_peak * w_joint_box_peak * smooth_max(ReLU(q_wp - box))``.
+    #: The AL group still integrates the horizon hard max.  ZERO by default.
+    #: See :meth:`FusedCost._joint_box`.
+    w_joint_box_peak: float = 0.0
+    #: Differentiable peak shape for ``raw["joint_box_peak"]``.
+    joint_box_peak_mode: str = "pnorm"
+    joint_box_peak_p: float = 12.0
+    #: LSE temperature, rad.  Only read when ``joint_box_peak_mode == "lse"``.
+    joint_box_peak_temp: float = 0.02
     #: PER-JOINT override of the joint box for the two waist LEAN joints
     #: (``waist_pitch``, ``waist_roll``), in radians of half-width.  ``None``
     #: (default) leaves the box exactly as ``box_source`` builds it -- +-0.52 rad
@@ -370,8 +520,9 @@ class CostConfig:
     #: (the same conservatism every other row gets) and the RAW violation moves
     #: to the value itself, so the tightened rows are priced by the EXISTING
     #: ``joint_box`` augmented-Lagrangian group rather than by a new multiplier.
-    #: ``waist_yaw`` is deliberately untouched -- the torso has to spin to reach
-    #: the outer drums, and constraining it would fight the reach directly.
+    #: In the direct-movement recipe this also tightens ``waist_yaw`` to a fixed
+    #: ±80 deg guardrail inside the existing joint-box path so torso spin stays
+    #: stable without introducing a separate yaw-specific knob.
     #: Ramp it in with ``weights["waist_box"]`` (0 = the original box, 1 = fully
     #: shrunk, linear in the half-width) so a continuation does not step the AL.
     waist_pr_box: float | None = None
@@ -393,14 +544,46 @@ class CostConfig:
     #: joints, so the weight is interpretable against a target excursion --
     #: at 0.15 rad the raw term is 0.0225).  ``waist_yaw`` is excluded by
     #: construction: the mask has a hard zero in that column, so the term is
-    #: exactly yaw-invariant and carries no yaw gradient.  Zero by default, as
+    #: exactly yaw-invariant and carries no yaw gradient.  When
+    #: ``StrikeContext.waist_pr_ref`` is set the well tracks that set-point
+    #: instead of 0, with ``stopgrad(sp)`` so this is a decoder tax on
+    #: leaving the announcement (the 0.15 band is the free window; this
+    #: well is the price of using it).  The encoder teacher for lean is
+    #: gated strike-knot distill, not this term.  Zero by default, as
     #: every new term in this package is.  Ramp it with
     #: ``weights["posture_upright"]``.
     w_waist_upright: float = 0.0
+    #: TERMINAL P/R COST (economic-MPC V_f).  ``mean_pr(q_hit^2)`` at the
+    #: NEARER active hit (``min`` of the two hands' ``hit_index``), always
+    #: vs 0 -- even when ``waist_pr_ref`` walks the dense well.  Waist
+    #: *length* is the later hit (the torso is shared); this term is the
+    #: strike the committed prefix is actually for.  Same units as
+    #: ``w_waist_upright`` (rad^-2).  Zero by default (bit-identical);
+    #: ramped by ``weights["waist_pr_terminal"]``.
+    w_waist_pr_terminal: float = 0.0
     #: Waist-aim IL penalty weight (rad^-2).  When > 0 and ``StrikeContext``
     #: carries ``waist_yaw_ref``, penalises ``(q_yaw - ref)^2`` over the horizon.
     #: Zero by default (no IL).  Ramp via ``weights["waist_aim"]``.
+    #:
+    #: Two reference sources share this term: the analytic
+    #: ``waist_aim.yaw_reference`` ramp the pool bakes per sample, and -- under
+    #: ``Phase2Config.waist_sp_from_head`` -- the encoder's LEARNED set-point
+    #: broadcast over the horizon (``docs/waist_sp_head_plan.md``), through
+    #: which gradient reaches the head.
     w_waist_aim: float = 0.0
+    #: DEADBAND on the yaw error of the ``waist_aim`` term, rad.  Yaw deviation
+    #: inside ``|q_yaw - ref| <= waist_aim_deadband`` is free; only the excess
+    #: is squared.  0.0 (the default) is the original quadratic-everywhere
+    #: behaviour.  The point, with the learned set-point: the anchor kills
+    #: drift and wobble without micro-tugging the fine azimuth adjustments the
+    #: arms may want, and travel across a segment boundary is not priced until
+    #: it strays from the new set-point by more than the band.
+    waist_aim_deadband: float = 0.0
+    #: Restrict the ``waist_aim`` term to the YAW row.  False (the default)
+    #: keeps the original behaviour of also pricing pitch/roll against 0 --
+    #: redundant with ``w_waist_upright`` when both are on, which is exactly
+    #: the situation the learned set-point runs in, so head runs set True.
+    waist_aim_yaw_only: bool = False
     #: WAIST-YAW RATE penalty, ``w_waist_yaw_vel * mean_valid(qd_waist_yaw^2)``,
     #: in (rad/s)^-2.  Yaw ONLY -- pitch and roll are excluded by the same
     #: ``c_waist_yaw`` selector the diagnostics use.
@@ -419,32 +602,53 @@ class CostConfig:
     #: comparable to a target rate in (rad/s)^2 -- a torso turning at a steady
     #: 1 rad/s pays ``w`` exactly.  Ramped by ``weights["waist_yaw_vel"]``.
     w_waist_yaw_vel: float = 0.0
-    #: IDLE-ARM TERMINAL.  **The idle arm's goal, priced exactly like a strike.**
+    #: WAIST PITCH/ROLL RATE penalty, ``w_waist_pr_vel * mean_valid(qd_pr^2)``,
+    #: in (rad/s)^-2.  The exact complement of ``w_waist_yaw_vel``: that one
+    #: says how fast the torso may TURN, this one how fast it may LEAN.
+    #:
+    #: Why this exists.  ``w_waist_upright`` prices lean POSITION and the joint
+    #: box bounds it, but neither notices how the torso GETS there -- a plan can
+    #: whip pitch/roll across its range and pay only for where it ends up.  The
+    #: reach measurement of 2026-08-13 (arm-only IK to the randomized kit) found
+    #: the reach benefit of lean saturates at the URDF limit, so lean is worth
+    #: paying for as a POSTURE and worth nothing as MOMENTUM: the torso should
+    #: settle into a lean and strike from it, not swing through one.  Reduced
+    #: over the two pitch/roll rows alone, so like its yaw twin the weight reads
+    #: directly as a target rate -- a torso leaning at a steady 1 rad/s pays
+    #: ``w`` exactly.  Ramped by ``weights["waist_pr_vel"]``, which shares the
+    #: waist ramp with every other waist term.
+    w_waist_pr_vel: float = 0.0
+    #: DECODER P/R BAND around the encoder set-point.  Priced as the **sum**
+    #: of per-waypoint ReLU ``relu(|q_pr - stopgrad(sp)| - band)`` so every
+    #: plan row past the band gets gradient; AL ``live`` is the horizon
+    #: **max**.  ``sp`` is ``StrikeContext.waist_pr_ref``; ``stopgrad`` is
+    #: load-bearing.  Idle when the ref is None.  ZERO by default;
+    #: ``phase2_cost_config`` turns it on.
+    w_waist_pr_band: float = 0.0
+    waist_pr_band_rad: float = 0.15
+    #: IDLE-ARM SAFETY CYLINDER.  **The idle arm's goal, priced over its horizon.**
     #:
     #: A hand with a scheduled hit gets a terminal region + a terminal velocity
     #: (``w_terminal_region`` / ``w_terminal_velocity``).  A hand with no hit gets
-    #: the same two things, aimed at a resting posture instead of a drum head:
-    #: this weight prices ``|q_arm(K) - home|^2`` at its terminal knot, and
-    #: ``w_idle_vel`` asks that knot to be stopped.
+    #: the cylinder hinge instead: stick tip outside the torso-frame idle
+    #: cylinder (see :mod:`~amortized_opt.idle_cylinder`) is softplus-hinged at
+    #: every masked knot on that hand's horizon, and ``w_idle_vel`` asks the
+    #: terminal knot to be stopped.
     #:
     #: Everything else is already handled and is *identical* for both hands --
     #: collision, self-collision, torque, velocity and joint-box all run over the
-    #: idle arm's whole horizon with no special case.  So this term does not have
-    #: to keep the arm out of the kit; it only has to say where the arm should
-    #: end up, and the rest of the objective shapes how it gets there.
-    #:
-    #: ``home`` is ONE posture per hand (see :mod:`~amortized_opt.idle_home`), not
-    #: a function of waist yaw: arm joint angles are already torso-relative, so a
-    #: fixed vector keeps its posture relative to the body however the torso
-    #: turns, and a parked arm genuinely sits still.
-    w_idle_home: float = 0.0
+    #: idle arm's whole horizon with no special case.  The cylinder only says
+    #: the tip must stay in a torso-fixed park region; the rest of the objective
+    #: shapes how it gets there.
     #:
     #: A **static weight, never an augmented-Lagrangian group**: on closed-loop
-    #: states an arm mid-flight from a strike cannot be at home, and the repo has
-    #: already paid once for pricing an unsatisfiable condition with a multiplier
-    #: (the shortfall Lagrangian pinned at ``lam_max`` starved a 2 197-iteration
-    #: run).  Keep it near ``w_posture_mid``'s scale so a mid-horizon
-    #: re-activation pulls the arm out of home smoothly.
+    #: states an arm mid-flight from a strike cannot be inside the cylinder, and
+    #: the repo has already paid once for pricing an unsatisfiable condition with
+    #: a multiplier (the shortfall Lagrangian pinned at ``lam_max`` starved a
+    #: 2 197-iteration run).
+    w_idle_cylinder: float = 0.0
+    #: Softplus temperature (metres) for the tip-outside-cylinder hinge.
+    beta_idle_cyl: float = 0.01
     #:
     #: IDLE-ARM TERMINAL VELOCITY: the parked arm arrives **stopped**.
     #: ``|qd_arm|^2`` at that hand's terminal knot, rad^2/s^2.  Directly the
@@ -452,7 +656,7 @@ class CostConfig:
     #: 2 m/s at its terminal knot.
     #:
     #: Both idle terms are exactly zero, with exactly zero gradient, until a
-    #: posture is installed with :meth:`FusedCost.set_idle_home`.
+    #: cylinder is installed with :meth:`FusedCost.set_idle_cylinder`.
     w_idle_vel: float = 0.0
     w_elbow_down: float = 1.0
     #: Metres the elbow may sit ABOVE the shoulder->wrist chord midpoint before
@@ -484,12 +688,24 @@ class CostConfig:
             raise ValueError(f"box_source={self.box_source!r}")
         if self.torque_derate not in ("none", "linear"):
             raise ValueError(f"torque_derate={self.torque_derate!r}")
+        if self.torque_physics not in ("full", "diag_grav", "diag_grav_frozen"):
+            raise ValueError(f"torque_physics={self.torque_physics!r}")
         if self.torque_peak_mode not in ("pnorm", "lse"):
             raise ValueError(f"torque_peak_mode={self.torque_peak_mode!r}")
         if self.torque_peak_p < 1.0:
             raise ValueError("torque_peak_p must be >= 1")
         if self.torque_peak_temp <= 0.0:
             raise ValueError("torque_peak_temp must be > 0")
+        if self.w_track_torque < 0.0:
+            raise ValueError("w_track_torque must be >= 0")
+        if self.w_track_torque_peak < 0.0:
+            raise ValueError("w_track_torque_peak must be >= 0")
+        if int(self.track_torque_taps) < 1:
+            raise ValueError("track_torque_taps must be >= 1")
+        if self.track_torque_reduce not in ("last", "max"):
+            raise ValueError(f"track_torque_reduce={self.track_torque_reduce!r}")
+        if not (self.soft_wrist_effort_scale > 0.0):
+            raise ValueError("soft_wrist_effort_scale must be > 0")
         if self.collision_peak_mode not in ("pnorm", "lse"):
             raise ValueError(f"collision_peak_mode={self.collision_peak_mode!r}")
         if self.collision_peak_p < 1.0:
@@ -498,6 +714,34 @@ class CostConfig:
             raise ValueError("collision_peak_temp must be > 0")
         if self.w_collision_peak < 0.0:
             raise ValueError("w_collision_peak must be >= 0")
+        if self.w_velocity_peak < 0.0:
+            raise ValueError("w_velocity_peak must be >= 0")
+        if self.velocity_peak_mode not in ("pnorm", "lse"):
+            raise ValueError(f"velocity_peak_mode={self.velocity_peak_mode!r}")
+        if self.velocity_peak_p < 1.0:
+            raise ValueError("velocity_peak_p must be >= 1")
+        if self.velocity_peak_temp <= 0.0:
+            raise ValueError("velocity_peak_temp must be > 0")
+        if self.joint_box_peak_mode not in ("pnorm", "lse"):
+            raise ValueError(f"joint_box_peak_mode={self.joint_box_peak_mode!r}")
+        if self.joint_box_peak_p < 1.0:
+            raise ValueError("joint_box_peak_p must be >= 1")
+        if self.joint_box_peak_temp <= 0.0:
+            raise ValueError("joint_box_peak_temp must be > 0")
+        if self.w_joint_box_peak < 0.0:
+            raise ValueError("w_joint_box_peak must be >= 0")
+        if self.w_stick_stick < 0.0:
+            raise ValueError("w_stick_stick must be >= 0")
+        if self.w_terminal_aim < 0.0:
+            raise ValueError("w_terminal_aim must be >= 0")
+        if self.terminal_aim_deadband_m < 0.0:
+            raise ValueError("terminal_aim_deadband_m must be >= 0")
+        if self.w_tip_crossover < 0.0:
+            raise ValueError("w_tip_crossover must be >= 0")
+        if self.tip_crossover_margin < 0.0:
+            raise ValueError("tip_crossover_margin must be >= 0")
+        if self.beta_tip_crossover <= 0.0:
+            raise ValueError("beta_tip_crossover must be > 0")
         if self.reduction not in ("mean", "sum"):
             raise ValueError(f"reduction={self.reduction!r}")
         if self.n_sub < 1:
@@ -506,18 +750,40 @@ class CostConfig:
             object.__setattr__(self, "waist_pr_box", None)
         if self.w_effort < 0.0:
             raise ValueError("w_effort must be >= 0")
+        if self.w_torque_static < 0.0:
+            raise ValueError("w_torque_static must be >= 0")
+        if self.torque_static_al and not self.torque_static_only:
+            raise ValueError("torque_static_al requires torque_static_only")
+        if self.torque_static_al and self.w_torque_static <= 0.0:
+            raise ValueError("torque_static_al requires w_torque_static > 0")
+        if self.static_torque_tighten not in (None, "off", "none", ""):
+            static_torque_tighten_divisors(
+                G1_UPPER_BODY_JOINTS, mode=self.static_torque_tighten,
+            )
         if self.effort_fade_wp < 0:
             raise ValueError("effort_fade_wp must be >= 0")
         if self.w_waist_upright < 0.0:
             raise ValueError("w_waist_upright must be >= 0")
+        if self.w_waist_pr_terminal < 0.0:
+            raise ValueError("w_waist_pr_terminal must be >= 0")
         if self.w_waist_aim < 0.0:
             raise ValueError("w_waist_aim must be >= 0")
         if self.w_waist_yaw_vel < 0.0:
             raise ValueError("w_waist_yaw_vel must be >= 0")
-        if self.w_idle_home < 0.0:
-            raise ValueError("w_idle_home must be >= 0")
+        if self.w_waist_pr_vel < 0.0:
+            raise ValueError("w_waist_pr_vel must be >= 0")
+        if self.w_waist_pr_band < 0.0:
+            raise ValueError("w_waist_pr_band must be >= 0")
+        if self.waist_pr_band_rad < 0.0:
+            raise ValueError("waist_pr_band_rad must be >= 0")
+        if self.w_idle_cylinder < 0.0:
+            raise ValueError("w_idle_cylinder must be >= 0")
+        if self.beta_idle_cyl <= 0.0:
+            raise ValueError("beta_idle_cyl must be > 0")
         if self.w_idle_vel < 0.0:
             raise ValueError("w_idle_vel must be >= 0")
+        if self.terminal_axial_lo > self.terminal_axial_hi:
+            raise ValueError("terminal_axial_lo must be <= terminal_axial_hi")
         return self
 
 
@@ -554,9 +820,52 @@ class StrikeContext:
     #: the context tokens with :func:`drum_heads_from_context` so "the scene the
     #: cost sees" and "the scene the model was told about" are the same array.
     drum_head_centers: torch.Tensor | None = None
+    #: ``(B, D)`` per-sample drum head RADII, rows aligned with
+    #: ``drum_head_centers``.  Set it whenever
+    #: :attr:`~amortized_opt.rhythm.KitRandomization.per_drum_radius` is on, for
+    #: exactly the reason the centres are per-sample: without it the drum token
+    #: describes a resized head while the collision cylinder keeps the nominal
+    #: one, so the objective and the scene disagree.  Radius is
+    #: frame-independent, so this is ``ContextInputs.drum_radius`` verbatim --
+    #: one array, and the two cannot drift.
+    drum_radii: torch.Tensor | None = None
+    #: ``(B, 2, P, 3)`` per-sample stick contact points in the WRIST frame, hand
+    #: major (0 = left), ``P = 1 tip + n_shaft + 1 wrist`` in ``c_points`` order.
+    #: Set this whenever the STICK is domain-randomized, for exactly the reason
+    #: ``drum_head_centers`` exists: without it the collision and terminal terms
+    #: price a nominal stick while the data was generated with a randomized one,
+    #: so the objective and the geometry disagree.  Build it with
+    #: :func:`stick_points_from_specs` so the two cannot drift apart.
+    stick_points_local: torch.Tensor | None = None
+    #: ``(B, 2, 3)`` per-sample stick AXIS (handle->tip unit) in the wrist frame.
+    #: The terminal term builds its contact candidates as ``mount + sigma *
+    #: axis``, so a tilted stick needs this as well as the collision points.
+    stick_axis_local: torch.Tensor | None = None
+    #: ``(B, 2)`` per-sample arc coordinate of the TIP.  Length randomization is
+    #: handle-fixed, so a longer stick moves the tip out along the axis and this
+    #: is where the bead actually is; the shaft candidates keep their nominal
+    #: sigmas, which stay on the shaft by construction.
+    stick_tip_sigma: torch.Tensor | None = None
     #: ``(B, H)`` waist-yaw reference trajectory at knot resolution, computed by
     #: :mod:`~amortized_opt.waist_aim`.  ``None`` means the IL term is disabled.
+    #:
+    #: KNOT CONVENTION (the one place it is defined): ``waist_yaw_ref[:, k]``
+    #: is the reference for **knot k+1** -- the same rows-1..H layout as the
+    #: decoder's waypoint tokens (``WarmStart.init_traj``, ``MPCRoller``'s
+    #: ``init``), which never include the measured ``q0`` (knot 0).  Every
+    #: producer (the fresh pool's seed yaw column, ``MPCRoller``'s harvested
+    #: reference, the learned set-point broadcast) and the one consumer
+    #: (:meth:`FusedCost._posture`'s ``waist_aim`` term) must follow it; a
+    #: trajectory equal to its own seed then prices the term at exactly zero.
     waist_yaw_ref: torch.Tensor | None = None
+    #: ``(B, H, 2)`` pitch/roll reference at knot resolution, ``[pitch, roll]``.
+    #: Same knot convention as ``waist_yaw_ref`` (row ``k`` is knot ``k+1``).
+    #: ``None`` keeps the upright well pricing ``q_pr²`` against 0 (snapshot
+    #: / 81-grid).  When set it prices ``‖q_pr − stopgrad(ref)‖²``: the
+    #: encoder P/R head used to fill this, now a leaky EMA of the clipped
+    #: P/R command harvested by the roller.  Sample 0 is then masked out of
+    #: the reduction, matching ``waist_aim``.
+    waist_pr_ref: torch.Tensor | None = None
 
     @property
     def batch(self) -> int:
@@ -588,6 +897,67 @@ def drum_heads_from_context(drum_pos_env: torch.Tensor) -> torch.Tensor:
         PELVIS_IN_ENV, device=drum_pos_env.device, dtype=drum_pos_env.dtype
     )
     return drum_pos_env - off
+
+
+def stick_cost_from_context(
+    stick_axis: torch.Tensor,
+    stick_tip: torch.Tensor,
+    stick_length: torch.Tensor,
+    stick_valid: torch.Tensor,
+    n_shaft: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None]:
+    """The cost's three stick tensors, built from the CONTEXT columns.
+
+    The stick counterpart of :func:`drum_heads_from_context`, and it exists for
+    the same reason: "the stick the cost prices" and "the stick the model was
+    told about" must be one array, or they drift.  Takes the
+    ``(B, 2, ...)`` blocks a pool stores -- axis, tip offset, length, valid --
+    and returns ``(points, axis, tip_sigma)`` shaped for
+    :class:`StrikeContext`.
+
+    Returns ``(None, None, None)`` when no row carries a stick, so a caller can
+    pass the result straight through and get the nominal, baked-in geometry.
+
+    The shaft samples are rebuilt here rather than stored: they are a
+    deterministic ``linspace`` along the axis between the (fixed) butt and the
+    tip, so storing them would be four more columns that can only disagree.
+    """
+    if stick_valid is None or not bool(stick_valid.any()):
+        return None, None, None
+    dtype, device = stick_axis.dtype, stick_axis.device
+    B = stick_axis.shape[0]
+    m = stick_valid.unsqueeze(-1).to(dtype)                      # (B, 2, 1)
+    butt = -STICK_LENGTH / 2.0
+    mounts = torch.stack([
+        torch.as_tensor(STICK_MOUNT_POS_LEFT, device=device, dtype=dtype),
+        torch.as_tensor(STICK_MOUNT_POS_RIGHT, device=device, dtype=dtype),
+    ]).view(1, 2, 1, 3)                                          # mount is NOT randomized
+
+    # Rows without a stick fall back to the NOMINAL geometry -- axis, tip
+    # sigma AND the tip point are blended toward the shipped stick BEFORE the
+    # point cloud is built, so an invalid row's points come out exactly the
+    # nominal stick's rather than a zero-length stub at the wrist.  A single
+    # valid row must not poison the rest of the batch.
+    nom_axis = torch.stack([
+        torch.as_tensor(stick_axis_local("left"), device=device, dtype=dtype),
+        torch.as_tensor(stick_axis_local("right"), device=device, dtype=dtype),
+    ]).view(1, 2, 3)
+    axis = stick_axis * m + nom_axis * (1.0 - m)                 # (B, 2, 3)
+    tip_sigma = (stick_length - STICK_LENGTH / 2.0)              # (B, 2)
+    tip_sigma = tip_sigma * m.squeeze(-1) + (STICK_LENGTH / 2.0) * (1.0 - m.squeeze(-1))
+    nom_tip = mounts.squeeze(2) + (STICK_LENGTH / 2.0) * nom_axis  # (1, 2, 3)
+    tip_pt = stick_tip * m + nom_tip * (1.0 - m)                 # (B, 2, 3)
+
+    n = max(int(n_shaft), 2)
+    u = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype).view(1, 1, n)
+    end = (tip_sigma - SHAFT_TIP_CLEAR).unsqueeze(-1)            # (B, 2, 1)
+    sig = butt + u * (end - butt)                                # (B, 2, n)
+    shaft = mounts + sig.unsqueeze(-1) * axis.unsqueeze(2)       # (B, 2, n, 3)
+
+    tip = tip_pt.unsqueeze(2)                                    # (B, 2, 1, 3)
+    wrist = torch.zeros(B, 2, 1, 3, device=device, dtype=dtype)
+    pts = torch.cat([tip, shaft, wrist], dim=2)                  # (B, 2, P, 3)
+    return pts, axis, tip_sigma
 
 
 def strike_context_from_cases(
@@ -662,10 +1032,19 @@ class CostTerms:
     violations: dict[str, torch.Tensor] = field(default_factory=dict)
     diagnostics: dict[str, torch.Tensor] = field(default_factory=dict)
     counts: dict[str, torch.Tensor] = field(default_factory=dict)
+    balance_terms: dict[str, torch.Tensor] = field(default_factory=dict)
+    #: Detached aux-head labels (vel/acc/torque/fk_*), when
+    #: :meth:`FusedCost.forward` was asked for ``aux_mode``.  Built from the
+    #: same spline / knot RNEA / FK plant the cost already paid for, so the
+    #: train step does not rebuild them in a second ``aux_targets`` pass.
+    aux_labels: dict[str, torch.Tensor] | None = None
 
     def detach_numpy(self) -> dict[str, np.ndarray]:
         out = {"total": self.total.detach().cpu().numpy()}
-        for grp in ("terms", "raw", "violations", "diagnostics", "counts"):
+        for grp in (
+            "terms", "raw", "violations", "diagnostics", "counts",
+            "balance_terms",
+        ):
             for k, v in getattr(self, grp).items():
                 out[f"{grp[:4]}.{k}"] = v.detach().cpu().numpy()
         return out
@@ -889,10 +1268,10 @@ class FusedCost:
             bc_start=bc_start, bc_end=bc_end, joint_names=self.joint_names,
             device=self.device, dtype=dtype,
         )
-        #: Idle-arm park posture ``(2, n_arm)``, installed by
-        #: :meth:`set_idle_home`.  ``None`` (the default) makes ``w_idle_home`` /
-        #: ``w_idle_vel`` exact no-ops.
-        self.c_idle_q: torch.Tensor | None = None
+        #: Idle-arm safety cylinder ``(8,)`` = center(3)+axis(3)+radius+half_height,
+        #: installed by :meth:`set_idle_cylinder`.  ``None`` (the default) makes
+        #: ``w_idle_cylinder`` / ``w_idle_vel`` exact no-ops.
+        self.c_idle_cyl: torch.Tensor | None = None
         self._build_constants(under_depth, under_clearance)
 
     # ------------------------------------------------------------ build ---
@@ -915,7 +1294,13 @@ class FusedCost:
         self.c_under_half = t(np.full(sc.num_drums, under_depth / 2.0))
         self.n_drums = sc.num_drums
 
-        # Collision sample points, wrist-local: [tip, shaft*S, wrist].
+        # Collision endpoints, wrist-local: [tip, shaft*S, wrist].  Row 0 is
+        # the bead and row 1 is the first shaft sample, which
+        # ``stick_shaft_offsets`` places at the butt, so [row 1 -> row 0] is
+        # the whole stick capsule.  The wrist is a separate sphere at the
+        # origin.  Shaft *samples* are no longer scored against drums -- they
+        # exist so the same cloud still yields the capsule endpoints under
+        # stick-length randomization.
         S = int(cfg.shaft_samples)
         self.c_points = {}
         for hand in _HANDS:
@@ -929,11 +1314,10 @@ class FusedCost:
         self.c_pt_radii = t(
             np.concatenate([[TIP_RADIUS], np.full(S, STICK_RADIUS), [WRIST_RADIUS]])
         )
-        row_tip = np.zeros(self.n_points)
-        row_tip[0] = 1.0
-        row_shaft = np.zeros(self.n_points)
-        row_shaft[1 : 1 + S] = 1.0
-        self.c_row_tip, self.c_row_shaft = t(row_tip), t(row_shaft)
+        # Stick capsule swallows the bead as well as the shaft (the bead is
+        # the fatter of the two); the wrist keeps its own ball.
+        self.c_stick_r = float(max(TIP_RADIUS, STICK_RADIUS))
+        self.c_wrist_r = float(WRIST_RADIUS)
 
         a, b, r = TORSO_CAPSULE
         self.c_torso_a, self.c_torso_b, self.c_torso_r = t(a), t(b), float(r)
@@ -952,8 +1336,23 @@ class FusedCost:
         tip_first[int(np.argmax(np.asarray(SHAFT_SIGMAS)))] = 1.0
         self.c_sigma_is_tip = t(tip_first)  # which candidate is the bead
 
-        # Limits.
-        self.tau_hard = t(isaac_effort_limits(self.joint_names))
+        # Limits.  Soft-wrist scale is scoring-only (cost / ok_torque); the
+        # plant clamp still uses the unscaled Isaac table.
+        self.tau_hard = t(scale_soft_wrist_effort(
+            isaac_effort_limits(self.joint_names), self.joint_names,
+            scale=cfg.soft_wrist_effort_scale,
+        ))
+        mode = cfg.static_torque_tighten
+        if mode in (None, "off", "none", ""):
+            tighten = np.ones(self.n_dof, dtype=float)
+        else:
+            tighten = static_torque_tighten_divisors(
+                self.joint_names, mode=mode,
+            )
+        self.c_static_torque_tighten = t(tighten)
+        self.c_torque_eta = t(
+            torque_limit_eta_scale(self.joint_names, eta_torque=cfg.eta_torque)
+        )
         self.v_hard = t(isaac_velocity_limits(self.joint_names))
         lo, hi = urdf_position_limits(
             self.joint_names, posture_limits=(cfg.box_source == "posture")
@@ -975,12 +1374,25 @@ class FusedCost:
                 row[self.joint_names.index(nm)] = 1.0
         self.c_waist_pr, self.c_waist_yaw = t(pr), t(yaw)
 
+        # Actuator-class column indices for the split limit duals.  Built as
+        # long tensors so ``index_select`` in the compiled cost is a gather.
+        self.c_seg: list[tuple[str, torch.Tensor]] = []
+        for name, joints in ACTUATOR_SEGMENTS:
+            idx = [self.joint_names.index(j) for j in joints]
+            self.c_seg.append(
+                (name, torch.as_tensor(idx, device=dev, dtype=torch.long))
+            )
+
         # Posture: twist rows + reference pose.
         self.c_twist = t(
             axial_twist_directions(self.fk, twist_axis_floor=cfg.twist_axis_floor,
                                    joint_names=self.joint_names)
         )  # (2, n)
         self.q_ready = t(ready_joint_pos(self.joint_names))
+        from .pd_sim import mass_matrix
+
+        M0 = mass_matrix(self.rnea, self.q_ready.view(1, -1))
+        self._m_diag_ready = torch.diagonal(M0, dim1=-2, dim2=-1).detach().squeeze(0)
 
         # Group column indices (waist / left / right), for per-hand masks.
         # Warm BOTH spline caches here: they are built from Python lists, so a
@@ -999,6 +1411,47 @@ class FusedCost:
             device=dev, dtype=torch.long,
         )
 
+        # TRACKING-TORQUE FIR bank, ``(n, L)``.  Built here (so it follows the
+        # object across ``.to()``) but ONLY when a tracking weight is on: it
+        # costs one RNEA mass matrix and one ``n``-sample PD rollout, and a run
+        # that does not price the term should not pay for either.
+        self.c_tau_kernel: torch.Tensor | None = None
+        if self.track_torque_on:
+            self.c_tau_kernel = self.build_torque_kernels()
+
+    # ------------------------------------------------- tracking-torque FIR ---
+    @property
+    def track_torque_on(self) -> bool:
+        """Is the tracking-torque estimator priced at all?
+
+        A python bool read at TRACE time, so the whole block below is compiled
+        away (and is bit-for-bit absent) whenever both weights are zero.
+        """
+        return bool(self.cfg.w_track_torque > 0.0 or self.cfg.w_track_torque_peak > 0.0)
+
+    def build_torque_kernels(self) -> torch.Tensor:
+        """Identify the per-joint ``command -> demanded torque`` FIR bank.
+
+        Delegates to :func:`~amortized_opt.pd_sim.nominal_torque_kernels` --
+        THE one identification, shared with the phase-1/2 auxiliary torque
+        label -- at the NOMINAL runtime gains (the plant's ``kp_nominal`` /
+        ``kd_nominal``, i.e. what ``BatchedPDSim`` uses before gain
+        randomization) and a frozen diagonal mobility taken at the drummer's
+        ready pose, ``diag(inv(M(q_ready) + armature))``.  Identified in
+        float64 whatever the cost's own dtype -- it is 24 taps of a stiff
+        recursion, done once.
+        """
+        from .pd_sim import nominal_torque_kernels
+
+        cfg = self.cfg
+        return nominal_torque_kernels(
+            self.rnea, self.q_ready,
+            joint_names=self.joint_names, dt=self.dt, substeps=PD_SUBSTEPS,
+            taps=int(cfg.track_torque_taps), tol=float(cfg.track_torque_tol),
+            torque_reduce=cfg.track_torque_reduce,
+            device=self.device, dtype=self.dtype,
+        )
+
     def to(self, device, dtype: torch.dtype | None = None) -> "FusedCost":
         self.device = torch.device(device)
         if dtype is not None:
@@ -1007,42 +1460,30 @@ class FusedCost:
         self.rnea = self.rnea.to(self.device, self.dtype)
         self.spline = self.spline.to(self.device, self.dtype)
         self._build_constants(self.scene.under_depth, self.scene.under_clearance)
-        if self.c_idle_q is not None:
-            self.c_idle_q = self.c_idle_q.to(device=self.device, dtype=self.dtype)
+        if self.c_idle_cyl is not None:
+            self.c_idle_cyl = self.c_idle_cyl.to(device=self.device, dtype=self.dtype)
         return self
 
     # ----------------------------------------------------------- idle arm ---
-    def set_idle_home(self, table) -> "FusedCost":
-        """Install the park posture the idle-arm terms are priced against.
+    def set_idle_cylinder(self, cyl) -> "FusedCost":
+        """Install the torso-frame cylinder the idle-arm tip hinge prices against.
 
-        ``table`` is an :class:`~amortized_opt.idle_home.IdleHomeTable` or a
-        ``(2, n_arm)`` array: ONE arm posture per hand.  It is torso-relative --
-        the arm is mounted on the torso, so a fixed vector of joint angles keeps
-        its posture relative to the body at every waist yaw, and the term below
-        is therefore exactly yaw-independent by construction rather than by a
-        detached index.
-
-        Pass ``None`` to uninstall (the terms go back to exact zeros).
+        ``cyl`` is an :class:`~amortized_opt.idle_cylinder.IdleCylinder`, an
+        :class:`~amortized_opt.idle_cylinder.IdleCylinderLibrary` (uses its
+        ``.cylinder``), or an ``(8,)`` packed vector
+        (center + axis + radius + half_height).  Pass ``None`` to uninstall
+        (the terms go back to exact zeros).
         """
-        if table is None:
-            self.c_idle_q = None
+        if cyl is None:
+            self.c_idle_cyl = None
             return self
-        if hasattr(table, "q_arm"):
-            if tuple(table.joint_names) != self.joint_names:
-                raise ValueError(
-                    f"idle-home pose is for {tuple(table.joint_names)}, "
-                    f"cost is on {self.joint_names}"
-                )
-            table = table.q_arm
-        q = torch.as_tensor(
-            np.asarray(table, float), device=self.device, dtype=self.dtype
-        )
-        n_arm = int(self._gcols["left"].numel())
-        if q.shape != (2, n_arm):
-            raise ValueError(
-                f"idle-home pose must be (2, {n_arm}), got {tuple(q.shape)}"
-            )
-        self.c_idle_q = q
+        if hasattr(cyl, "cylinder"):
+            cyl = cyl.cylinder
+        if hasattr(cyl, "pack"):
+            v = np.asarray(cyl.pack(), float).reshape(8)
+        else:
+            v = np.asarray(cyl, float).reshape(8)
+        self.c_idle_cyl = torch.as_tensor(v, device=self.device, dtype=self.dtype)
         return self
 
     def with_config(self, **kw) -> "FusedCost":
@@ -1057,6 +1498,32 @@ class FusedCost:
         out = object.__new__(FusedCost)
         out.__dict__.update(self.__dict__)
         out.cfg = replace(self.cfg, **kw).validate()
+        # ``tau_hard`` is baked at construction; refresh when the soft-wrist
+        # scoring scale changes so ``with_config`` stays honest.
+        if "soft_wrist_effort_scale" in kw:
+            t = lambda a: torch.as_tensor(
+                np.asarray(a, float), device=out.tau_hard.device, dtype=out.tau_hard.dtype
+            )
+            out.tau_hard = t(scale_soft_wrist_effort(
+                isaac_effort_limits(out.joint_names), out.joint_names,
+                scale=out.cfg.soft_wrist_effort_scale,
+            ))
+        if "static_torque_tighten" in kw:
+            mode = out.cfg.static_torque_tighten
+            if mode in (None, "off", "none", ""):
+                div = np.ones(out.n_dof, dtype=float)
+            else:
+                div = static_torque_tighten_divisors(out.joint_names, mode=mode)
+            out.c_static_torque_tighten = torch.as_tensor(
+                div, device=out.tau_hard.device, dtype=out.tau_hard.dtype,
+            )
+        if "static_torque_tighten" in kw or "eta_torque" in kw:
+            out.c_torque_eta = torch.as_tensor(
+                torque_limit_eta_scale(
+                    out.joint_names, eta_torque=out.cfg.eta_torque,
+                ),
+                device=out.tau_hard.device, dtype=out.tau_hard.dtype,
+            )
         return out
 
     # -------------------------------------------------------- reductions --
@@ -1067,6 +1534,32 @@ class FusedCost:
         if self.cfg.reduction == "sum":
             return num, cnt
         return num / cnt.clamp_min(1.0), cnt
+
+    def _emit_limit_segments(
+        self, family: str, over: torch.Tensor, hinge: torch.Tensor,
+        mask: torch.Tensor, cnt: torch.Tensor, raw, viol, live,
+        *, write_raw: bool = True,
+    ) -> None:
+        """Per-actuator-class hinge share + hierarchical dual residual.
+
+        Hinge share is ``sum(h in G) / n_valid`` so the seven shares sum to the
+        global mean (diagnostics / optional; they do not enter ``terms`` × λ).
+        Dual residual is ``max_{k,j in G} [g]₊`` -- a one-hot joint is the
+        full peak inside its class, not peak/|G|.  Warning uses the global
+        mean at ``cfg.w_*`` with no λ.  Hard is ``w[seg] * live[seg]`` in
+        :meth:`forward`.
+        """
+        denom = cnt.clamp_min(1.0)
+        for name, idx in self.c_seg:
+            o = over.index_select(-1, idx)
+            h = hinge.index_select(-1, idx)
+            m = mask.index_select(-1, idx)
+            hier = (o * m).amax(dim=(1, 2))
+            key = f"{family}_{name}"
+            viol[key] = hier.detach()
+            live[key] = hier
+            if write_raw:
+                raw[key] = (h * m).sum(dim=(1, 2)) / denom
 
     # ------------------------------------------------------------ forward --
     def forward(
@@ -1079,6 +1572,8 @@ class FusedCost:
         lengths: torch.Tensor | None = None,   # (B, 3) segments per group
         elem_mask: torch.Tensor | None = None,  # (B, H, 17)
         weights: dict[str, torch.Tensor | float] | None = None,
+        aux_mode: str | None = None,
+        aux_tau_kernel: torch.Tensor | None = None,
     ) -> CostTerms:
         cfg = self.cfg
         if lengths is None:
@@ -1103,6 +1598,10 @@ class FusedCost:
         terms: dict[str, torch.Tensor] = {}
         raw: dict[str, torch.Tensor] = {}
         viol: dict[str, torch.Tensor] = {}
+        # Live (undettached) copy of the same ReLU residuals the dual reads.
+        # Public ``violations`` stay detached; consumers are the PHR quadratic
+        # ``(pen / 2) [g]₊²`` and the hard wall ``λ [g]₊``.
+        live: dict[str, torch.Tensor] = {}
         diag: dict[str, torch.Tensor] = {}
         counts: dict[str, torch.Tensor] = {}
 
@@ -1118,53 +1617,150 @@ class FusedCost:
             smooth=1.0, posture=1.0,
             terminal_region=1.0, terminal_velocity=1.0, terminal_elev=1.0,
             posture_mid=1.0, posture_elbow=1.0, torque_peak=1.0,
-            collision_peak=1.0,
+            collision_peak=1.0, joint_box_peak=1.0, velocity_peak=1.0,
             posture_upright=1.0, waist_box=1.0, effort=1.0, waist_aim=1.0,
-            posture_idle=1.0, waist_yaw_vel=1.0,
+            posture_idle=1.0, waist_yaw_vel=1.0, waist_pr_vel=1.0,
+            tip_crossover=1.0, waist_pr_band=1.0, waist_pr_terminal=1.0,
         )
+        for fam in LIMIT_FAMILIES:
+            for seg in ACTUATOR_SEGMENT_NAMES:
+                w[limit_group_name(fam, seg)] = w[fam]
         if weights:
             w.update({k: v for k, v in weights.items() if k in w})
+            # Family key without per-segment keys still broadcasts onto every
+            # ``torque_*`` / ``velocity_*`` / ``joint_box_*`` λ (the hard
+            # ReLU wall).  Keys that WERE passed win, so a live AL dict of
+            # ``torque_waist`` etc. is not overwritten by a leftover family
+            # entry.
+            for fam in LIMIT_FAMILIES:
+                for seg in ACTUATOR_SEGMENT_NAMES:
+                    key = limit_group_name(fam, seg)
+                    if key not in weights:
+                        w[key] = w[fam]
 
-        self._collision(frames, B, S, ctx, m_hand, raw, viol, diag, counts, sp)
-        self._torque(sp, ss, v0, B, S, D, ctx, raw, viol, diag, counts)
-        self._velocity(sp, raw, viol, diag, counts)
-        self._joint_box(ss, raw, viol, diag, counts, w["waist_box"])
+        # ---- per-JOINT price on the three limit hinges -----------------------
+        # ``weights["limit_alpha"]`` is a ``(D,)`` vector, deliberately NOT a
+        # member of ``w`` above: ``w``'s entries are scalar prices on an already
+        # reduced term, this one multiplies the hinge PER ELEMENT *before* its
+        # reduction, so a curriculum can hold one joint at full strength while
+        # the rest ramp (see ``WeightSchedule.full_limit_joints``).  It touches
+        # exactly the mean halves of ``torque`` / ``velocity`` / ``joint_box``;
+        # the max-shaped ``torque_peak`` keeps its own group schedule, and every
+        # RAW violation is computed from the unscaled excess, so the augmented
+        # Lagrangian cannot see this at all.
+        #
+        # ``None`` is all-ones and is bit-identical to the pre-exemption form
+        # (the multiply is skipped, not performed against ones).  The branch is
+        # on the OBJECT, resolved at trace time exactly like
+        # ``ctx.waist_yaw_ref`` below, so nothing here is data-dependent.
+        lim_a = weights.get("limit_alpha") if weights else None
+        if lim_a is not None:
+            lim_a = torch.as_tensor(
+                lim_a, device=ss.q.device, dtype=ss.q.dtype
+            ).view(1, 1, D)
+
+        self._collision(frames, B, S, ctx, m_hand, raw, viol, live, diag, counts, sp)
+        tau = None
+        if cfg.torque_static_only:
+            self._torque_off(
+                B, ss, raw, viol, live, diag, counts,
+                zero_viol=not cfg.torque_static_al,
+            )
+        else:
+            torque_full_blend = 1.0
+            if cfg.torque_physics != "full":
+                if weights is not None and "torque_full_blend" in weights:
+                    tb = weights["torque_full_blend"]
+                    torque_full_blend = float(
+                        tb.item() if isinstance(tb, torch.Tensor) else tb
+                    )
+                else:
+                    torque_full_blend = 0.0
+            tau = self._torque(
+                sp, ss, v0, B, S, D, ctx, raw, viol, live, diag, counts, lim_a,
+                torque_full_blend=torque_full_blend,
+            )
+        if cfg.w_torque_static > 0.0 or (
+            cfg.torque_static_only and cfg.torque_static_al
+        ):
+            self._torque_static(
+                sp, ss, v0, B, S, D, raw, viol, live, diag, counts, lim_a,
+            )
+        # TRACKING TORQUE.  Entirely behind a trace-time python branch: with
+        # both weights at 0 (the default) not one tensor of it is created, and
+        # ``viol["torque"]`` keeps its RNEA meaning.  The three diagnostics are
+        # emitted either way so ``DIAG_KEYS`` has a fixed width.
+        tau_track = None
+        if self.track_torque_on:
+            tau_track = self._track_torque(
+                sp, v0, B, D, raw, viol, live, diag, counts, lim_a,
+            )
+        else:
+            z = ss.q.new_zeros(B)
+            diag["track_torque_excess_mean"] = z
+            diag["track_torque_excess_max"] = z
+            diag["track_torque_max"] = z
+        self._velocity(sp, raw, viol, live, diag, counts, lim_a)
+        wp_mask = elem_mask if elem_mask is not None else sp.seg_mask
+        self._joint_box(
+            waypoints, wp_mask, raw, viol, live, diag, counts, w["waist_box"], lim_a,
+        )
         self._smoothness(sp, raw, diag, counts)
-        self._posture(frames, ss, B, S, ctx, raw, diag, counts)
-        self._terminal(sp, ctx, raw, viol, diag, counts)
+        self._posture(sp, frames, ss, B, S, ctx, raw, diag, counts)
+        self._waist_pr_band(waypoints, wp_mask, B, ctx, raw, viol, live)
+        self._terminal(sp, ctx, raw, viol, live, diag, counts)
 
-        terms["terminal"] = w["terminal"] * (
+        # Warning (no λ): softplus / curriculum at ``cfg.w_*``.  Hard wall
+        # ``λ [g]₊`` is added below over ``TERM_FOR_GROUP``.  Default λ=1 when
+        # the caller did not pass AL, matching today's missing-key default,
+        # but it multiplies ReLU live, not the softplus.
+        #
+        # Terminal sub-hinges keep their curriculum ramps; ``w["terminal"]``
+        # (λ) does NOT scale the warning.  The in-plane aim pull is a plain
+        # objective.  Exactly zero at ``cfg.w_terminal_aim = 0``.
+        terms["terminal"] = (
             (cfg.w_terminal_region * w["terminal_region"]) * raw["terminal_region"]
-            + cfg.w_terminal_aim * raw["terminal_aim"]
             + (cfg.w_terminal_velocity * w["terminal_velocity"]) * raw["terminal_velocity"]
             + (cfg.w_terminal_elev * w["terminal_elev"]) * raw["terminal_elev"]
         )
-        # As with ``torque``, the two reductions of the collision hinge carry
-        # INDEPENDENT multipliers: ``w["collision"]`` prices the three
-        # mean-reduced sub-costs, ``w["collision_peak"]`` the smooth max over
-        # the same hinges.  Separate augmented-Lagrangian groups so the peak
-        # price can rise while the mean price relaxes -- raising a weight
-        # against a multiplier calibrated on the other reduction is what
-        # destabilized the section-7b continuations.  At
-        # ``cfg.w_collision_peak = 0`` (the default) the second product is
-        # exactly zero and the term is bit-identical to the mean-only form.
-        terms["collision"] = w["collision"] * (
+        terms["terminal_aim"] = cfg.w_terminal_aim * raw["terminal_aim"]
+        # Mean collision is a margin-softplus warning at ``cfg.w_collision_*``;
+        # ``w["collision"]`` (λ) does not scale it.  The peak is already a
+        # ReLU reduction, priced as ``λ_peak * w_collision_peak * raw_peak``
+        # (hard).  At ``cfg.w_collision_peak = 0`` that product is exactly
+        # zero.  Cross-hand mean joins the warning block; at
+        # ``cfg.w_stick_stick = 0`` it is an exact zero.
+        terms["collision"] = (
             cfg.w_collision_drum * raw["collision_drum"]
             + cfg.w_collision_under * raw["collision_under"]
             + cfg.w_collision_self * raw["collision_self"]
+            + cfg.w_stick_stick * raw["collision_stick"]
         ) + w["collision_peak"] * cfg.w_collision_peak * raw["collision_peak"]
-        # The two reductions of the torque hinge carry INDEPENDENT multipliers:
-        # ``w["torque"]`` prices the mean, ``w["torque_peak"]`` the smooth max.
-        # They are separate augmented-Lagrangian groups (see
-        # :data:`~amortized_opt.lagrangian.CONSTRAINT_GROUPS`) because their
-        # violations differ by ~n_valid in scale, and ``w["torque_peak"]`` also
-        # carries the curriculum ramp on the max-shaped half.  At
-        # ``cfg.w_torque_peak = 0`` (the default) the second product is exactly
-        # zero and the term is bit-identical to the mean-only form.
+        # Limit-family warning is the global mean softplus at ``cfg.w_*``.
+        # Per-segment λ hits ``live[seg]`` only (loop below), never the
+        # diagnostic shares.  Peak halves are ``λ_peak * w_peak * smooth_max(ReLU)``;
+        # skipped in the linear live loop so they are not double-counted.
         terms["torque"] = (
-            w["torque"] * cfg.w_torque * raw["torque"]
-            + w["torque_peak"] * cfg.w_torque_peak * raw["torque_peak"]
+            w["torque_peak"] * cfg.w_torque_peak * raw["torque_peak"]
+            + cfg.w_torque * raw["torque"]
         )
+        terms["velocity"] = (
+            w["velocity_peak"] * cfg.w_velocity_peak * raw["velocity_peak"]
+            + cfg.w_velocity * raw["velocity"]
+        )
+        terms["joint_box"] = (
+            w["joint_box_peak"] * cfg.w_joint_box_peak * raw["joint_box_peak"]
+            + cfg.w_joint_box * raw["joint_box"]
+        )
+        # Peaks are smooth-max ReLU (dense, max-shaped); AL max is separate.
+        # Tracking hinge is a warning (``cfg.w_track_* × raw``), still under
+        # ``limit_alpha``.  Not multiplied by λ.  The torque group's ``live``
+        # is already whatever ``_track_torque`` wrote.
+        if self.track_torque_on:
+            terms["torque"] = terms["torque"] + (
+                cfg.w_track_torque * raw["track_torque"]
+                + cfg.w_track_torque_peak * raw["track_torque_peak"]
+            )
         # Effort is an OBJECTIVE, not a constraint: no augmented-Lagrangian
         # multiplier, only its config weight and a curriculum ramp.  Its own
         # term key rather than a share of ``torque`` precisely because the
@@ -1172,8 +1768,12 @@ class FusedCost:
         # a limit-violation multiplier is the mistake section 7b paid for.
         # Exactly zero at the default ``cfg.w_effort = 0``.
         terms["effort"] = (cfg.w_effort * w["effort"]) * raw["effort"]
-        terms["velocity"] = w["velocity"] * cfg.w_velocity * raw["velocity"]
-        terms["joint_box"] = w["joint_box"] * cfg.w_joint_box * raw["joint_box"]
+        # Gravity-only static torque: plain objective, no λ.
+        terms["torque_static"] = (
+            cfg.w_torque_static * raw["torque_static"]
+            if cfg.w_torque_static > 0.0
+            else ss.q.new_zeros(B)
+        )
         terms["smooth"] = w["smooth"] * (
             cfg.w_smooth_vel * raw["smooth_vel"]
             + cfg.w_smooth_acc * raw["smooth_acc"]
@@ -1183,15 +1783,17 @@ class FusedCost:
             (cfg.w_posture_mid * w["posture_mid"]) * raw["posture_mid"]
             + (cfg.w_elbow_down * w["posture_elbow"]) * raw["posture_elbow"]
             + cfg.w_axial_twist * raw["posture_twist"]
-            # At ``cfg.w_waist_upright = 0`` (the default) this product is
-            # exactly zero and the term is bit-identical to the pre-7d form.
-            + (cfg.w_waist_upright * w["posture_upright"]) * raw["posture_upright"]
-            # The IDLE ARM pair, both exactly zero without an installed home
-            # table.  They ride the ``posture`` group multiplier (an objective
-            # block, no augmented-Lagrangian multiplier of their own) and share
-            # one curriculum ramp, ``weights["posture_idle"]``.
-            + (cfg.w_idle_home * w["posture_idle"]) * raw["posture_idle_home"]
+            # The IDLE ARM pair, both exactly zero without an installed cylinder.
+            # They ride the ``posture`` group multiplier (an objective block, no
+            # augmented-Lagrangian multiplier of their own) and share one
+            # curriculum ramp, ``weights["posture_idle"]``.
+            + (cfg.w_idle_cylinder * w["posture_idle"]) * raw["posture_idle_cylinder"]
             + (cfg.w_idle_vel * w["posture_idle"]) * raw["posture_idle_vel"]
+        )
+        # Waist-upright POSITION: own term (grad-balance ``waist`` group with the
+        # rate terms).  At ``cfg.w_waist_upright = 0`` this is exactly zero.
+        terms["waist_upright"] = (
+            (cfg.w_waist_upright * w["posture_upright"]) * raw["posture_upright"]
         )
         # Waist-aim IL: an OBJECTIVE (no multiplier) — penalise deviation from
         # the reference yaw trajectory computed by ``waist_aim.yaw_reference``.
@@ -1205,9 +1807,81 @@ class FusedCost:
         terms["waist_yaw_vel"] = (
             cfg.w_waist_yaw_vel * w["waist_yaw_vel"]
         ) * raw["waist_yaw_vel"]
+        # Waist pitch/roll RATE, the lean half of the same idea: reach saturates
+        # at the URDF limit, so a lean is worth paying for as a posture and
+        # worth nothing as momentum.  Exactly zero at ``w_waist_pr_vel = 0``.
+        terms["waist_pr_vel"] = (
+            cfg.w_waist_pr_vel * w["waist_pr_vel"]
+        ) * raw["waist_pr_vel"]
+        # Economic-MPC V_f on P/R at the nearer active hit.  Own term so it
+        # shows up as ``c_waist_pr_terminal`` rather than hiding inside
+        # posture.  Exact zero at ``w_waist_pr_terminal = 0``.
+        terms["waist_pr_terminal"] = (
+            cfg.w_waist_pr_terminal * w["waist_pr_terminal"]
+        ) * raw["waist_pr_terminal"]
+        # Decoder P/R vs stopgrad(encoder SP).  Warning is sum of per-waypoint
+        # ReLU at ``cfg.w_waist_pr_band`` (no λ).  Hard is ``λ * live`` (max)
+        # below.  Exact zero at the default ``cfg.w_waist_pr_band = 0``.
+        terms["waist_pr_band"] = cfg.w_waist_pr_band * raw["waist_pr_band"]
+        # Tip lateral ordering: plain objective (no AL).  Exactly zero at
+        # ``cfg.w_tip_crossover = 0``.
+        terms["tip_crossover"] = (
+            cfg.w_tip_crossover * w["tip_crossover"]
+        ) * raw["tip_crossover"]
+        # Hard wall: λ × ReLU live.  Peak groups already carry λ in the
+        # ``w_peak * λ * smooth_max(ReLU)`` product above.  Runs even when
+        # ``weights is None`` so default λ=1 still applies.
+        for g, term in TERM_FOR_GROUP.items():
+            if g in _PEAK_AL_GROUPS:
+                continue
+            v = live.get(g)
+            if v is None:
+                continue
+            terms[term] = terms[term] + w[g] * v
+        # PHR quadratic on the LIVE residual.  Keys ``pen_<group>`` are absent
+        # when the coefficient is zero, so a caller that does not pass them is
+        # bit-identical (not "plus a zero").  ``w`` above only copies keys it
+        # already names -- these ride the original ``weights`` dict.
+        if weights:
+            for g, term in TERM_FOR_GROUP.items():
+                p = weights.get(f"pen_{g}")
+                if p is None:
+                    continue
+                v = live.get(g)
+                if v is None:
+                    continue
+                terms[term] = terms[term] + 0.5 * p * v.clamp_min(0.0).square()
         total = sum(terms.values())
-        return CostTerms(total=total, terms=terms, raw=raw, violations=viol,
-                         diagnostics=diag, counts=counts)
+        # Balance-only reference: the exact warning + AL wall attributable to
+        # yaw/pitch/roll inside the global joint-box term.  It is NOT added to
+        # ``total`` again; one-sided PCGrad uses only its gradient direction.
+        box_waist_key = limit_group_name("joint_box", "waist")
+        box_waist = (
+            cfg.w_joint_box * raw[box_waist_key]
+            + w[box_waist_key] * live[box_waist_key]
+        )
+        if weights:
+            p = weights.get(f"pen_{box_waist_key}")
+            if p is not None:
+                box_waist = (
+                    box_waist
+                    + 0.5 * p * live[box_waist_key].clamp_min(0.0).square()
+                )
+        return CostTerms(
+            total=total, terms=terms, raw=raw, violations=viol,
+            diagnostics=diag, counts=counts,
+            balance_terms={box_waist_key: box_waist},
+            aux_labels=(
+                self._aux_labels_from_plant(
+                    sp, ss, tau, v0,
+                    torque_mode=aux_mode,
+                    tau_kernel=aux_tau_kernel,
+                    tau_track=tau_track,
+                    B=B, D=D,
+                )
+                if aux_mode is not None else None
+            ),
+        )
 
     __call__ = forward
 
@@ -1218,11 +1892,19 @@ class FusedCost:
         return torch.stack([both, left, right], dim=1)
 
     # ---------------------------------------------------------- collision --
-    def _points_world(self, frames, hand: str) -> torch.Tensor:
+    def _points_world(self, frames, hand: str, ctx=None) -> torch.Tensor:
         R, p = frames[f"{hand}_wrist"]
-        return ChainFK.points_world(R, p, self.c_points[hand].to(p.dtype))
+        local = self.c_points[hand]
+        if ctx is not None and getattr(ctx, "stick_points_local", None) is not None:
+            # (B, 2, P, 3) -> (B, P, 3) for this hand, then repeated over the S
+            # spline samples the frames were flattened to.
+            hi = 0 if hand == "left" else 1
+            per = ctx.stick_points_local[:, hi].to(p.dtype)          # (B, P, 3)
+            reps = p.shape[0] // per.shape[0]
+            local = per.repeat_interleave(reps, dim=0) if reps > 1 else per
+        return ChainFK.points_world(R, p, local.to(p.dtype))
 
-    def _collision(self, frames, B, S, ctx, m_hand, raw, viol, diag, counts, sp) -> None:
+    def _collision(self, frames, B, S, ctx, m_hand, raw, viol, live, diag, counts, sp) -> None:
         cfg = self.cfg
         dtype = self.c_heads.dtype
         D = self.n_drums
@@ -1238,19 +1920,22 @@ class FusedCost:
         n_seen = 0.0
         # The smooth-max half is built from the SAME hinges the means reduce,
         # collected flat and concatenated so ONE :func:`smooth_max` sees every
-        # (knot, point, drum) pair of both hands and all three collision types
-        # -- a per-hand max combined afterwards would be a max of p-norms, not
-        # the p-norm of the union.  Only assembled when the term is priced: the
-        # concatenation is ~9 k floats per sample and the default weight is 0.
+        # (knot, capsule/wrist, drum) pair of both hands and all three collision
+        # types -- a per-hand max combined afterwards would be a max of
+        # p-norms, not the p-norm of the union.  Only assembled when the term
+        # is priced.
         want_peak = cfg.w_collision_peak > 0.0
         peak_h: list[torch.Tensor] = []
         peak_m: list[torch.Tensor] = []
+        #: Each hand's world sample points, kept for the CROSS-HAND block after
+        #: the loop -- the per-hand pass already pays for the transform.
+        pts_by_hand: dict[str, torch.Tensor] = {}
         # Domain randomization moves the drums; when the caller supplies the
         # per-sample head centres (fix B) the collision scene is rebuilt from
         # them, so it agrees with the terminal cost and the goal tokens.
         if ctx.drum_head_centers is None:
-            body_c = self.c_body_c.view(1, 1, 1, D, 3)
-            under_c = self.c_under_c.view(1, 1, 1, D, 3)
+            body_c = self.c_body_c.view(1, 1, D, 3)
+            under_c = self.c_under_c.view(1, 1, D, 3)
         else:
             # The context tokens are padded to ``num_drums`` slots; the scene
             # has however many the layout defines. Row i is drum id i in both
@@ -1258,21 +1943,25 @@ class FusedCost:
             # them up.
             heads_b = ctx.drum_head_centers[:, :D].to(dtype)   # (B, D, 3)
             axb = self.c_axes.view(1, D, 3)
-            body_c = (heads_b - self.c_half_h.view(1, D, 1) * axb).view(B, 1, 1, D, 3)
+            body_c = (heads_b - self.c_half_h.view(1, D, 1) * axb).view(B, 1, D, 3)
             under_top_b = heads_b - self.c_heights_uc.view(1, D, 1) * axb
-            under_c = (under_top_b - self.c_under_off * axb).view(B, 1, 1, D, 3)
+            under_c = (under_top_b - self.c_under_off * axb).view(B, 1, D, 3)
+        # The RADII are per-sample for the same reason (``per_drum_radius``);
+        # they are frame-free, so the context column is used verbatim.  Sliced
+        # to the scene's drum count exactly as the centres are: the tokens are
+        # padded to ``num_drums`` and row i is drum id i in both.
+        if ctx.drum_radii is None:
+            rad = self.c_radii.view(1, 1, D)
+        else:
+            rad = ctx.drum_radii[:, :D].to(dtype).view(B, 1, D)
+        ax = self.c_axes.view(1, 1, D, 3)
+        half_h = self.c_half_h.view(1, 1, D)
+        under_half = self.c_under_half.view(1, 1, D)
 
         for hi, hand in enumerate(_HANDS):
-            pts = self._points_world(frames, hand).reshape(B, S, P, 3)
-            x = pts.unsqueeze(3)  # (B,S,P,1,3)
-            ax = self.c_axes.view(1, 1, 1, D, 3)
-            rad = self.c_radii.view(1, 1, 1, D)
-            sdf_b = point_cylinder_sdf(
-                x, body_c, ax, rad, self.c_half_h.view(1, 1, 1, D),
-            ) - self.c_pt_radii.view(1, 1, P, 1)
-            sdf_u = point_cylinder_sdf(
-                x, under_c, ax, rad, self.c_under_half.view(1, 1, 1, D),
-            ) - self.c_pt_radii.view(1, 1, P, 1)
+            pts = self._points_world(frames, hand, ctx).reshape(B, S, P, 3)
+            pts_by_hand[hand] = pts
+            tip_w, butt_w, wrist_w = pts[:, :, 0], pts[:, :, 1], pts[:, :, -1]
 
             # --- exemption windows (mirror TrajectoryScorer) -----------------
             k = ctx.hit_index[:, hi]
@@ -1283,40 +1972,47 @@ class FusedCost:
             if cfg.start_exempt_waypoints <= 0:
                 win_start = torch.zeros_like(win_start)
 
-            rows_t = (
-                self.c_row_tip.view(1, P)
-                + self.c_row_shaft.view(1, P) * ctx.shaft_allowed[:, hi : hi + 1]
-            ).clamp_max(1.0)
-            rows_s = (
-                self.c_row_tip.view(1, P)
-                + self.c_row_shaft.view(1, P) * ctx.start_shaft_allowed[:, hi : hi + 1]
-            ).clamp_max(1.0)
             tgt = ctx.target_drum[:, hi]
             src = ctx.start_drum[:, hi]
             oh_t = F.one_hot(tgt.clamp(min=0), D).to(dtype) * (tgt >= 0).to(dtype).unsqueeze(-1)
             oh_s = F.one_hot(src.clamp(min=0), D).to(dtype) * (src >= 0).to(dtype).unsqueeze(-1)
-            ex = (
-                win_strike.view(B, S, 1, 1) * rows_t.view(B, 1, P, 1) * oh_t.view(B, 1, 1, D)
-                + win_start.view(B, S, 1, 1) * rows_s.view(B, 1, P, 1) * oh_s.view(B, 1, 1, D)
+            # Stick capsule vs the TARGET (and, at departure, the START) drum
+            # is exempted: a hit is contact, so those waypoints cannot also be
+            # a collision.  Pads and cymbals share this now that both are
+            # capsules; HIT membership is still tip-only on pads.  The wrist
+            # sphere is never exempted.
+            ex_cap = (
+                win_strike.unsqueeze(-1) * oh_t.unsqueeze(1)
+                + win_start.unsqueeze(-1) * oh_s.unsqueeze(1)
             ).clamp_max(1.0)
-            keep = 1.0 - ex  # (B,S,P,D)
-            smask = m_hand[hand].view(B, S, 1, 1)
+            smask = m_hand[hand]  # (B, S)
+            w_cap = (1.0 - ex_cap) * smask.unsqueeze(-1)  # (B,S,D)
+            w_wr = smask.unsqueeze(-1).expand(B, S, D)
 
-            hd = _softplus_hinge(cfg.collision_margin - sdf_b, cfg.beta_collision)
-            hu = _softplus_hinge(cfg.collision_margin - sdf_u, cfg.beta_collision)
-            w = keep * smask
-            wf = w.reshape(B, -1) if want_peak else None
+            cap_b = segment_cylinder_sdf(
+                butt_w.unsqueeze(2), tip_w.unsqueeze(2),
+                body_c, ax, rad, half_h, ra=self.c_stick_r,
+            )
+            cap_u = segment_cylinder_sdf(
+                butt_w.unsqueeze(2), tip_w.unsqueeze(2),
+                under_c, ax, rad, under_half, ra=self.c_stick_r,
+            )
+            wr_x = wrist_w.unsqueeze(2)  # (B,S,1,3) broadcasts vs (.,1,D,3)
+            sdf_wb = point_cylinder_sdf(wr_x, body_c, ax, rad, half_h) - self.c_wrist_r
+            sdf_wu = point_cylinder_sdf(wr_x, under_c, ax, rad, under_half) - self.c_wrist_r
+            hdc = _softplus_hinge(cfg.collision_margin - cap_b, cfg.beta_collision)
+            huc = _softplus_hinge(cfg.collision_margin - cap_u, cfg.beta_collision)
+            hdw = _softplus_hinge(cfg.collision_margin - sdf_wb, cfg.beta_collision)
+            huw = _softplus_hinge(cfg.collision_margin - sdf_wu, cfg.beta_collision)
 
             # --- time-bucketed drum collision (diagnostic only) ---------
-            # Per-timestep hinge, mean over (points, drums) for this hand
-            hsum = ((hd + hu) * w).sum(dim=(2, 3))        # (B, S)
-            hcnt = w.sum(dim=(2, 3)).clamp_min(1.0)        # (B, S)
+            hsum = ((hdc + huc) * w_cap + (hdw + huw) * w_wr).sum(dim=2)
+            hcnt = (w_cap + w_wr).sum(dim=2).clamp_min(1.0)
             hps = hsum / hcnt                               # (B, S)
-            # Distance to hit in waypoints (positive = before hit)
-            k_wp = k.float().view(B, 1)                     # (B, 1)
-            dist_wp = k_wp - s_idx.float() / float(n_sub)   # (B, S)
+            k_wp = k.float().view(B, 1)
+            dist_wp = k_wp - s_idx.float() / float(n_sub)
             exempt_start = float(cfg.strike_exempt_waypoints)
-            nohit = (k <= 0).view(B, 1)                     # (B, 1): idle hand
+            nohit = (k <= 0).view(B, 1)
             b_far  = (dist_wp > 10.0) & ~nohit
             b_mid  = (dist_wp > 3.0) & (dist_wp <= 10.0) & ~nohit
             b_near = (dist_wp > exempt_start) & (dist_wp <= 3.0) & ~nohit
@@ -1329,32 +2025,41 @@ class FusedCost:
                     (hps * bm.float()).sum(dim=1) / bc
                 ).detach()
 
-            hand_pen_d = (hd * w).sum(dim=(1, 2, 3))
-            hand_pen_u = (hu * w).sum(dim=(1, 2, 3))
-            hand_n = w.sum(dim=(1, 2, 3))
+            hand_pen_d = (hdc * w_cap + hdw * w_wr).sum(dim=(1, 2))
+            hand_pen_u = (huc * w_cap + huw * w_wr).sum(dim=(1, 2))
+            hand_n = (w_cap + w_wr).sum(dim=(1, 2))
             pen_d = pen_d + hand_pen_d
             pen_u = pen_u + hand_pen_u
             n_seen = n_seen + hand_n
 
-            # --- self collision ---------------------------------------------
+            # --- self collision: stick capsule + wrist vs torso / head ------
             Rt, pt = frames["torso"]
             off = lambda loc: (pt + (Rt @ loc.to(pt.dtype).view(1, 3, 1)).squeeze(-1)
-                               ).reshape(B, S, 3).unsqueeze(2)
+                               ).reshape(B, S, 3)
             a = off(self.c_torso_a)
             b = off(self.c_torso_b)
             hc = off(self.c_head_c)
-            s_t = point_capsule_sdf(pts, a, b, self.c_torso_r)
-            s_h = point_sphere_sdf(pts, hc, self.c_head_r)
-            sdf_self = torch.minimum(s_t, s_h) - self.c_pt_radii.view(1, 1, P)
-            ws = m_hand[hand].view(B, S, 1)
-            hs = _softplus_hinge(cfg.collision_margin - sdf_self, cfg.beta_collision)
-            pen_s = pen_s + (hs * ws).sum(dim=(1, 2))
+            s_t = segment_segment_sdf(
+                butt_w, tip_w, a, b, self.c_stick_r, self.c_torso_r,
+            )
+            s_h = segment_segment_sdf(
+                butt_w, tip_w, hc, hc, self.c_stick_r, self.c_head_r,
+            )
+            s_wt = point_capsule_sdf(wrist_w, a, b, self.c_torso_r) - self.c_wrist_r
+            s_wh = point_sphere_sdf(wrist_w, hc, self.c_head_r) - self.c_wrist_r
+            sdf_self_st = torch.minimum(s_t, s_h)
+            sdf_self_wr = torch.minimum(s_wt, s_wh)
+            hs_st = _softplus_hinge(cfg.collision_margin - sdf_self_st, cfg.beta_collision)
+            hs_wr = _softplus_hinge(cfg.collision_margin - sdf_self_wr, cfg.beta_collision)
+            pen_s = pen_s + (hs_st * smask + hs_wr * smask).sum(dim=1)
 
             # --- raw violation (penetration depth), for the multipliers -------
-            big = torch.full_like(sdf_b, 1e3)
-            vd = torch.where(w > 0.5, (-sdf_b).clamp_min(0.0), torch.zeros_like(sdf_b))
-            vu = torch.where(w > 0.5, (-sdf_u).clamp_min(0.0), torch.zeros_like(sdf_u))
-            vs = (-sdf_self).clamp_min(0.0) * ws
+            vdc = torch.where(w_cap > 0.5, (-cap_b).clamp_min(0.0), torch.zeros_like(cap_b))
+            vuc = torch.where(w_cap > 0.5, (-cap_u).clamp_min(0.0), torch.zeros_like(cap_u))
+            vdw = torch.where(w_wr > 0.5, (-sdf_wb).clamp_min(0.0), torch.zeros_like(sdf_wb))
+            vuw = torch.where(w_wr > 0.5, (-sdf_wu).clamp_min(0.0), torch.zeros_like(sdf_wu))
+            vs_st = (-sdf_self_st).clamp_min(0.0) * smask
+            vs_wr = (-sdf_self_wr).clamp_min(0.0) * smask
             if want_peak:
                 # The peak half reduces the PENETRATION, not the margin-softplus
                 # the means reduce.  Measured on the champion's 243-case grid,
@@ -1368,20 +2073,37 @@ class FusedCost:
                 # ``pen_count == 0``, with no margin and no smoothing.  The
                 # margin and the softplus belong to the MEAN, whose job is dense
                 # shaping on the safe side; the peak's job is the gate.
-                peak_h += [vd.reshape(B, -1), vu.reshape(B, -1),
-                           vs.reshape(B, -1)]
-                peak_m += [wf, wf, ws.expand(B, S, P).reshape(B, -1)]
+                peak_h += [vdc.reshape(B, -1), vuc.reshape(B, -1),
+                           vdw.reshape(B, -1), vuw.reshape(B, -1),
+                           vs_st, vs_wr]
+                peak_m += [w_cap.reshape(B, -1), w_cap.reshape(B, -1),
+                           w_wr.reshape(B, -1), w_wr.reshape(B, -1),
+                           smask, smask]
             hand_max = torch.maximum(
-                torch.maximum(vd.amax(dim=(1, 2, 3)), vu.amax(dim=(1, 2, 3))),
-                vs.amax(dim=(1, 2)),
+                torch.maximum(vdc.amax(dim=(1, 2)), vuc.amax(dim=(1, 2))),
+                torch.maximum(
+                    torch.maximum(vdw.amax(dim=(1, 2)), vuw.amax(dim=(1, 2))),
+                    torch.maximum(vs_st.amax(dim=1), vs_wr.amax(dim=1)),
+                ),
             )
             v_max = hand_max if v_max is None else torch.maximum(v_max, hand_max)
+            big = 1.0e3
             msd = torch.minimum(
-                torch.where(w > 0.5, sdf_b, big).amin(dim=(1, 2, 3)),
-                torch.where(w > 0.5, sdf_u, big).amin(dim=(1, 2, 3)),
+                torch.minimum(
+                    torch.where(w_cap > 0.5, cap_b, big).amin(dim=(1, 2)),
+                    torch.where(w_cap > 0.5, cap_u, big).amin(dim=(1, 2)),
+                ),
+                torch.minimum(
+                    torch.where(w_wr > 0.5, sdf_wb, big).amin(dim=(1, 2)),
+                    torch.where(w_wr > 0.5, sdf_wu, big).amin(dim=(1, 2)),
+                ),
             )
             msd = torch.minimum(
-                msd, torch.where(ws > 0.5, sdf_self, big[..., 0]).amin(dim=(1, 2))
+                msd,
+                torch.minimum(
+                    torch.where(smask > 0.5, sdf_self_st, big).amin(dim=1),
+                    torch.where(smask > 0.5, sdf_self_wr, big).amin(dim=1),
+                ),
             )
             min_sdf = msd if min_sdf is None else torch.minimum(min_sdf, msd)
 
@@ -1396,14 +2118,126 @@ class FusedCost:
             diag[f"collision_min_sdf_{hand}"] = msd.detach()
             diag[f"collision_pen_max_{hand}"] = hand_max.detach()
 
+        # --- cross-hand: stick vs stick, wrist vs stick, wrist vs wrist ------
+        # Everything above scores ONE hand's capsule against the drums and
+        # against the torso/head; the two hands' geometry was never compared to
+        # itself, so nothing in the cost forbade the two sticks from passing
+        # through each other.
+        #
+        # The stick AXIS is recoverable from the very points the loop scored:
+        # row 0 is the bead and row 1 is the first shaft sample, which BOTH
+        # producers of the cloud put at the BUTT -- ``fk.stick_shaft_offsets``
+        # and the per-sample randomized :func:`stick_cost_from_context` start
+        # their linspace at ``butt_sigma``.  So [row 1 -> row 0] is the whole
+        # 0.40 m stick.
+        pl, pr = pts_by_hand["left"], pts_by_hand["right"]      # (B, S, P, 3)
+        l_tip, l_butt, l_wr = pl[:, :, 0], pl[:, :, 1], pl[:, :, -1]
+        r_tip, r_butt, r_wr = pr[:, :, 0], pr[:, :, 1], pr[:, :, -1]
+        rs, rw = self.c_stick_r, self.c_wrist_r
+        sdf_x = torch.minimum(
+            torch.minimum(
+                cross_hand_sdf(l_butt, l_tip, r_butt, r_tip, rs, rs),
+                cross_hand_sdf(l_wr, l_wr, r_butt, r_tip, rw, rs),
+            ),
+            torch.minimum(
+                cross_hand_sdf(r_wr, r_wr, l_butt, l_tip, rw, rs),
+                cross_hand_sdf(l_wr, l_wr, r_wr, r_wr, rw, rw),
+            ),
+        )                                                       # (B, S)
+        # A sample counts only where BOTH hands are inside their horizon: past
+        # it the frames are the held tail and the two sticks are not
+        # simultaneously real.
+        wx = m_hand["left"] * m_hand["right"]                    # (B, S)
+        hx = _softplus_hinge(cfg.collision_margin - sdf_x, cfg.beta_collision)
+        n_x = wx.sum(dim=1)
+        pen_x = (hx * wx).sum(dim=1)
+        # Its OWN denominator, not ``n_seen``: this term has S elements per row
+        # against the drum block's 2 x S x D (capsule + wrist, both hands),
+        # and sharing the divisor would silently scale the weight.
+        raw["collision_stick"] = (
+            pen_x / n_x.clamp_min(1.0) if cfg.reduction == "mean" else pen_x
+        )
+        big_x = torch.full_like(sdf_x, 1e3)
+        vx = (-sdf_x).clamp_min(0.0) * wx
+        msd_x = torch.where(wx > 0.5, sdf_x, big_x).amin(dim=1)
+        # The SHARED reductions -- the augmented-Lagrangian violation, the peak
+        # group and the reported ``collision_min_sdf`` -- see the cross-hand
+        # pair only once the term is PRICED.  At the default
+        # ``w_stick_stick = 0`` the multiplier dynamics, the smooth max and
+        # every logged number are therefore bit-identical to the pre-cross-hand
+        # form; the two diagnostics below are computed either way, so a run can
+        # measure its cross-hand clearance before paying for it.
+        if cfg.w_stick_stick > 0.0:
+            if want_peak:
+                peak_h.append(vx)
+                peak_m.append(wx)
+            vx_max = vx.amax(dim=1)
+            v_max = vx_max if v_max is None else torch.maximum(v_max, vx_max)
+            min_sdf = msd_x if min_sdf is None else torch.minimum(min_sdf, msd_x)
+        diag["collision_stick"] = raw["collision_stick"].detach()
+        # A row with no jointly-valid sample reports the raw closest approach
+        # rather than the 1e3 sentinel, which would swamp the batch mean the
+        # training log records.
+        diag["collision_stick_min_sdf"] = torch.where(
+            n_x > 0.5, msd_x, sdf_x.amin(dim=1)
+        ).detach()
+        counts["collision_stick"] = n_x.detach()
+
+        # --- tip lateral ordering (plain objective; not AL) -----------------
+        # Bead tips from the same world cloud the collision loop already paid
+        # for; torso frame so waist yaw cannot flip the left/right label.
+        # ``d = tip_L.y - tip_R.y``; correct order is d >= margin.  Sample 0 is
+        # excluded: its q is measured q0 and cannot be optimized (same reason
+        # as the waist-rate knot-0 exclusion).
+        Rt, pt = frames["torso"]
+        Rt_bs = Rt.reshape(B, S, 3, 3)
+        pt_bs = pt.reshape(B, S, 3)
+        tip_l = pts_by_hand["left"][:, :, 0, :]
+        tip_r = pts_by_hand["right"][:, :, 0, :]
+        yl = torch.einsum(
+            "bsij,bsj->bsi", Rt_bs.transpose(-1, -2), tip_l - pt_bs
+        )[..., 1]
+        yr = torch.einsum(
+            "bsij,bsj->bsi", Rt_bs.transpose(-1, -2), tip_r - pt_bs
+        )[..., 1]
+        d_lat = yl - yr  # (B, S); >= 0 when left tip is more leftward
+        wx_ord = m_hand["left"] * m_hand["right"]
+        wx_ord = torch.cat(
+            [torch.zeros_like(wx_ord[:, :1]), wx_ord[:, 1:]], dim=1
+        )
+        h_ord = _softplus_hinge(
+            cfg.tip_crossover_margin - d_lat, cfg.beta_tip_crossover
+        )
+        n_ord = wx_ord.sum(dim=1)
+        pen_ord = (h_ord * wx_ord).sum(dim=1)
+        raw["tip_crossover"] = (
+            pen_ord / n_ord.clamp_min(1.0) if cfg.reduction == "mean" else pen_ord
+        )
+        counts["tip_crossover"] = n_ord.detach()
+        # Signed lateral separation (min over jointly-valid samples) and the
+        # peak crossover depth ``relu(-d)``.
+        big_lat = torch.full_like(d_lat, 1e3)
+        d_masked = torch.where(wx_ord > 0.5, d_lat, big_lat)
+        diag["tip_lateral_min"] = torch.where(
+            n_ord > 0.5, d_masked.amin(dim=1), d_lat.amin(dim=1)
+        ).detach()
+        cross_depth = (-d_lat).clamp_min(0.0)
+        diag["tip_crossover_max"] = torch.where(
+            n_ord > 0.5,
+            torch.where(wx_ord > 0.5, cross_depth, torch.zeros_like(cross_depth)
+                        ).amax(dim=1),
+            cross_depth.amax(dim=1),
+        ).detach()
+
         denom = n_seen.clamp_min(1.0) if cfg.reduction == "mean" else 1.0
         raw["collision_drum"] = pen_d / denom
         raw["collision_under"] = pen_u / denom
         raw["collision_self"] = pen_s / denom
         if want_peak:
+            hcat = torch.cat(peak_h, dim=1)
+            mcat = torch.cat(peak_m, dim=1)
             raw["collision_peak"] = smooth_max(
-                torch.cat(peak_h, dim=1), torch.cat(peak_m, dim=1),
-                cfg.collision_peak_mode, cfg.collision_peak_p,
+                hcat, mcat, cfg.collision_peak_mode, cfg.collision_peak_p,
                 cfg.collision_peak_temp, dims=(1,),
             )
         else:
@@ -1411,18 +2245,15 @@ class FusedCost:
             # builds the concatenation and the term is bit-identical to the
             # pre-peak form.
             raw["collision_peak"] = torch.zeros_like(pen_d)
-        viol["collision"] = v_max.detach() if v_max is not None else pen_d.detach() * 0
+        coll_live = v_max if v_max is not None else pen_d * 0
+        viol["collision"] = coll_live.detach()
         # The peak group integrates the SAME per-sample max penetration as
-        # ``collision``.  That is not an oversight: ``viol["collision"]`` has
-        # always been a max (unlike ``viol["torque"]``, which is a mean), so
-        # there is no second quantity to hand the new group, and making the
-        # mean group's violation a mean would change the multiplier dynamics of
-        # every existing run.  The two groups are still worth separating -- the
-        # PENALTIES they scale differ by ``n_seen``, and each carries its own
-        # ``rho`` -- but they will track the same signal.  See DECISIONS.
+        # ``collision`` for the dual; the priced half is a smooth max.
         viol["collision_peak"] = viol["collision"]
+        live["collision"] = coll_live
+        live["collision_peak"] = coll_live
         diag["collision_min_sdf"] = min_sdf.detach()
-        diag["collision_pen_max"] = v_max.detach()
+        diag["collision_pen_max"] = coll_live.detach()
         # Per-type breakdown (the three sub-costs before weighting)
         diag["collision_drum"] = raw["collision_drum"].detach()
         diag["collision_under"] = raw["collision_under"].detach()
@@ -1472,16 +2303,141 @@ class FusedCost:
             2, self.c_joint_group
         )
 
-    def _torque(self, sp, ss, v0, B, S, D, ctx, raw, viol, diag, counts) -> None:
+    def _torque_off(
+        self, B, ss, raw, viol, live, diag, counts, *, zero_viol: bool = True,
+    ) -> None:
+        """Skip coupled RNEA torque: zero hinge, peak, segment groups, effort."""
+        z = ss.q.new_zeros(B)
+        raw["torque"] = z
+        raw["torque"].requires_grad_(False)
+        raw["torque_peak"] = z
+        raw["torque_peak"].requires_grad_(False)
+        if zero_viol:
+            raw["torque_static"] = z
+            raw["torque_static"].requires_grad_(False)
+            viol["torque"] = z.detach()
+            viol["torque_peak"] = z.detach()
+            live["torque"] = z
+            live["torque_peak"] = z
+            for name, _idx in self.c_seg:
+                key = f"torque_{name}"
+                raw[key] = z
+                raw[key].requires_grad_(False)
+                viol[key] = z.detach()
+                live[key] = z
+            diag["torque_hinge_max"] = z.detach()
+            diag["torque_excess_max"] = z.detach()
+            diag["torque_max"] = z.detach()
+            diag["torque_frac_over"] = z.detach()
+            diag["torque_static_max"] = z.detach()
+        diag["torque_sq_mean"] = z.detach()
+        diag["torque_abs_mean"] = z.detach()
+        raw["effort"] = z
+        raw["effort"].requires_grad_(False)
+        counts["torque"] = z.detach()
+        counts["effort"] = z.detach()
+        if zero_viol:
+            counts["torque_static"] = z.detach()
+
+    def _torque_static(
+        self, sp, ss, v0, B, S, D, raw, viol, live, diag, counts, lim_alpha=None,
+    ) -> None:
+        """Gravity-only static torque: τ_g = RNEA(q, 0, 0).
+
+        Warning at ``w_torque_static * raw["torque_static"]``.  When
+        ``torque_static_al``, also fills the ``torque_*`` AL groups from the
+        hard ReLU excess (same groups as coupled RNEA).
+        """
+        cfg = self.cfg
+        if cfg.physics_mode == "knot_fd":
+            q, _qd, _qdd = sp.knot_finite_differences(v0)
+            idx = torch.arange(
+                sp.max_segments + 1, device=q.device, dtype=torch.long,
+            ).view(1, -1, 1)
+            mask = (idx <= sp.lengths.unsqueeze(1)).to(q.dtype)
+        else:
+            q, mask = ss.q, ss.mask
+        n = q.shape[1]
+        q_flat = q.reshape(B * n, D)
+        zd = torch.zeros_like(q_flat)
+        tau_g = self.rnea.rnea(q_flat, zd, zd).reshape(B, n, D)
+        tighten = self.c_static_torque_tighten.view(1, 1, D)
+        lim_hard = available_torque_torch(
+            zd.reshape(B, n, D), self.tau_hard.view(1, 1, D),
+            self.v_hard.view(1, 1, D),
+            eta=1.0, saturation_scale=cfg.torque_saturation_scale,
+            derate=cfg.torque_derate,
+        ) / tighten
+        lim = cfg.eta_torque * lim_hard
+        excess = tau_g.abs() - lim
+        h = _softplus_hinge(excess, cfg.beta_torque)
+        ss_local = _Rates(q, zd.reshape(B, n, D), zd.reshape(B, n, D), mask)
+        val, cnt = self._reduce(
+            h if lim_alpha is None else h * lim_alpha, ss_local.mask, (1, 2),
+        )
+        raw["torque_static"] = val
+        diag["torque_static_max"] = (h * ss_local.mask).amax(dim=(1, 2)).detach()
+        counts["torque_static"] = cnt.detach()
+        if not cfg.torque_static_al:
+            return
+        over = (tau_g.abs() - lim_hard).clamp_min(0.0) * ss_local.mask
+        if cfg.w_torque_peak > 0.0:
+            raw["torque_peak"] = smooth_max(
+                over, ss_local.mask, cfg.torque_peak_mode, cfg.torque_peak_p,
+                cfg.torque_peak_temp, dims=(1, 2),
+            )
+        else:
+            z = tau_g.new_zeros(B)
+            raw["torque_peak"] = z
+            raw["torque_peak"].requires_grad_(False)
+        mean_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        peak_live = over.amax(dim=(1, 2))
+        viol["torque"] = mean_live.detach()
+        viol["torque_peak"] = peak_live.detach()
+        live["torque"] = mean_live
+        live["torque_peak"] = peak_live
+        h_priced = h if lim_alpha is None else h * lim_alpha
+        self._emit_limit_segments(
+            "torque", over, h_priced, ss_local.mask, cnt, raw, viol, live,
+        )
+        diag["torque_hinge_max"] = (h * ss_local.mask).amax(dim=(1, 2)).detach()
+        diag["torque_excess_max"] = viol["torque_peak"]
+        diag["torque_max"] = (tau_g.abs() * ss_local.mask).amax(dim=(1, 2)).detach()
+        diag["torque_frac_over"] = (
+            (over > 0).to(tau_g.dtype).sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        ).detach()
+
+    def _torque_level_a(
+        self,
+        q_flat: torch.Tensor,
+        qdd_flat: torch.Tensor,
+        *,
+        frozen: bool,
+    ) -> torch.Tensor:
+        """Decoupled torque: ``g(q) + diag(M) @ qdd`` (no Coriolis / coupling)."""
+        z = torch.zeros_like(q_flat)
+        tau_g = self.rnea.rnea(q_flat, z, z)
+        if frozen:
+            m_diag = self._m_diag_ready.to(device=q_flat.device, dtype=q_flat.dtype)
+            return tau_g + m_diag.unsqueeze(0) * qdd_flat
+        from .pd_sim import mass_matrix
+
+        M = mass_matrix(self.rnea, q_flat)
+        m_diag = torch.diagonal(M, dim1=-2, dim2=-1)
+        return tau_g + m_diag * qdd_flat
+
+    def _torque(self, sp, ss, v0, B, S, D, ctx, raw, viol, live, diag, counts,
+                lim_alpha=None, *, torque_full_blend: float = 1.0) -> torch.Tensor:
         """RNEA torque against ``eta_torque`` x the effort limits.
 
-        Two reductions of the SAME hinge array ``h``, both returned:
+        Two reductions, both returned:
 
-        * ``raw["torque"]`` -- the mean over valid ``(knot, joint)`` elements,
-          the file-wide convention.
-        * ``raw["torque_peak"]`` -- a differentiable smooth max over those same
-          elements (:func:`smooth_max`), priced by ``cfg.w_torque_peak`` and by
-          its OWN augmented-Lagrangian multiplier ``w["torque_peak"]``.
+        * ``raw["torque"]`` -- the mean softplus over valid ``(knot, joint)``
+          elements (warning, priced at ``cfg.w_torque``, never × λ).
+        * ``raw["torque_peak"]`` -- a **smooth max** of ReLU excess
+          ``relu(|τ| - lim_hard)`` over valid elements, priced by
+          ``cfg.w_torque_peak * λ_peak``.  A feasible row is identically 0.
+          ``viol`` / ``live["torque_peak"]`` stay the horizon **hard max**.
 
         Each half reports its own raw violation, because the two are the same
         physical quantity reduced differently and are ~``n_valid`` apart in
@@ -1494,6 +2450,8 @@ class FusedCost:
           quantity the acceptance gate thresholds.
 
         Both are detached, both are exactly zero on a feasible sample.
+        Per-actuator-class groups (``torque_*``) carry the hierarchical dual
+        residual; the family mean is a diagnostic alias, not an AL group.
 
         The peak exists because the mean is the wrong SHAPE for the gate it is
         supposed to move.  ``ok_torque`` in the eval harness is a zero-tolerance
@@ -1504,9 +2462,11 @@ class FusedCost:
         0.87 N*m.  One such element moves the mean by ~0.3 % of its own size --
         roughly 1e-3 N*m of loss -- while failing the case outright.  Averaging
         is exactly the operation that destroys the signal, so the peak term puts
-        a max-shaped one back alongside it (the mean is kept: it is what gives
-        every element gradient on the safe side of the limit, and what keeps the
-        term from collapsing onto whichever single element happens to be worst).
+        a max-shaped one back alongside it (the mean is kept: it is the warning
+        that gives every element gradient on the safe side of the limit).
+
+        Returns the signed RNEA ``tau`` of shape ``(B, n, D)`` so a caller that
+        also wants aux torque labels can reuse it without a second RNEA.
         """
         cfg = self.cfg
         if cfg.physics_mode == "knot_fd":
@@ -1518,34 +2478,68 @@ class FusedCost:
         else:
             q, qd, qdd, mask = ss.q, ss.qd, ss.qdd, ss.mask
         n = q.shape[1]
-        tau = self.rnea.rnea(
-            q.reshape(B * n, D), qd.reshape(B * n, D), qdd.reshape(B * n, D)
-        ).reshape(B, n, D)
-        lim_hard = self.tau_hard.view(1, 1, D)
-        if cfg.torque_derate == "linear":
-            sat = cfg.torque_saturation_scale * lim_hard
-            derate = sat * (1.0 - qd.abs() / self.v_hard.view(1, 1, D)).clamp(0.0, 1.0)
-            lim_hard = torch.minimum(lim_hard.expand_as(derate), derate)
-        lim = cfg.eta_torque * lim_hard
+        q_flat = q.reshape(B * n, D)
+        qd_flat = qd.reshape(B * n, D)
+        qdd_flat = qdd.reshape(B * n, D)
+        blend = float(torque_full_blend)
+        use_level_a = cfg.torque_physics != "full" and blend < 1.0 - 1.0e-6
+        if not use_level_a:
+            tau = self.rnea.rnea(q_flat, qd_flat, qdd_flat).reshape(B, n, D)
+        elif blend <= 1.0e-6:
+            frozen = cfg.torque_physics == "diag_grav_frozen"
+            tau = self._torque_level_a(
+                q_flat, qdd_flat, frozen=frozen,
+            ).reshape(B, n, D)
+        else:
+            tau_full = self.rnea.rnea(q_flat, qd_flat, qdd_flat)
+            frozen = cfg.torque_physics == "diag_grav_frozen"
+            tau_simple = self._torque_level_a(q_flat, qdd_flat, frozen=frozen)
+            tau = (blend * tau_full + (1.0 - blend) * tau_simple).reshape(B, n, D)
+        # ONE definition of the limit, shared with the tracking hinge, the
+        # plant's optional clamp and the eval gate: ``available_torque``.
+        # ``eta=1.0`` is the derated HARD rating (what the raw violation is
+        # measured against); the hinge sits at ``eta_torque`` x that.
+        lim_hard = available_torque_torch(
+            qd, self.tau_hard.view(1, 1, D), self.v_hard.view(1, 1, D),
+            eta=1.0, saturation_scale=cfg.torque_saturation_scale,
+            derate=cfg.torque_derate,
+        )
+        lim = self.c_torque_eta.view(1, 1, D) * lim_hard
         excess = tau.abs() - lim
         h = _softplus_hinge(excess, cfg.beta_torque)
         ss = _Rates(q, qd, qdd, mask)  # local alias for the reductions below
-        val, cnt = self._reduce(h, ss.mask, (1, 2))
-        raw["torque"] = val
-        raw["torque_peak"] = smooth_max(
-            h, ss.mask, cfg.torque_peak_mode, cfg.torque_peak_p, cfg.torque_peak_temp,
-            dims=(1, 2),
+        # ``lim_alpha`` (1, 1, D) prices the hinge PER JOINT before the mean.
+        # The denominator ``cnt`` is the unweighted element count, so this is a
+        # re-weighted mean over the same elements, not a change of normalization.
+        # Applied to the MEAN warning only: ``raw["torque_peak"]`` is the
+        # unscaled smooth-max ReLU excess, and every diagnostic keeps the
+        # unscaled ``h``.
+        val, cnt = self._reduce(
+            h if lim_alpha is None else h * lim_alpha, ss.mask, (1, 2)
         )
+        raw["torque"] = val
         diag["torque_hinge_max"] = (h * ss.mask).amax(dim=(1, 2)).detach()
         counts["torque"] = cnt.detach()
         over = (tau.abs() - lim_hard).clamp_min(0.0) * ss.mask
-        viol["torque"] = (over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)).detach()
-        excess_max = over.amax(dim=(1, 2)).detach()
-        # The peak group's AL multiplier is driven by the MAX excess -- the same
-        # tensor the diagnostics report, exposed as a violation so
-        # ``AugmentedLagrangian`` can integrate it.
-        viol["torque_peak"] = excess_max
-        diag["torque_excess_max"] = excess_max
+        if cfg.w_torque_peak > 0.0:
+            raw["torque_peak"] = smooth_max(
+                over, ss.mask, cfg.torque_peak_mode, cfg.torque_peak_p,
+                cfg.torque_peak_temp, dims=(1, 2),
+            )
+        else:
+            raw["torque_peak"] = tau.new_zeros(B)
+            raw["torque_peak"].requires_grad_(False)
+        mean_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        peak_live = over.amax(dim=(1, 2))
+        viol["torque"] = mean_live.detach()
+        viol["torque_peak"] = peak_live.detach()
+        live["torque"] = mean_live
+        live["torque_peak"] = peak_live
+        h_priced = h if lim_alpha is None else h * lim_alpha
+        self._emit_limit_segments(
+            "torque", over, h_priced, ss.mask, cnt, raw, viol, live,
+        )
+        diag["torque_excess_max"] = viol["torque_peak"]
         diag["torque_max"] = (tau.abs() * ss.mask).amax(dim=(1, 2)).detach()
         diag["torque_frac_over"] = (
             (over > 0).to(tau.dtype).sum(dim=(1, 2)) / cnt.clamp_min(1.0)
@@ -1568,10 +2562,237 @@ class FusedCost:
         diag["torque_abs_mean"] = (
             (tau.abs() * ss.mask).sum(dim=(1, 2)) / cnt.clamp_min(1.0)
         ).detach()
+        return tau
+
+    # ---------------------------------------------------- tracking torque --
+    def _track_torque(self, sp, v0, B, D, raw, viol, live, diag, counts,
+                      lim_alpha=None) -> torch.Tensor:
+        """The torque the PD servo DEMANDS while tracking this plan.
+
+        ``tau_hat[t] = tau_rnea[t] + tau_fb[t]`` per (waypoint, joint), where
+
+        * ``tau_rnea`` is the plan's own inverse dynamics at the KNOT finite
+          differences -- the scorer's convention, and the states a first-order
+          hold actually commands (:meth:`TrajectorySpline.knot_finite_differences`),
+          not the spline sub-samples the RNEA hinge above uses.  The estimate has
+          to live on the control-tick grid because the FIR bank does.
+        * ``tau_fb`` is the feedback demand from the identified per-joint FIR
+          (:func:`~amortized_opt.pd_sim.feedback_torque`), DC-removed so the
+          quasi-static part is counted once, by the RNEA term, and not twice.
+          See the note at the top of :mod:`amortized_opt.pd_sim`.
+
+        Both come out of :func:`~amortized_opt.pd_sim.tracking_torque_knots`,
+        which is also what the ``"tracking"`` auxiliary torque label calls, so
+        the quantity the model's torque head predicts and the quantity this
+        term prices are the same array by construction.
+
+        Excess is measured against the SAME ``available_torque`` the RNEA hinge
+        uses, and hinged with the same ``beta_torque`` softplus, then reduced
+        two ways off the ONE hinge array: a mean (``w_track_torque``, whose
+        raw violation drives the ``torque`` augmented-Lagrangian group in place
+        of the RNEA mean) and a smooth max (``w_track_torque_peak``).
+
+        ``lim_alpha`` -- the per-joint curriculum ramp -- multiplies the hinge
+        before BOTH reductions here (the RNEA block applies it to the mean
+        only): the tracking peak carries no group multiplier of its own, so the
+        ramp is the only schedule gating it, and a peak that ignored the ramp
+        would arrive at full price on step 0.  The raw violations below are
+        computed from the UNSCALED excess, exactly as everywhere else, so the
+        multiplier dynamics cannot see the ramp.
+
+        Returns the signed ``tau_hat`` of shape ``(B, H+1, D)`` for aux reuse.
+        """
+        from .pd_sim import tracking_torque_knots
+
+        cfg = self.cfg
+        if self.c_tau_kernel is None:          # e.g. a ``with_config`` clone
+            self.c_tau_kernel = self.build_torque_kernels()
+        # THE shared definition -- the auxiliary label calls the same function.
+        tau_hat, q, qd = tracking_torque_knots(sp, v0, self.rnea, self.c_tau_kernel)
+        idx = torch.arange(
+            sp.max_segments + 1, device=q.device, dtype=torch.long
+        ).view(1, -1, 1)
+        mask = (idx <= sp.lengths.unsqueeze(1)).to(q.dtype)
+        lim_hard = available_torque_torch(
+            qd, self.tau_hard.view(1, 1, D), self.v_hard.view(1, 1, D),
+            eta=1.0, saturation_scale=cfg.torque_saturation_scale,
+            derate=cfg.torque_derate,
+        )
+        h = _softplus_hinge(
+            tau_hat.abs() - self.c_torque_eta.view(1, 1, D) * lim_hard,
+            cfg.beta_torque,
+        )
+        hm = h if lim_alpha is None else h * lim_alpha
+        val, cnt = self._reduce(hm, mask, (1, 2))
+        raw["track_torque"] = val
+        raw["track_torque_peak"] = smooth_max(
+            hm, mask, cfg.torque_peak_mode, cfg.torque_peak_p, cfg.torque_peak_temp,
+            dims=(1, 2),
+        )
+        counts["track_torque"] = cnt.detach()
+        over = (tau_hat.abs() - lim_hard).clamp_min(0.0) * mask
+        mean_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        mean_over = mean_live.detach()
+        max_over = over.amax(dim=(1, 2)).detach()
+        # THE constraint signal for the ``torque`` group: one multiplier, one
+        # constraint, and it is now the one the hardware enforces.  The PHR
+        # quadratic follows this replacement -- same residual the dual reads.
+        viol["torque"] = mean_over
+        live["torque"] = mean_live
+        h_priced = hm
+        self._emit_limit_segments(
+            "torque", over, h_priced, mask, cnt, raw, viol, live,
+            write_raw=False,
+        )
+        diag["track_torque_excess_mean"] = mean_over
+        diag["track_torque_excess_max"] = max_over
+        diag["track_torque_max"] = (tau_hat.abs() * mask).amax(dim=(1, 2)).detach()
+        return tau_hat
+
+    @torch.no_grad()
+    def _aux_labels_from_plant(
+        self,
+        sp,
+        ss,
+        tau: torch.Tensor | None,
+        v0: torch.Tensor,
+        *,
+        torque_mode: str,
+        tau_kernel: torch.Tensor | None,
+        tau_track: torch.Tensor | None,
+        B: int,
+        D: int,
+    ) -> dict[str, torch.Tensor]:
+        """Aux head labels from plant tensors the cost forward already built.
+
+        Matches :func:`~amortized_opt.warmstart_data.aux_targets` bit-for-bit
+        on the default ``rnea_segmax`` path when ``physics_mode="knot_fd"``
+        (the production cost).  FK tips use the nominal stick offset -- same as
+        ``aux_targets``, not the cost's possibly-randomized ``c_points``.
+        """
+        from .tokenizer import FK_POINT_NAMES
+
+        if torque_mode not in ("rnea_segmax", "tracking"):
+            raise ValueError(
+                f"aux_mode must be 'rnea_segmax' or 'tracking', got {torque_mode!r}"
+            )
+        H = int(sp.max_segments)
+        dt = float(self.dt)
+        end = torch.full((1,), dt, device=ss.q.device, dtype=ss.q.dtype)
+        _q, qd, qdd, _j = sp.eval_offsets(end)
+        vel = qd[:, :, 0, :]
+        acc = qdd[:, :, 0, :]
+
+        if torque_mode == "tracking":
+            from .pd_sim import nominal_torque_kernels, tracking_torque_knots
+
+            if tau_track is not None:
+                torque = tau_track[:, 1:].abs()
+            else:
+                kern = tau_kernel
+                if kern is None:
+                    if self.c_tau_kernel is None:
+                        kern = nominal_torque_kernels(
+                            self.rnea,
+                            joint_names=tuple(self.joint_names),
+                            dt=dt,
+                            device=ss.q.device,
+                            dtype=ss.q.dtype,
+                        )
+                    else:
+                        kern = self.c_tau_kernel
+                tau_hat, _xk, _qd = tracking_torque_knots(sp, v0, self.rnea, kern)
+                torque = tau_hat[:, 1:].abs()
+            n_knots = H + 1
+        else:
+            # Prefer the cost's knot RNEA.  knot_fd always evaluates on H+1
+            # knots; spline mode with n_sub=1 does too.  Anything denser falls
+            # back to an explicit knot pass so the segment-max label stays
+            # defined on waypoints.
+            if (
+                tau is not None
+                and (
+                    self.cfg.physics_mode == "knot_fd"
+                    or (
+                        self.cfg.physics_mode == "spline"
+                        and int(self.cfg.n_sub) == 1
+                    )
+                )
+                and int(tau.shape[1]) == H + 1
+            ):
+                ta = tau.abs()
+                torque = torch.maximum(ta[:, :-1], ta[:, 1:])
+                n_knots = H + 1
+            else:
+                xk, qd_fd, qdd_fd = sp.knot_finite_differences(v0)
+                n_knots = xk.shape[1]
+                ta = self.rnea.rnea(
+                    xk.reshape(B * n_knots, D),
+                    qd_fd.reshape(B * n_knots, D),
+                    qdd_fd.reshape(B * n_knots, D),
+                ).reshape(B, n_knots, D).abs()
+                torque = torch.maximum(ta[:, :-1], ta[:, 1:])
+
+        # FK at ``sp.x_held`` -- the same knot positions ``aux_targets`` gets
+        # from ``knot_finite_differences``.  One extra knot FK is cheap next to
+        # the RNEA we skipped; subsample FK is only ulp-close and would drift.
+        xk = sp.x_held
+        pts = self._fk_aux_points_from_q(xk.reshape(B * (H + 1), D)).reshape(
+            B, H + 1, len(FK_POINT_NAMES), 3
+        )
+        fk_pos = pts[:, 1:]
+        fk_vel = (pts[:, 1:] - pts[:, :-1]) / dt
+        return {
+            "vel": vel,
+            "acc": acc,
+            "torque": torque,
+            "fk_pos": fk_pos,
+            "fk_vel": fk_vel,
+        }
+
+    def _fk_aux_points_from_q(self, q: torch.Tensor) -> torch.Tensor:
+        """``(N, 6, 3)`` tip/wrist/elbow for flat ``q`` of shape ``(N, D)``."""
+        from .tokenizer import FK_POINT_NAMES
+
+        frames = self.fk.forward(q)
+        cols: dict[str, torch.Tensor] = {}
+        for hand in ("left", "right"):
+            R, p = frames[f"{hand}_wrist"]
+            tip_local = torch.as_tensor(
+                stick_tip_offset(hand)[None, :], device=q.device, dtype=q.dtype,
+            )
+            cols[f"{hand}_tip"] = ChainFK.points_world(R, p, tip_local)[:, 0]
+            cols[f"{hand}_wrist"] = p
+            cols[f"{hand}_elbow"] = frames[f"{hand}_elbow"][1]
+        return torch.stack([cols[name] for name in FK_POINT_NAMES], dim=1)
 
     # ----------------------------------------------------------- velocity --
-    def _velocity(self, sp: TrajectorySpline, raw, viol, diag, counts) -> None:
+    def _velocity(self, sp: TrajectorySpline, raw, viol, live, diag, counts,
+                  lim_alpha=None) -> None:
         cfg = self.cfg
+        B = sp.x.shape[0]
+        # Off path: no segment-max |qd|, no hinge, no peak.  A run that does
+        # not price velocity should not pay for the analytic locator either.
+        if cfg.w_velocity <= 0.0 and cfg.w_velocity_peak <= 0.0:
+            z = sp.x.new_zeros(B)
+            raw["velocity"] = z
+            raw["velocity"].requires_grad_(False)
+            raw["velocity_peak"] = z
+            raw["velocity_peak"].requires_grad_(False)
+            viol["velocity"] = z.detach()
+            viol["velocity_peak"] = z.detach()
+            live["velocity"] = z
+            live["velocity_peak"] = z
+            for name, _idx in self.c_seg:
+                key = f"velocity_{name}"
+                raw[key] = z
+                raw[key].requires_grad_(False)
+                viol[key] = z.detach()
+                live[key] = z
+            diag["velocity_excess_max"] = z.detach()
+            diag["velocity_max"] = z.detach()
+            counts["velocity"] = z.detach()
+            return
         vmax = (
             sp.segment_velocity_max_analytic()
             if cfg.velocity_max_mode == "analytic"
@@ -1579,46 +2800,109 @@ class FusedCost:
         )  # (B, H, n)
         lim_hard = self.v_hard.view(1, 1, -1)
         h = _softplus_hinge(vmax - cfg.eta_velocity * lim_hard, cfg.beta_velocity)
-        val, cnt = self._reduce(h, sp.seg_mask, (1, 2))
+        # Per-joint price on the hinge, before the mean; ``over`` below is the
+        # unscaled excess the augmented Lagrangian reads.  See ``forward``.
+        val, cnt = self._reduce(
+            h if lim_alpha is None else h * lim_alpha, sp.seg_mask, (1, 2)
+        )
         raw["velocity"] = val
         counts["velocity"] = cnt.detach()
         over = (vmax - lim_hard).clamp_min(0.0) * sp.seg_mask
-        viol["velocity"] = (over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)).detach()
-        diag["velocity_excess_max"] = over.amax(dim=(1, 2)).detach()
+        vel_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        viol["velocity"] = vel_live.detach()
+        live["velocity"] = vel_live
+        h_priced = h if lim_alpha is None else h * lim_alpha
+        self._emit_limit_segments(
+            "velocity", over, h_priced, sp.seg_mask, cnt, raw, viol, live,
+        )
+        peak_live = over.amax(dim=(1, 2))
+        diag["velocity_excess_max"] = peak_live.detach()
         diag["velocity_max"] = vmax.amax(dim=(1, 2)).detach()
+        if cfg.w_velocity_peak > 0.0:
+            raw["velocity_peak"] = smooth_max(
+                over, sp.seg_mask, cfg.velocity_peak_mode, cfg.velocity_peak_p,
+                cfg.velocity_peak_temp, dims=(1, 2),
+            )
+            viol["velocity_peak"] = peak_live.detach()
+            live["velocity_peak"] = peak_live
+        else:
+            z = vmax.new_zeros(vmax.shape[0])
+            raw["velocity_peak"] = z
+            raw["velocity_peak"].requires_grad_(False)
+            viol["velocity_peak"] = z.detach()
+            live["velocity_peak"] = z
 
     # ---------------------------------------------------------- joint box --
-    def _joint_box(self, ss, raw, viol, diag, counts, w_waist_box=1.0) -> None:
-        """Sub-sampled ``q`` against the (optionally waist-narrowed) box.
-
-        ``cfg.waist_pr_box`` shrinks the ``waist_pitch`` / ``waist_roll`` rows
-        only.  It moves the SOFT half-width (to ``eta_position x waist_pr_box``,
-        so the tightened rows are held to the same 80 % conservatism as every
-        other joint) AND the HARD limits the raw violation is measured against
-        (to ``+-waist_pr_box``), which is what makes the new constraint flow
-        through the existing ``joint_box`` multiplier instead of needing one of
-        its own.  ``w_waist_box`` linearly blends the half-width between the
-        original box (0) and the shrunk one (1) so a continuation can ramp the
-        constraint in rather than stepping the augmented Lagrangian.
-        """
+    def _joint_box_hard_limits(self, w_waist_box: float = 1.0):
+        """Soft half-width and hard URDF/posture box, optionally waist-narrowed."""
         cfg = self.cfg
         half = cfg.eta_position * self.q_half.view(1, 1, -1)
         lo_hard = self.q_lo_hard.view(1, 1, -1)
         hi_hard = self.q_hi_hard.view(1, 1, -1)
         if cfg.waist_pr_box is not None:
-            m = self.c_waist_pr.view(1, 1, -1)
-            tight = float(cfg.waist_pr_box)
-            half = half + (w_waist_box * m) * (cfg.eta_position * tight - half)
-            lo_hard = lo_hard + (w_waist_box * m) * (-tight - lo_hard)
-            hi_hard = hi_hard + (w_waist_box * m) * (tight - hi_hard)
-        dev = (ss.q - self.q_mid.view(1, 1, -1)).abs()
+            m_pr = self.c_waist_pr.view(1, 1, -1)
+            tight_pr = float(cfg.waist_pr_box)
+            half = half + (w_waist_box * m_pr) * (cfg.eta_position * tight_pr - half)
+            lo_hard = lo_hard + (w_waist_box * m_pr) * (-tight_pr - lo_hard)
+            hi_hard = hi_hard + (w_waist_box * m_pr) * (tight_pr - hi_hard)
+            # Keep yaw inside a conservative reach-preserving guardrail whenever
+            # the waist box is enabled, using the same existing AL/cost term.
+            m_yaw = self.c_waist_yaw.view(1, 1, -1)
+            tight_yaw = math.radians(80.0)
+            half = half + (w_waist_box * m_yaw) * (cfg.eta_position * tight_yaw - half)
+            lo_hard = lo_hard + (w_waist_box * m_yaw) * (-tight_yaw - lo_hard)
+            hi_hard = hi_hard + (w_waist_box * m_yaw) * (tight_yaw - hi_hard)
+        return half, lo_hard, hi_hard
+
+    def _joint_box(self, waypoints, wp_mask, raw, viol, live, diag, counts,
+                   w_waist_box=1.0, lim_alpha=None) -> None:
+        """Decoder waypoints against the (optionally waist-narrowed) box.
+
+        The warning is a mean softplus over valid ``(waypoint, joint)`` pairs.
+        The optional peak half is a **smooth max** of ReLU hard excess over the
+        same grid (max-shaped dense grad).  ``viol`` /
+        ``live["joint_box_peak"]`` stay the horizon max for the AL gate.
+
+        ``cfg.waist_pr_box`` shrinks the ``waist_pitch`` / ``waist_roll`` rows
+        to ``+-waist_pr_box`` and, when enabled, also narrows ``waist_yaw`` to
+        a fixed ±80 deg guardrail.  ``w_waist_box`` linearly blends the
+        half-width between the original box (0) and the shrunk one (1).
+        """
+        cfg = self.cfg
+        half, lo_hard, hi_hard = self._joint_box_hard_limits(w_waist_box)
+        dev = (waypoints - self.q_mid.view(1, 1, -1)).abs()
         h = _softplus_hinge(dev - half, cfg.beta_position)
-        val, cnt = self._reduce(h, ss.mask, (1, 2))
+        val, cnt = self._reduce(
+            h if lim_alpha is None else h * lim_alpha, wp_mask, (1, 2)
+        )
         raw["joint_box"] = val
         counts["joint_box"] = cnt.detach()
-        over = torch.maximum(lo_hard - ss.q, ss.q - hi_hard).clamp_min(0.0) * ss.mask
-        viol["joint_box"] = (over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)).detach()
-        diag["joint_box_excess_max"] = over.amax(dim=(1, 2)).detach()
+        over = (
+            torch.maximum(lo_hard - waypoints, waypoints - hi_hard)
+            .clamp_min(0.0) * wp_mask
+        )
+        box_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
+        viol["joint_box"] = box_live.detach()
+        live["joint_box"] = box_live
+        h_priced = h if lim_alpha is None else h * lim_alpha
+        self._emit_limit_segments(
+            "joint_box", over, h_priced, wp_mask, cnt, raw, viol, live,
+        )
+        peak_live = over.amax(dim=(1, 2))
+        diag["joint_box_excess_max"] = peak_live.detach()
+        if cfg.w_joint_box_peak > 0.0:
+            raw["joint_box_peak"] = smooth_max(
+                over, wp_mask, cfg.joint_box_peak_mode, cfg.joint_box_peak_p,
+                cfg.joint_box_peak_temp, dims=(1, 2),
+            )
+            viol["joint_box_peak"] = peak_live.detach()
+            live["joint_box_peak"] = peak_live
+        else:
+            z = waypoints.new_zeros(waypoints.shape[0])
+            raw["joint_box_peak"] = z
+            raw["joint_box_peak"].requires_grad_(False)
+            viol["joint_box_peak"] = z.detach()
+            live["joint_box_peak"] = z
 
     # -------------------------------------------------------- smoothness ---
     def _smoothness(self, sp: TrajectorySpline, raw, diag, counts) -> None:
@@ -1632,7 +2916,7 @@ class FusedCost:
         counts["smooth"] = cnt.detach()
 
     # ----------------------------------------------------------- posture ---
-    def _posture(self, frames, ss, B, S, ctx, raw, diag, counts) -> None:
+    def _posture(self, sp, frames, ss, B, S, ctx, raw, diag, counts) -> None:
         cfg = self.cfg
         # mid-range well, normalized by half-range so every joint counts equally
         u = (ss.q - self.q_mid.view(1, 1, -1)) / self.q_half.view(1, 1, -1).clamp_min(1e-6)
@@ -1673,8 +2957,32 @@ class FusedCost:
         # 17 -- the weight is then directly comparable to a target excursion in
         # rad^2 -- and (b) waist YAW is multiplied by a hard zero, so the term is
         # exactly yaw-invariant and no yaw gradient exists to leak.
+        #
+        # When ``ctx.waist_pr_ref`` is set the well tracks that set-point
+        # instead of 0 (``docs/waist_pr_sp_head_plan.md``).  Ref 0 is
+        # bit-identical to the no-ref path except sample 0 is dropped -- a
+        # trajectory sitting on the announced lean must read zero, and q0 is
+        # not a decision variable.  ``stopgrad(sp)`` is load-bearing: a
+        # live ref made this a 20x ungated encoder follow of decoder mean
+        # (w=100 vs tether 5), which is how dumps taught the head.
         m_pr = ss.mask * self.c_waist_pr.view(1, 1, -1)
-        val_up, cnt_up = self._reduce(ss.q * ss.q, m_pr, (1, 2))
+        if ctx.waist_pr_ref is not None:
+            pr_idx = self.c_waist_pr.nonzero(as_tuple=True)[0]  # (2,) pitch, roll
+            pr_ref = ctx.waist_pr_ref  # (B, H, 2)
+            H_ref = pr_ref.shape[1]
+            n_sub = int(cfg.n_sub)
+            S_pr = ss.q.shape[1]
+            knot_idx = (
+                (torch.arange(S_pr, device=ss.q.device) - 1) // n_sub
+            ).clamp(0, H_ref - 1)
+            ref_ss = pr_ref[:, knot_idx, :].detach()  # (B, S, 2)
+            q_pr = ss.q.index_select(2, pr_idx)
+            m2 = ss.mask.index_select(2, pr_idx)
+            m2 = torch.cat([torch.zeros_like(m2[:, :1]), m2[:, 1:]], dim=1)
+            d2 = q_pr - ref_ss
+            val_up, cnt_up = self._reduce(d2 * d2, m2, (1, 2))
+        else:
+            val_up, cnt_up = self._reduce(ss.q * ss.q, m_pr, (1, 2))
         raw["posture_upright"] = val_up
         counts["posture_upright"] = cnt_up.detach()
         # Waist usage diagnostics, always reported: the point of the upright
@@ -1682,6 +2990,24 @@ class FusedCost:
         qa = ss.q.abs() * ss.mask
         diag["waist_pr_max"] = (qa * self.c_waist_pr.view(1, 1, -1)).amax(dim=(1, 2)).detach()
         diag["waist_yaw_max"] = (qa * self.c_waist_yaw.view(1, 1, -1)).amax(dim=(1, 2)).detach()
+
+        # V_f: P/R at the NEARER active hit, always vs 0.  Same knot the
+        # strike terminal gathers (``sp.knot(hit_index)``).  Inactive hands
+        # are ignored; no active hit → 0.  The later hit only lengthens
+        # the waist window; it is not this term's terminal.
+        k = ctx.hit_index.to(dtype=torch.long)
+        act = ctx.active > 0.5
+        cap = int(sp.max_segments)
+        big = torch.full((), cap + 1, device=k.device, dtype=k.dtype)
+        k_act = torch.where(act, k.clamp(1, cap), big.expand_as(k))
+        k_first = k_act.min(dim=1).values
+        has = act.any(dim=1) & (k_first <= cap)
+        q_hit = sp.knot(k_first.clamp(1, cap))
+        m_hit = self.c_waist_pr.to(dtype=q_hit.dtype)
+        sq_hit = (q_hit * q_hit * m_hit).sum(dim=1) / m_hit.sum().clamp_min(1.0)
+        raw["waist_pr_terminal"] = torch.where(has, sq_hit, torch.zeros_like(sq_hit))
+        counts["waist_pr_terminal"] = (has.to(q_hit.dtype) * m_hit.sum()).detach()
+        diag["waist_pr_N"] = (q_hit.abs() * m_hit).amax(dim=1).detach()
 
         # WAIST-YAW RATE well.  Same shape as the upright well one block up, on
         # ``qd`` instead of ``q`` and on the YAW row instead of pitch/roll, so
@@ -1692,62 +3018,83 @@ class FusedCost:
         # number the ablation is actually about, and a run with the weight at
         # zero still has to be able to show what its waist was doing.
         m_yaw = ss.mask * self.c_waist_yaw.view(1, 1, -1)
+        # Sample 0's qd IS the measured v0 -- a constant the optimizer cannot
+        # move, so pricing it (or reporting it as the peak) is an
+        # un-optimizable floor; exclude it from the term and the diagnostic.
+        m_yaw = torch.cat([torch.zeros_like(m_yaw[:, :1]), m_yaw[:, 1:]], dim=1)
         val_yv, cnt_yv = self._reduce(ss.qd * ss.qd, m_yaw, (1, 2))
         raw["waist_yaw_vel"] = val_yv
         counts["waist_yaw_vel"] = cnt_yv.detach()
         diag["waist_yawd_max"] = (
             ss.qd.abs() * m_yaw
         ).amax(dim=(1, 2)).detach()
-        diag["waist_prd_max"] = (
-            ss.qd.abs() * ss.mask * self.c_waist_pr.view(1, 1, -1)
-        ).amax(dim=(1, 2)).detach()
+        # PITCH/ROLL RATE well: the exact complement of the yaw one above, on
+        # the two pitch/roll rows.  Same knot-0 exclusion, same reason -- v0 is
+        # measured and un-optimizable.  ``waist_prd_max`` is its peak, reported
+        # unconditionally (including at weight 0) so an ablation always has a
+        # baseline to read.
+        m_prv = ss.mask * self.c_waist_pr.view(1, 1, -1)
+        m_prv = torch.cat([torch.zeros_like(m_prv[:, :1]), m_prv[:, 1:]], dim=1)
+        val_prv, cnt_prv = self._reduce(ss.qd * ss.qd, m_prv, (1, 2))
+        raw["waist_pr_vel"] = val_prv
+        counts["waist_pr_vel"] = cnt_prv.detach()
+        diag["waist_prd_max"] = (ss.qd.abs() * m_prv).amax(dim=(1, 2)).detach()
 
-        # IDLE ARM: park at the home posture, and arrive stopped.
+        # IDLE ARM: tip inside the torso-frame safety cylinder, arrive stopped.
         #
         # The mask is ``m_hand[h] * (1 - active[h])``, so (a) only a hand with no
         # scheduled strike is priced -- a striking hand's terminal objective is
-        # never contested -- and (b) the reduction is over that arm's 7 rows
-        # only.  ``home`` is a CONSTANT per hand: arm joint angles are already
-        # torso-relative, so one posture holds its relationship to the body at
-        # every waist yaw.  The term is therefore exactly yaw-independent -- no
-        # waist column appears in it at all, so no yaw gradient can leak and the
-        # target the arm is asked to hold does not move when the torso turns.
+        # never contested -- and (b) the cylinder hinge runs over that hand's
+        # whole horizon (not just the terminal knot).  The cylinder is torso-
+        # frame, so the park region rides with waist yaw by construction.
         idle_pen = ss.q.new_zeros(B)
         idle_vel = ss.q.new_zeros(B)
         idle_n = ss.q.new_zeros(B)
         idle_worst = ss.q.new_zeros(B)
-        if self.c_idle_q is not None and (cfg.w_idle_home > 0.0 or cfg.w_idle_vel > 0.0):
+        if self.c_idle_cyl is not None and (
+            cfg.w_idle_cylinder > 0.0 or cfg.w_idle_vel > 0.0
+        ):
             S_ = ss.q.shape[1]
-            # "final velocity zero": a (k / K)^2 profile over the hand's OWN
-            # horizon -- ~0 where the arm is still travelling into home, 1 at the
-            # terminal knot.  ``lengths`` is in segments, the sub-sample grid is
-            # ``n_sub`` finer, and sample K*n_sub is the terminal knot.
+            n_dof = ss.q.shape[2]
+            center = self.c_idle_cyl[:3]
+            axis = self.c_idle_cyl[3:6]
+            radius = self.c_idle_cyl[6]
+            hh = self.c_idle_cyl[7]
+            beta = float(cfg.beta_idle_cyl)
+            q_flat = None
+            if cfg.w_idle_cylinder > 0.0:
+                q_flat = ss.q.reshape(B * S_, n_dof)
             for hi, hand in enumerate(_HANDS):
                 cols = self._gcols[hand]
                 idle = 1.0 - ctx.active[:, hi]                          # (B,)
-                # THIS hand's terminal sample.  ``m_hand`` is 1 up to and
-                # including it (``SplineSamples.mask`` includes the terminal
-                # knot), so the count is that index + 1.
-                k = (m_hand[hand].sum(dim=1) - 1.0).clamp(0.0, S_ - 1).long()
+                m = m_hand[hand]                                        # (B, S)
+                if cfg.w_idle_cylinder > 0.0:
+                    tip = tip_in_torso(self.fk, q_flat, hand).reshape(B, S_, 3)
+                    d = tip - center.view(1, 1, 3)
+                    z = (d * axis.view(1, 1, 3)).sum(-1)
+                    radial = d - z.unsqueeze(-1) * axis.view(1, 1, 3)
+                    rho = torch.linalg.norm(radial, dim=-1)
+                    s_r = (rho - radius).clamp_min(0.0)
+                    s_z = (z.abs() - hh).clamp_min(0.0)
+                    outside = torch.hypot(s_r, s_z)                     # (B, S)
+                    h = _softplus_hinge(outside, beta)
+                    den = m.sum(dim=1).clamp_min(1.0)
+                    # Mean softplus(outside)^2 over masked knots, then * idle.
+                    idle_pen = idle_pen + idle * ((h * h * m).sum(dim=1) / den)
+                    idle_worst = torch.maximum(
+                        idle_worst, idle * (outside * m).amax(dim=1)
+                    )
+                # Terminal velocity zero at THIS hand's terminal sample.
+                k = (m.sum(dim=1) - 1.0).clamp(0.0, S_ - 1).long()
                 g = k.view(-1, 1, 1).expand(-1, 1, cols.numel())
-                q_k = ss.q.index_select(2, cols).gather(1, g).squeeze(1)   # (B, n_arm)
                 qd_k = ss.qd.index_select(2, cols).gather(1, g).squeeze(1)
-                # ---- position: be at home at the terminal knot.
-                e = q_k - self.c_idle_q[hi]
-                sq = (e * e).sum(-1)                                    # rad^2
-                idle_pen = idle_pen + idle * sq
-                d = torch.sqrt(sq + 1e-12)
-                # ---- velocity: arrive stopped.  The idle arm's counterpart of
-                # ``w_terminal_velocity`` -- the striking hand is asked for
-                # 2 m/s, the parked one for zero.
                 idle_vel = idle_vel + idle * (qd_k * qd_k).sum(-1)
                 idle_n = idle_n + idle
-                idle_worst = torch.maximum(idle_worst, idle * d)
         den_idle = idle_n.clamp_min(1.0)
-        raw["posture_idle_home"] = idle_pen / den_idle
+        raw["posture_idle_cylinder"] = idle_pen / den_idle
         raw["posture_idle_vel"] = idle_vel / den_idle
         counts["posture_idle"] = idle_n.detach()
-        diag["idle_home_dist"] = idle_worst.detach()
+        diag["idle_cyl_outside"] = idle_worst.detach()
 
         # Waist-aim IL: penalise yaw, pitch, and roll deviation from the
         # reference trajectory.  Yaw follows waist_aim; pitch and roll are 0.
@@ -1757,8 +3104,15 @@ class FusedCost:
             H_ref = yaw_ref.shape[1]
             n_sub = int(cfg.n_sub)
             S = ss.q.shape[1]
-            # Map sub-sample index → knot index
-            knot_idx = (torch.arange(S, device=ss.q.device) // n_sub).clamp(0, H_ref - 1)
+            # Map sub-sample index -> reference row.  ``ref[k]`` is KNOT k+1
+            # (the rows-1..H convention documented on
+            # ``StrikeContext.waist_yaw_ref``), and sample ``j * n_sub`` is
+            # knot j, so knot j reads row j-1.  Sample 0 is the measured q0 --
+            # a constant no decision variable can move -- so it is masked out
+            # of the reduction below rather than priced against row 0.
+            knot_idx = (
+                (torch.arange(S, device=ss.q.device) - 1) // n_sub
+            ).clamp(0, H_ref - 1)
             yaw_ref_ss = yaw_ref[:, knot_idx]  # (B, S)
             # Full 3-DOF reference: yaw, pitch=0, roll=0
             ref_ss = torch.stack([
@@ -1776,17 +3130,84 @@ class FusedCost:
                 if nm in names:
                     waist_order.append(names.index(nm))
             q_waist = ss.q[:, :, waist_order]  # (B, S, 3)
-            sq_err = ((q_waist - ref_ss) ** 2).sum(dim=-1)  # (B, S)
-            # Reduce over time, masked by validity
+            err = q_waist - ref_ss  # (B, S, 3), [yaw, pitch, roll]
+            # Deadband applies to YAW only: inside the band the yaw error is
+            # free, outside only the excess is squared.  Pitch/roll keep the
+            # plain quadratic (they are a 0-reference, not a set-point), and
+            # ``waist_aim_yaw_only`` drops them entirely for runs where the
+            # upright well already owns that job.
+            db = float(cfg.waist_aim_deadband)
+            e_yaw = err[:, :, 0]
+            if db > 0.0:
+                e_yaw = (e_yaw.abs() - db).clamp_min(0.0)
+            sq_err = e_yaw * e_yaw
+            if not cfg.waist_aim_yaw_only and err.shape[-1] > 1:
+                sq_err = sq_err + (err[:, :, 1:] ** 2).sum(dim=-1)
+            # Reduce over time, masked by validity.  Sample 0 (the measured
+            # q0) is excluded: it is constant w.r.t. the decision variables,
+            # so it contributes no gradient -- only a floor that would keep
+            # ``raw["waist_aim"]`` from reading zero on a perfectly tracking
+            # trajectory.
             m_any = ss.mask.amax(dim=2)  # (B, S)
+            m_any = torch.cat(
+                [torch.zeros_like(m_any[:, :1]), m_any[:, 1:]], dim=1
+            )
             val_aim = (sq_err * m_any).sum(dim=1) / m_any.sum(dim=1).clamp_min(1.0)
             raw["waist_aim"] = val_aim
         else:
             raw["waist_aim"] = ss.q.new_zeros(B)
 
+    # --------------------------------------------------- waist P/R band ---
+    def _waist_pr_band(self, waypoints, wp_mask, B, ctx, raw, viol, live) -> None:
+        """Decoder P/R vs ``stopgrad(encoder sp)`` on plan waypoints.
+
+        ``raw`` is the **sum** of ReLU excess over valid ``(waypoint, P/R)``
+        so every plan row past the band gets gradient.  ``viol`` / ``live``
+        stay the horizon **max**.  When ``ctx.waist_pr_ref`` is ``None`` and
+        ``w_waist_pr_band > 0`` the reference defaults to zero (upright), so
+        the band penalises any lean beyond ``waist_pr_band_rad``.  Truly idle
+        (exact-zero) only when both ``waist_pr_ref`` is None AND the weight
+        is zero.  ``sp`` is detached so this group cannot move the encoder.
+        """
+        cfg = self.cfg
+        z = waypoints.new_zeros(B)
+        if ctx.waist_pr_ref is None and cfg.w_waist_pr_band <= 0.0:
+            # Band weight off AND no reference: truly idle.
+            raw["waist_pr_band"] = z
+            viol["waist_pr_band"] = z
+            live["waist_pr_band"] = z
+            return
+        pr_idx = self.c_waist_pr.nonzero(as_tuple=True)[0]  # (2,) pitch, roll
+        # When no encoder SP head is active, treat the reference as upright
+        # (zero pitch/roll) so the band becomes "stay within band_rad of vertical".
+        if ctx.waist_pr_ref is None:
+            H_wp = waypoints.shape[1]
+            pr_ref = waypoints.new_zeros(B, H_wp, 2)
+        else:
+            pr_ref = ctx.waist_pr_ref.detach()  # (B, H, 2); stopgrad(sp)
+        H_ref = pr_ref.shape[1]
+        H_wp = waypoints.shape[1]
+        if H_wp != H_ref:
+            # Waypoints are knots 1..H; ref is the same convention.
+            # Truncate/pad to match if a caller mismatched horizons.
+            H = min(H_wp, H_ref)
+            q_pr = waypoints[:, :H].index_select(2, pr_idx)
+            ref = pr_ref[:, :H]
+            m2 = wp_mask[:, :H].index_select(2, pr_idx)
+        else:
+            q_pr = waypoints.index_select(2, pr_idx)
+            ref = pr_ref
+            m2 = wp_mask.index_select(2, pr_idx)
+        excess = ((q_pr - ref).abs() - float(cfg.waist_pr_band_rad)).clamp_min(0.0)
+        over = excess * m2
+        raw["waist_pr_band"] = over.sum(dim=(1, 2))
+        peak_live = over.amax(dim=(1, 2))
+        live["waist_pr_band"] = peak_live
+        viol["waist_pr_band"] = peak_live.detach()
+
     # ---------------------------------------------------------- terminal ---
     def _terminal(self, sp: TrajectorySpline, ctx: StrikeContext,
-                  raw, viol, diag, counts) -> None:
+                  raw, viol, live, diag, counts) -> None:
         cfg = self.cfg
         B = sp.x.shape[0]
         dtype = sp.x.dtype
@@ -1814,46 +3235,69 @@ class FusedCost:
             qq = torch.cat([q_k, q_p], dim=0)
             R, p = self.fk.frame(qq, f"{hand}_wrist")
             base = p + (R @ self.c_mount_p[hand].to(dtype).view(1, 3, 1)).squeeze(-1)
-            u = (R @ self.c_mount_axis[hand].to(dtype).view(1, 3, 1)).squeeze(-1)
+            if ctx.stick_axis_local is not None:
+                ax_l = ctx.stick_axis_local[:, hi].to(dtype)            # (B, 3)
+                ax_l = torch.cat([ax_l, ax_l], dim=0).unsqueeze(-1)     # knot + prev
+            else:
+                ax_l = self.c_mount_axis[hand].to(dtype).view(1, 3, 1)
+            u = (R @ ax_l).squeeze(-1)
             base_k, base_p = base[:B], base[B:]
             u_k, u_p = u[:B], u[B:]
 
-            # contact candidates
-            if cfg.contact_mode == "spec":
-                sig = ctx.contact_sigma[:, hi].view(B, 1, 1)
-                valid = sp.x.new_ones(B, 1)
+            # Playing-shaft capsule on cymbals/hi-hat; a degenerate (bead)
+            # segment on pads.  ``spec`` collapses every row to contact_sigma.
+            spec_s = ctx.contact_sigma[:, hi].to(dtype)
+            if ctx.stick_tip_sigma is not None:
+                tip_s = ctx.stick_tip_sigma[:, hi].to(dtype)
             else:
-                sig = self.c_sigmas.to(dtype).view(1, -1, 1)
-                valid = (
-                    self.c_sigma_is_tip.to(dtype).view(1, -1)
-                    + ctx.shaft_allowed[:, hi : hi + 1]
-                ).clamp_max(1.0)  # (B, Sc)
-            pc_k = base_k.unsqueeze(1) + sig * u_k.unsqueeze(1)  # (B, Sc, 3)
-            pc_p = base_p.unsqueeze(1) + sig * u_p.unsqueeze(1)
+                tip_s = spec_s.new_full((B,), float(STICK_TIP_SIGMA))
+            fb = spec_s.new_full((B,), float(CYMBAL_CONTACT_SIGMA_FALLBACK))
+            if cfg.contact_mode == "spec":
+                sig_lo = spec_s
+                sig_hi = spec_s
+            else:
+                shaft = ctx.shaft_allowed[:, hi]
+                sig_lo = torch.where(shaft > 0.5, fb, spec_s)
+                sig_hi = torch.where(shaft > 0.5, tip_s, spec_s)
+                sig_lo = torch.minimum(sig_lo, sig_hi)
+            a_k = base_k + sig_lo.unsqueeze(-1) * u_k
+            b_k = base_k + sig_hi.unsqueeze(-1) * u_k
+            a_p = base_p + sig_lo.unsqueeze(-1) * u_p
+            b_p = base_p + sig_hi.unsqueeze(-1) * u_p
+            _dmin, s_star, p_c, cand_s, dist, valid = segment_hit_region(
+                a_k, b_k,
+                ctx.p_star[:, hi], ctx.n_out[:, hi], ctx.hit_radius[:, hi],
+                ctx.disk_offset[:, hi], ctx.half_plane_dir[:, hi],
+                ctx.has_half_plane[:, hi],
+                cfg.terminal_axial_lo, cfg.terminal_axial_hi,
+                return_candidates=True,
+            )
+            d_ab_k = b_k - a_k
+            d_ab_p = b_p - a_p
+            pc_k = a_k.unsqueeze(1) + cand_s.unsqueeze(-1) * d_ab_k.unsqueeze(1)
+            pc_p = a_p.unsqueeze(1) + cand_s.unsqueeze(-1) * d_ab_p.unsqueeze(1)
             v_c = (pc_k - pc_p) / dt
 
-            n_out = ctx.n_out[:, hi].unsqueeze(1)
-            e = pc_k - ctx.p_star[:, hi].unsqueeze(1)
-            axial = (e * n_out).sum(-1)
-            d_in = e - axial.unsqueeze(-1) * n_out - ctx.disk_offset[:, hi].unsqueeze(1)
-            r_disk = (
-                torch.sqrt((d_in * d_in).sum(-1) + 1e-12) - ctx.hit_radius[:, hi : hi + 1]
-            ).clamp_min(0.0)
-            hp = (d_in * ctx.half_plane_dir[:, hi].unsqueeze(1)).sum(-1)
-            r_hp = (-hp).clamp_min(0.0) * ctx.has_half_plane[:, hi : hi + 1]
-            r_ax = (axial.abs() - cfg.terminal_axial_tol).clamp_min(0.0)
-            dist = torch.sqrt(r_disk**2 + r_hp**2 + r_ax**2 + 1e-12)  # (B, Sc)
-
-            # soft-min over the legal contact span
-            big = 1e3 * (1.0 - valid)
-            logits = -(dist + big) / cfg.contact_softmin_temp
-            wgt = torch.softmax(logits, dim=1)
+            logits = -(dist + 1e3 * (1.0 - valid)) / cfg.contact_softmin_temp
+            wgt = torch.softmax(logits, dim=-1)
             act = ctx.active[:, hi]
 
-            reg = reg + act * (wgt * _softplus_hinge(dist, cfg.beta_terminal)).sum(1)
-            reg_raw = reg_raw + act * (wgt * dist).sum(1)
-            aim_d = torch.sqrt((e * e).sum(-1) + 1e-12)
-            aim = aim + act * (wgt * aim_d).sum(1)
+            reg = reg + act * (wgt * _softplus_hinge(dist, cfg.beta_terminal)).sum(-1)
+            reg_raw = reg_raw + act * (wgt * dist).sum(-1)
+            # In-plane distance to the AIM (do not subtract ``disk_offset``:
+            # toms/cymbals aim off-centre, and the pull is toward the star the
+            # strike asked for).  Deadband then a region-style softplus so the
+            # term is idle once the contact is on the interior of the head.
+            e = pc_k - ctx.p_star[:, hi].unsqueeze(1)
+            axial_c = (e * ctx.n_out[:, hi].unsqueeze(1)).sum(-1)
+            e_in_aim = e - axial_c.unsqueeze(-1) * ctx.n_out[:, hi].unsqueeze(1)
+            rho_aim = torch.sqrt((e_in_aim * e_in_aim).sum(-1) + 1e-12)
+            aim_excess = (
+                rho_aim - float(cfg.terminal_aim_deadband_m)
+            ).clamp_min(0.0)
+            aim = aim + act * (
+                wgt * _softplus_hinge(aim_excess, cfg.beta_terminal)
+            ).sum(-1)
 
             # impact velocity, at the same (soft-selected) contact point
             vs = ctx.v_star[:, hi].unsqueeze(1)
@@ -1866,10 +3310,15 @@ class FusedCost:
                 cfg.terminal_a_normal * along * along
                 + cfg.terminal_a_tangential * perp2.clamp_min(0.0)
             )
-            vel = vel + act * (wgt * vcost).sum(1)
+            vel = vel + act * (wgt * vcost).sum(-1)
 
             # stick elevation band on |elev|
-            cosang = -(u_k * ctx.n_out[:, hi]).sum(-1).clamp(-1.0, 1.0)
+            # Interior clamp: ``asin'(±1)`` is inf, and ``clamp`` onto the pole
+            # then does ``0 * inf → NaN`` in the backward.  Same floor as
+            # :func:`~amortized_opt.tokenizer._tilt_angle`.
+            cosang = -(u_k * ctx.n_out[:, hi]).sum(-1).clamp(
+                -1.0 + 1e-6, 1.0 - 1e-6
+            )
             el = torch.asin(cosang).abs()
             lo = float(np.deg2rad(cfg.elev_min_deg))
             hi_ = float(np.deg2rad(cfg.elev_max_deg))
@@ -1880,10 +3329,9 @@ class FusedCost:
             elev_pen = elev_pen + act * ctx.elev_required[:, hi] * ep
             n_act = n_act + act
 
-            # diagnostics at the SPEC contact point (what the harness scores)
-            sig_spec = ctx.contact_sigma[:, hi].view(B, 1)
-            pk = base_k + sig_spec * u_k
-            pp = base_p + sig_spec * u_p
+            # diagnostics at the selected capsule contact (what the harness scores)
+            pk = p_c
+            pp = a_p + s_star.unsqueeze(-1) * d_ab_p
             vspec = (pk - pp) / dt
             d_pos.append(
                 act * torch.sqrt(((pk - ctx.p_star[:, hi]) ** 2).sum(-1) + 1e-12)
@@ -1899,8 +3347,10 @@ class FusedCost:
         raw["terminal_velocity"] = vel / den
         raw["terminal_elev"] = elev_pen / den
         # Raw violation = distance OUTSIDE the legal hit region (0 when on head).
-        viol["terminal"] = (reg_raw / den).detach()
-        diag["terminal_region_dist"] = (reg_raw / den).detach()
+        term_live = reg_raw / den
+        viol["terminal"] = term_live.detach()
+        live["terminal"] = term_live
+        diag["terminal_region_dist"] = term_live.detach()
         diag["contact_pos_err"] = (sum(d_pos) / den).detach()
         diag["contact_speed_err"] = (sum(d_speed) / den).detach()
         diag["contact_dir_cos"] = (sum(d_cos) / den).detach()

@@ -140,14 +140,11 @@ def test_masks_are_consistent_with_the_horizons(episode):
                 assert np.allclose(tau, k * C.CONTROL_DT - t)
 
 
-def test_one_hand_reset_leaves_the_other_hand_untouched(rig, capsys):
-    """The plan's decoupling requirement, checked on the trajectory itself.
+def test_one_hand_reset_rebuilds_waist_toward_aim(rig, capsys):
+    """Single-hand reset reseeds waist from the refreshed aim (not leftover).
 
-    The next tick's init is ``shift(planner_output)`` with the RESET hand's
-    columns overwritten by a fresh seed. So the property is measured against
-    the planner's own output, captured by a spy -- comparing against the
-    previous tick's *init* would prove nothing here, since the quintic stand-in
-    ignores its init and rebuilds every column from scratch.
+    The other arm's columns stay byte-identical to the shifted plan; the waist
+    must move when the new snapshot's aim differs from the prior seed.
     """
     _kit, clips, gen, starts = rig
     b = starts.sample(1, seed=1)
@@ -167,7 +164,9 @@ def test_one_hand_reset_leaves_the_other_hand_untouched(rig, capsys):
         first.setdefault(s.step, s)
 
     waist = [i for i, n in enumerate(C.G1_UPPER_BODY_JOINTS) if n.startswith("waist_")]
+    yaw_i = C.G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
     checked = 0
+    waist_moved = 0
     for a in sorted(first):
         if a + 1 not in first or a not in outs:
             continue
@@ -181,17 +180,23 @@ def test_one_hand_reset_leaves_the_other_hand_untouched(rig, capsys):
         assert np.array_equal(sb.init_traj[:, cols_h], shifted[:, cols_h]), (
             f"step {a}: {held} arm was disturbed by {fired[0]}'s reset"
         )
-        assert np.array_equal(sb.init_traj[:, waist], shifted[:, waist]), (
-            f"step {a}: the waist was disturbed by a single-hand reset"
-        )
         assert not np.array_equal(sb.init_traj[:, cols_r], shifted[:, cols_r]), (
             f"step {a}: {fired[0]} was NOT reseeded after its strike"
         )
+        if not np.array_equal(sb.init_traj[:, waist], shifted[:, waist]):
+            waist_moved += 1
+            # Terminal yaw of the reseed should sit near the context aim token.
+            aim = float(sb.context["aim_yaw"])
+            term_yaw = float(sb.init_traj[-1, yaw_i])
+            assert abs(term_yaw - aim) < 0.15, (
+                f"step {a}: waist terminal yaw {term_yaw:.3f} vs aim {aim:.3f}"
+            )
         checked += 1
     with capsys.disabled():
-        print(f"\n[mpc decoupling] {checked} single-hand resets verified: the other "
-              f"arm's and the waist's columns are byte-identical to the shifted plan")
+        print(f"\n[mpc waist rebuild] {checked} single-hand resets; "
+              f"{waist_moved} moved waist toward aim")
     assert checked > 0
+    assert waist_moved > 0
 
 
 def test_planner_stand_in_is_actually_called(rig):

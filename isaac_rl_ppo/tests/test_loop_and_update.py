@@ -254,6 +254,8 @@ def test_collect_then_update_runs_and_is_finite(driver, run_cfg):
     assert any(".lora_" in n for n in moved), "no LoRA parameter moved"
     assert any(n.startswith("critic.") for n in moved), "the critic did not train"
     actor.assert_frozen()
+    assert "orth_cos" in out
+    assert abs(out["orth_cos"]) <= 1.0 + 1e-5
 
 
 def test_ratio_is_one_before_any_gradient_step(driver, run_cfg):
@@ -276,13 +278,15 @@ def test_ratio_is_one_before_any_gradient_step(driver, run_cfg):
     storage.finalize()
 
     from isaac_rl_ppo.actor import MpcInputs
+    from isaac_rl_ppo.ppo_loop import index_dataclass
     flat = storage.flat
     n = flat["actions"].shape[0]
     sel = torch.arange(n)
     inputs = MpcInputs(init=flat["init"], state=flat["state"],
                        ctx=flat["ctx"], hit_index=flat["hit_index"])
     with torch.no_grad():
-        plan = actor.plan(inputs)
+        plan = actor.plan(
+            inputs, encoding=index_dataclass(flat["encoding"], sel))
         dist = actor.update_distribution(plan.mean)
         logp = dist.log_prob(flat["actions"]).sum(dim=-1)
 
@@ -306,6 +310,16 @@ def test_adaptive_kl_controller_moves_the_learning_rate(actor, run_cfg):
         upd._adapt_lr(1.0)
     assert upd.learning_rate == pytest.approx(run_cfg.ppo.lr_min)
     assert upd.lr_floor_hits > 0, "the floor must be counted, not hidden"
+
+
+def test_first_minibatch_low_kl_does_not_raise_lr(actor, run_cfg):
+    """Replay-matched minibatch 0 has KL≈0; raising then ratchets the LR."""
+    upd = PpoUpdater(actor, run_cfg, device="cpu", cost=None)
+    lr0 = upd.learning_rate
+    upd._adapt_lr(run_cfg.ppo.desired_kl / 100.0, allow_increase=False)
+    assert upd.learning_rate == pytest.approx(lr0)
+    upd._adapt_lr(run_cfg.ppo.desired_kl / 100.0, allow_increase=True)
+    assert upd.learning_rate == pytest.approx(min(run_cfg.ppo.lr_max, lr0 * 1.5))
 
 
 def test_micro_batching_matches_a_single_pass(driver, run_cfg):
@@ -333,8 +347,8 @@ def test_micro_batching_matches_a_single_pass(driver, run_cfg):
         mb = idx.shape[0]
         for s in range(0, mb, micro or mb):
             sel = idx[s: s + (micro or mb)]
-            part = upd._chunk_loss(storage.flat, sel, adv)
-            ((sel.shape[0] / mb) * part["loss"]).backward()
+            upd._chunk_loss(storage.flat, sel, adv,
+                            weight=sel.shape[0] / mb)
         return {n: p.grad.detach().clone() for n, p in actor.named_parameters()
                 if p.requires_grad and p.grad is not None}
 
@@ -349,3 +363,64 @@ def test_micro_batching_matches_a_single_pass(driver, run_cfg):
                        / whole[n].abs().max().clamp_min(1e-12)), n)
                 for n in whole)
     assert worst[0] < 1e-5, f"micro-batching changed the gradient: {worst}"
+
+
+def test_orth_update_trains_lora_std_and_critic(driver, run_cfg):
+    """Decoder LoRA, Gaussian std, and the critic all receive a gradient.
+
+    The combine is traj-space: LoRA sees cost + orth(RL), std sees raw PPO,
+    the critic sees only the value loss.  A combine that dropped any of those
+    three would look like a healthy loss curve and train nothing useful.
+    """
+    drv, q, qd, cost = driver
+    actor = drv.actor
+    storage = PpoStorage(device=torch.device("cpu"), horizon=actor.H, n_dof=17)
+    q, qd, _ = drv.collect(q, qd, 4, storage)
+    T, B = 4, q.shape[0]
+    storage.returns = torch.randn(T, B)
+    storage.advantages = torch.randn(T, B)
+    storage.finalize()
+
+    assert run_cfg.orth.enabled
+    upd = PpoUpdater(actor, run_cfg, device="cpu", cost=cost)
+    actor.zero_grad(set_to_none=True)
+    idx = torch.arange(storage.flat["actions"].shape[0])
+    upd._chunk_loss(storage.flat, idx, storage.flat["advantages"], weight=1.0)
+
+    lora = [p for n, p in actor.named_parameters()
+            if ".lora_" in n and p.grad is not None
+            and float(p.grad.abs().sum()) > 0]
+    assert lora, "orth combine reached no LoRA parameter"
+    assert actor.std.grad is not None and float(actor.std.grad.abs().sum()) > 0
+    assert actor.mean_correction is not None
+    mc_hit = any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in actor.mean_correction.parameters())
+    assert mc_hit, "the mean-correction head received no PPO gradient"
+    critic_hit = any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in actor.critic.parameters())
+    assert critic_hit, "the critic received no value-loss gradient"
+    actor.assert_frozen()
+
+
+def test_scalar_fusion_still_runs_when_orth_disabled(driver, run_cfg):
+    """``--no-orth`` is the A/B back to ``surrogate + aux.weight * cost``."""
+    drv, q, qd, cost = driver
+    actor = drv.actor
+    storage = PpoStorage(device=torch.device("cpu"), horizon=actor.H, n_dof=17)
+    q, qd, _ = drv.collect(q, qd, 4, storage)
+    T, B = 4, q.shape[0]
+    storage.returns = torch.randn(T, B)
+    storage.advantages = torch.randn(T, B)
+    storage.finalize()
+
+    run_cfg.orth.enabled = False
+    run_cfg.ppo.num_learning_epochs = 1
+    run_cfg.ppo.num_mini_batches = 1
+    run_cfg.ppo.schedule = "fixed"
+    upd = PpoUpdater(actor, run_cfg, device="cpu", cost=cost)
+    out = upd.update(storage)
+    for k, v in out.items():
+        assert np.isfinite(v), f"{k} = {v}"
+    assert out["orth_cos"] == 0.0

@@ -81,6 +81,69 @@ def test_clamp_keeps_command_in_box(kit, start, clip, joint):
     assert _out_of_box(res.cmd_hist, lo, hi) <= 1e-9
 
 
+def _future_runaway_planner(gen, *, joint: str, offset: float = 1.5):
+    """Writes future knots outside the box; first knot stays at the measured pose.
+
+    The command clamp only sees ``traj[0]``, so without ``clamp_init_to_box``
+    the shifted tail becomes next tick's seed.
+    """
+    j = gen.names.index(joint)
+    H, n = gen.cfg.horizon, gen.n
+
+    def plan(req):
+        traj = np.repeat(np.asarray(req.q, float)[None, :], H, axis=0)
+        lo, hi = gen.q_bounds
+        traj[1:, j] = lo[j] - float(offset)
+        return traj
+
+    return plan
+
+
+def test_clamp_init_keeps_shifted_plan_in_box(kit, start, clip):
+    """Next-tick init is in the box even if the planner's tail is not."""
+    q0, qd0 = start
+    gen = MPCGenerator(
+        kit=kit, config=MPCGenConfig(horizon=25, clamp_cmd_to_box=True,
+                                     clamp_init_to_box=True, freeze_wp=0),
+    )
+    captured = []
+
+    inner = _future_runaway_planner(gen, joint="waist_roll_joint")
+
+    def plan(req):
+        captured.append(np.asarray(req.init_traj, float).copy())
+        return inner(req)
+
+    res = gen.run_episode(clip, q0, qd0, seed=0, planner=plan, max_steps=40)
+    lo, hi = gen.q_bounds
+    assert res.cmd_hist.shape[0] == 40
+    assert not res.diverged
+    assert _out_of_box(res.cmd_hist, lo, hi) <= 1e-9
+    # tick 0 is the quintic seed; every later seed is a clipped shift
+    for init in captured[1:]:
+        assert _out_of_box(init, lo, hi) <= 1e-9
+
+
+def test_without_init_clamp_shifted_plan_leaves_box(kit, start, clip):
+    """The regression: clamp_init OFF lets the illegal tail become the seed."""
+    q0, qd0 = start
+    gen = MPCGenerator(
+        kit=kit, config=MPCGenConfig(horizon=25, clamp_cmd_to_box=True,
+                                     clamp_init_to_box=False, freeze_wp=0),
+    )
+    captured = []
+    inner = _future_runaway_planner(gen, joint="waist_roll_joint")
+
+    def plan(req):
+        captured.append(np.asarray(req.init_traj, float).copy())
+        return inner(req)
+
+    gen.run_episode(clip, q0, qd0, seed=0, planner=plan, max_steps=8)
+    lo, hi = gen.q_bounds
+    assert len(captured) >= 2
+    assert _out_of_box(captured[1], lo, hi) > 0.5
+
+
 @pytest.mark.parametrize("joint", ["waist_roll_joint"])
 def test_without_clamp_the_command_runs_away(kit, start, clip, joint):
     """The regression itself: clamp OFF reproduces the divergence."""

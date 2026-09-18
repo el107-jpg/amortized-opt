@@ -64,6 +64,13 @@ def parse_args(argv=None):
     p.add_argument("--aux-weight", type=float, default=0.1)
     p.add_argument("--d-model", type=int, default=None, help="decoder width (default 384)")
     p.add_argument("--dec-layers", type=int, default=None, help="decoder depth (default 3)")
+    p.add_argument("--dec-rope", action="store_true",
+                   help="rotary position on decoder SELF-attention (see "
+                        "ModelConfig.dec_rope); off by default")
+    p.add_argument("--dec-plant-feats", action="store_true",
+                   help="analytic Cartesian (tip/wrist/elbow) + knot-RNEA of "
+                        "init_traj on decoder tokens (see "
+                        "ModelConfig.dec_plant_feats); off by default")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-kit-randomization", action="store_true")
@@ -78,6 +85,53 @@ def parse_args(argv=None):
     p.add_argument("--rest-frac", type=float, default=0.25,
                    help="fraction of BOTH-hands-idle draws kept instead of "
                         "rejected.  0 reproduces the old distribution")
+    p.add_argument("--waist-upright-ease-wp", type=int, default=None,
+                   help="seed AND target pitch/roll ease from the sampled lean "
+                        "to upright (0 rad) over this many waypoints, then "
+                        "hold (try 5).  Default None keeps the old "
+                        "hold-the-measured-lean data bit for bit -- which is "
+                        "the 'stay leaned' prior the phase-2 upright well has "
+                        "to fight")
+    p.add_argument("--hit-time-jitter-s", type=float, default=0.0,
+                   help="uniform +- jitter on each clip hit's time at snapshot "
+                        "time, seconds (unison-coherent; see goal_snapshot)")
+    p.add_argument("--hit-loudness-jitter", type=float, default=0.0,
+                   help="uniform +- jitter on each hit's 0-1 loudness before "
+                        "the speed mapping")
+    p.add_argument("--waist-aim-future-tau", type=float, default=1.0,
+                   help="time constant (s) of the FUTURE-aware waist aim law "
+                        "(WaistAimConfig.future_tau): the imitation target's "
+                        "yaw ramp and the aim_yaw token both aim at each hand's "
+                        "active goal AND its next hits, weighted by time to "
+                        "hit.  0 restores the current-goals-only law bit for "
+                        "bit.  Must match the phase-2 setting -- phase 2 warm "
+                        "starts from this checkpoint's head")
+    p.add_argument("--waist-sp-head", action="store_true",
+                   help="learned waist-yaw set-point head on the encoder "
+                        "(docs/waist_sp_head_plan.md).  Phase 1 needs NO loss "
+                        "change: the head is a zero-init residual on the "
+                        "analytic aim_yaw the imitation targets' yaw ramp "
+                        "already follows, and it trains through the decoder's "
+                        "conditioning token")
+    p.add_argument("--waist-pr-sp-head", action="store_true",
+                   help="learned waist pitch/roll set-point head on the encoder "
+                        "(docs/waist_pr_sp_head_plan.md).  Zero-init residual "
+                        "on upright; trains through the conditioning token.  "
+                        "Pair with --waist-upright-ease-wp so phase-1 targets "
+                        "are not 'keep the measured lean'")
+    p.add_argument("--waist-follow-frac", type=float, default=0.0,
+                   help="REMOVED. Non-zero exits; use --w-waist-gain")
+    p.add_argument("--waist-follow-jitter", type=float, default=0.3)
+    p.add_argument("--waist-pr-follow-jitter", type=float, default=0.1)
+    p.add_argument("--waist-hold-wp", type=int, default=10)
+    p.add_argument("--w-waist-mimic", type=float, default=0.0,
+                   help="Huber weight of encoder set-point vs aim / upright "
+                        "(try 0.1 with heads)")
+    p.add_argument("--w-waist-gain", type=float, default=0.0,
+                   help="identity Jacobian (∂ hold / ∂ sp − 1)² (try 1.0 with heads). "
+                        "No token jitter, no rewritten target")
+    p.add_argument("--waist-gain-frac", type=float, default=1.0,
+                   help="fraction of each batch used for the Jacobian VJP")
     p.add_argument("--no-idle-token", action="store_true",
                    help="keep the idle-arm targets but drop the encoder's IDLE "
                         "context token")
@@ -103,6 +157,12 @@ def parse_args(argv=None):
                    help="i.i.d. Gaussian inits at matched variance (OU off). "
                         "Implemented but NOT part of the sanctioned experiment "
                         "-- Eric cancelled the white-noise arm on 2026-08-10.")
+    p.add_argument("--aux-torque-tracking", action="store_true",
+                   help="train head_torque on the DEMANDED PD tracking torque "
+                        "|tau_rnea + tau_fb| (what w_track_torque prices) instead "
+                        "of the RNEA segment max. OFF by default: it redefines "
+                        "the aux target, so every earlier checkpoint's torque "
+                        "head means the other thing.")
     return p.parse_args(argv)
 
 
@@ -149,13 +209,19 @@ def main(argv=None) -> int:
     print(f"[run] {run_dir}", flush=True)
 
     scen = ScenarioConfig(
+        waist_cfg=A.WaistAimConfig(future_tau=float(args.waist_aim_future_tau)),
         horizon=int(args.horizon),
         buckets=tuple(args.buckets),
         randomize_kit=not args.no_kit_randomization,
         idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
         idle_settle_wp=int(args.idle_settle_wp),
         rest_frac=float(args.rest_frac),
+        waist_upright_ease_wp=args.waist_upright_ease_wp,
+        hit_time_jitter_s=float(args.hit_time_jitter_s),
+        hit_loudness_jitter=float(args.hit_loudness_jitter),
     )
+    print(f"[data] waist aim: future_tau={scen.waist_cfg.future_tau} s "
+          f"(0 = current goals only)", flush=True)
     acfg = ApexConfig(
         height=float(args.apex_height), radius=float(args.apex_radius),
         half_height=float(args.apex_half_height), iters=int(args.apex_iters),
@@ -177,6 +243,7 @@ def main(argv=None) -> int:
         device=pool_dev, fk=fk, rnea=rnea,
         init_mode=str(args.init_mode), init_mix=float(args.init_mix),
         white_noise=bool(args.white_noise),
+        aux_torque_tracking=bool(args.aux_torque_tracking),
     )
     print(f"[data] generating {args.val_scenarios} APEX val scenarios ...", flush=True)
     val_pool = generate_apex_pool(
@@ -186,6 +253,7 @@ def main(argv=None) -> int:
         device=pool_dev, fk=fk, rnea=rnea,
         init_mode=str(args.init_mode), init_mix=float(args.init_mix),
         white_noise=bool(args.white_noise),
+        aux_torque_tracking=bool(args.aux_torque_tracking),
     )
     t_data = time.perf_counter() - t0
     for name, pool in (("train", train_pool), ("val", val_pool)):
@@ -198,11 +266,17 @@ def main(argv=None) -> int:
         max_horizon=int(args.horizon), num_drums=scen.num_drums,
         num_future=scen.num_future,
         idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
+        waist_sp_head=bool(args.waist_sp_head),
+        waist_pr_sp_head=bool(args.waist_pr_sp_head),
     )
     for attr in ("d_model", "dec_layers"):
         val = getattr(args, attr, None)
         if val is not None:
             setattr(model_cfg, attr, val)
+    if args.dec_rope:
+        model_cfg.dec_rope = True
+    if args.dec_plant_feats:
+        model_cfg.dec_plant_feats = True
     model = A.build_model(model_cfg, dev)
     print(f"[model] {A.param_counts(model)}", flush=True)
 
@@ -217,8 +291,23 @@ def main(argv=None) -> int:
         patience_evals=int(args.patience),
         seed=int(args.seed),
         device=str(args.device),
+        aux_torque_tracking=bool(args.aux_torque_tracking),
+        waist_hold_wp=int(args.waist_hold_wp),
+        waist_gain_frac=float(args.waist_gain_frac),
     )
-    weights = LossWeights(aux=float(args.aux_weight))
+    if float(args.waist_follow_frac) > 0.0:
+        raise SystemExit(
+            "--waist-follow-frac is removed; use --w-waist-gain (identity Jacobian)"
+        )
+    if float(args.w_waist_gain) > 0.0 and not (args.waist_sp_head or args.waist_pr_sp_head):
+        raise SystemExit("--w-waist-gain > 0 requires --waist-sp-head and/or --waist-pr-sp-head")
+    if float(args.w_waist_mimic) > 0.0 and not (args.waist_sp_head or args.waist_pr_sp_head):
+        raise SystemExit("--w-waist-mimic > 0 requires a waist set-point head")
+    weights = LossWeights(
+        aux=float(args.aux_weight),
+        mimic=float(args.w_waist_mimic),
+        gain=float(args.w_waist_gain),
+    )
 
     summary = train(
         model=model, train_pool=train_pool, val_pool=val_pool, cfg=cfg,

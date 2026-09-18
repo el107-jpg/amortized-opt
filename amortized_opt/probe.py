@@ -16,12 +16,18 @@ of the drum that was aimed at.
 Conventions
 -----------
 
-``axial`` is the signed distance from the contact point to the head plane along
-the OUTWARD head normal, so **positive means short of the head**; the acceptance
-band is |axial| <= 20 mm.  ``in_plane`` is the distance beyond the legal disk
-edge, so <= 0 means inside.  ``in_disk`` is the conjunction, plus the half-plane
-cut for the drums that have one -- the same test
-:meth:`~amortized_opt.eval_harness.TrajectoryScorer.score` applies to a plan.
+``axial`` is the signed distance from the **selected contact** to the aim plane
+along the OUTWARD head normal, so **positive means short of the aim** (toward /
+past the geometric surface).  Pads use the bead; cymbals and the hi-hat use the
+closest point of the playing-shaft capsule
+(:func:`~amortized_opt.strike.shaft_hit_sigma_range`) to the legal region.  The
+acceptance band is the interior hit cylinder
+(:func:`~amortized_opt.strike.strike_axial_limits`): default 0 to +10 mm, i.e.
+from the 1 cm-inset aim out to the head surface.  ``in_plane`` is the distance
+beyond the legal disk edge, so <= 0 means inside.  ``in_disk`` is the
+conjunction, plus the half-plane cut for the drums that have one -- the same
+test :meth:`~amortized_opt.eval_harness.TrajectoryScorer.score` applies to a
+plan (capsule on cymbals, bead on pads).
 
 With ``MPCGenConfig.hit_lead_s`` the planner is told every hit is ``lead_s``
 early, so ``EpisodeResult.hit_steps`` fires ``round(lead_s / dt)`` ticks before
@@ -36,10 +42,19 @@ import time
 import numpy as np
 import torch
 
-from .constants import CONTROL_DT
+from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
+from .fk import ChainFK
+from .ik import correct_quintic_init_arms
+from .limits import urdf_position_limits
 from .mpc_gen import MPCGenConfig, MPCGenerator, PlanRequest
 from .rhythm import build_context_inputs, strike_region
-from .strike import default_contact_sigma
+from .sdf import hit_region_dist, segment_hit_region
+from .strike import (
+    default_contact_sigma,
+    shaft_hit_sigma_range,
+    strike_axial_limits,
+)
+from .warmstart import seed_waist_pr_to_sp
 
 __all__ = [
     "closed_loop_probe",
@@ -52,33 +67,80 @@ __all__ = [
 
 
 # ------------------------------------------------------------------ geometry --
-def head_frame_error(scorer, q, hand, kit, drum, sigma, *, axial_tol: float = 0.02):
-    """``(axial, in_plane_beyond_edge, in_disk)`` of the contact point at ``q``."""
-    p_c, _tip, _d = scorer.contact_world(np.asarray(q, float), hand, sigma)
+def head_frame_error(scorer, q, hand, kit, drum, sigma, *, axial_tol: float | None = None):
+    """``(axial, in_plane_beyond_edge, in_disk)`` of the contact at ``q``.
+
+    Pads: the bead (``sigma``).  Cymbals/hi-hat: the closest point of the
+    playing-shaft capsule to the legal region; ``sigma`` is ignored.  ``axial``
+    and ``in_plane`` are reported at that selected point, so a shaft that spans
+    the rim reads as inside even if the shoulder is not.
+    """
+    name = kit.names[int(drum)]
+    rng = shaft_hit_sigma_range(name)
+    lo, hi = (float(sigma), float(sigma)) if rng is None else (float(rng[0]), float(rng[1]))
+    a, _t, _d = scorer.contact_world(np.asarray(q, float), hand, lo)
+    b, _t, _d = scorer.contact_world(np.asarray(q, float), hand, hi)
     _aim, center, disk_r, half = strike_region(kit, int(drum), frame="pelvis")
     axis = np.asarray(kit.axes[int(drum)], float)
     axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
-    e = p_c - center
-    ax = float(e @ axis)
-    e_in = e - ax * axis
-    r_in = float(np.linalg.norm(e_in))
-    ok = (r_in <= disk_r) and abs(ax) <= float(axial_tol)
-    if half is not None:
-        ok = ok and float(e_in @ half) >= -1e-9
-    return ax, r_in - disk_r, bool(ok)
+    if axial_tol is None:
+        ax_lo, ax_hi = strike_axial_limits()
+    else:
+        ax_lo, ax_hi = -float(axial_tol), float(axial_tol)
+    hp = np.zeros(3) if half is None else np.asarray(half, float)
+    has_hp = 0.0 if half is None else 1.0
+    t = lambda x: scorer._t(x)
+    dist, _s, p_c = segment_hit_region(
+        t(a), t(b), t(center), t(axis), float(disk_r),
+        t(np.zeros(3)), t(hp), has_hp, ax_lo, ax_hi,
+    )
+    _d0, ax_t, d_in_t = hit_region_dist(
+        p_c, t(center), t(axis), float(disk_r),
+        t(np.zeros(3)), t(hp), has_hp, ax_lo, ax_hi,
+    )
+    d_in = d_in_t.detach().cpu().numpy()
+    r_in = float(np.linalg.norm(d_in))
+    ax = float(ax_t.item())
+    ok = float(dist.item()) <= 1e-9
+    return ax, r_in - float(disk_r), bool(ok)
 
 
 # ------------------------------------------------------------------- planner --
 def mpc_model_planner(model, *, num_drums, num_future, device, amp_dtype=None,
-                      iterations: int = 1, record: list | None = None):
+                      iterations: int = 1, record: list | None = None,
+                      waist_cfg=None, clamp_init_to_box: bool = True):
     """The decoder wired into ``MPCGenerator``'s planner protocol.
 
     Returns ``(plan_fn, state)``; ``state["drift"]`` accumulates the
     temporal-consistency drift between successive plans on their shared support
     and ``record``, if given, receives one dict per tick with that tick's plan.
+
+    ``waist_cfg`` is the :class:`~amortized_opt.waist_aim.WaistAimConfig` the
+    context's ``aim_yaw`` is computed with -- pass the one the checkpoint was
+    trained against, exactly as every pool builder passes ``cfg.waist_cfg``.
+    ``None`` keeps the default config (today's behaviour).
+
+    ``clamp_init_to_box`` projects the seed (and the waist P/R set-point it
+    eases toward) into the URDF/posture box after ``seed_waist_pr_to_sp`` /
+    DLS, so the decoder is not residual-seeded off an illegal torso.  Matches
+    ``MPCGenConfig.clamp_init_to_box``; does not clamp the emitted traj.
     """
     core = model.module if hasattr(model, "module") else model
-    state = {"prev": None, "drift": []}
+    state = {"prev": None, "drift": [], "last_hit": None}
+    fk: ChainFK | None = None
+    q_lo_np, q_hi_np = urdf_position_limits(G1_UPPER_BODY_JOINTS)
+    q_lo_t = torch.as_tensor(q_lo_np, device=device, dtype=torch.float32)
+    q_hi_t = torch.as_tensor(q_hi_np, device=device, dtype=torch.float32)
+    _pr = (
+        G1_UPPER_BODY_JOINTS.index("waist_pitch_joint"),
+        G1_UPPER_BODY_JOINTS.index("waist_roll_joint"),
+    )
+
+    def _fk(dev, dtype) -> ChainFK:
+        nonlocal fk
+        if fk is None or fk.device != torch.device(dev) or fk.dtype != dtype:
+            fk = ChainFK(device=dev, dtype=dtype)
+        return fk
 
     @torch.no_grad()
     def plan(req: PlanRequest) -> np.ndarray:
@@ -88,7 +150,13 @@ def mpc_model_planner(model, *, num_drums, num_future, device, amp_dtype=None,
         ctx = build_context_inputs(
             req.kit, req.snapshot, num_drums=num_drums, num_future=num_future,
             frame="env", device=device, dtype=torch.float32,
+            idle_library=getattr(req, "idle_library", None),
+            idle_cylinder=getattr(req, "idle_cylinder", None),
             idle_home=getattr(req, "idle_home", None),
+            yaw_now=np.asarray(req.q, float)[
+                G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
+            ],
+            waist_cfg=waist_cfg,
         )
         t = lambda a: torch.as_tensor(  # noqa: E731
             np.asarray(a, float), device=device, dtype=torch.float32
@@ -109,6 +177,47 @@ def mpc_model_planner(model, *, num_drums, num_future, device, amp_dtype=None,
         )
         with amp:
             enc = core.encode_context(ctx)
+            n = len(G1_UPPER_BODY_JOINTS)
+            if enc.waist_pr_sp is not None:
+                sp = enc.waist_pr_sp
+                if clamp_init_to_box:
+                    sp = sp.detach().clone()
+                    sp[..., 0] = sp[..., 0].clamp(q_lo_np[_pr[0]], q_hi_np[_pr[0]])
+                    sp[..., 1] = sp[..., 1].clamp(q_lo_np[_pr[1]], q_hi_np[_pr[1]])
+                init = seed_waist_pr_to_sp(
+                    init, st[:, :n], st[:, n:], sp,
+                    joint_names=G1_UPPER_BODY_JOINTS, dt=float(req.dt),
+                )
+            hit = torch.tensor(
+                [[req.hit_index.get("left", -1), req.hit_index.get("right", -1)]],
+                device=init.device, dtype=torch.long,
+            )
+            aims = torch.zeros(1, 2, 3, device=init.device, dtype=init.dtype)
+            for hi, hand in enumerate(("left", "right")):
+                g = req.snapshot.goal[hand]
+                if g.active:
+                    aims[0, hi] = t(np.asarray(g.position, float))
+            # Fresh quintic only: first tick, or a hand whose horizon jumped
+            # (reseed / stale promote).  Every-tick DLS would rebuild arms
+            # from q0 and wipe the shifted decoder plan.
+            hits = (
+                int(req.hit_index.get("left", -1)),
+                int(req.hit_index.get("right", -1)),
+            )
+            last = state["last_hit"]
+            pending = last is None or any(
+                h >= 1 and (last[i] < 1 or h > last[i]) for i, h in enumerate(hits)
+            )
+            if pending:
+                init = correct_quintic_init_arms(
+                    _fk(init.device, init.dtype), init, st[:, :n], hit, aims,
+                    steps=1, joint_names=G1_UPPER_BODY_JOINTS,
+                    qd0=st[:, n:], dt=float(req.dt),
+                )
+            if clamp_init_to_box:
+                init = init.clamp(q_lo_t.to(device=init.device, dtype=init.dtype),
+                                  q_hi_t.to(device=init.device, dtype=init.dtype))
+            state["last_hit"] = hits
             out = core.refine(init, st, enc, masks, iterations=int(iterations))
         traj = out.traj[0].float().cpu().numpy()
         prev = state["prev"]
@@ -251,6 +360,7 @@ def _p50(v):
 def summarize_hits(hits) -> dict:
     n = len(hits)
     g = lambda o, f: [h["meas"][o][f] for h in hits if o in h["meas"]]  # noqa: E731
+    ax_lo_mm, ax_hi_mm = (1000.0 * v for v in strike_axial_limits())
     out = {
         "hits": n,
         "in_disk": sum(1 for h in hits if h["meas"].get(0, {}).get("in_disk")),
@@ -261,7 +371,9 @@ def summarize_hits(hits) -> dict:
         "axial_p50_mm": _p50(g(0, "axial_mm")),
         "axial_abs_p50_mm": _p50([abs(x) for x in g(0, "axial_mm")]),
         "inplane_p50_mm": _p50(g(0, "inplane_mm")),
-        "axial_in_band": sum(1 for x in g(0, "axial_mm") if abs(x) <= 20.0),
+        "axial_in_band": sum(
+            1 for x in g(0, "axial_mm") if ax_lo_mm - 1e-6 <= x <= ax_hi_mm + 1e-6
+        ),
         "inplane_inside": sum(1 for x in g(0, "inplane_mm") if x <= 0.0),
     }
     # A continuous selection score.  Raw ``in_disk`` on a one-clip probe is a
@@ -305,11 +417,18 @@ def closed_loop_probe(
     pid_with_lead: bool = False,
     kp_scale=1.0,
     kd_scale=1.0,
+    saturate_effort: bool = False,
     freeze_wp: int = 0,
     freeze_waist: bool = True,
     sticky_goal_point: bool = True,
+    bounce: object | None = True,
     starts=None,
     record_drift: bool = True,
+    waist_upright_ease_wp: int | None = None,
+    waist_cfg=None,
+    waist_pr_ema: bool = False,
+    waist_pr_ema_alpha: float = 0.1,
+    waist_pr_ema_leak: float = 0.02,
 ) -> dict:
     """Run ``len(clips)`` closed-loop episodes and score every executed strike.
 
@@ -317,14 +436,24 @@ def closed_loop_probe(
     rolling training metric: the start poses come from a seeded
     :class:`~amortized_opt.starts.StartSampler` draw and every episode's RNG is
     ``1000 + episode``.
+
+    ``bounce`` defaults ON: after each fire the plant gets the BPTT placeholder
+    contact impulse (:func:`~amortized_opt.train_cost.apply_bounce`) before the
+    next-hit quintic is seeded, matching the training roller's post-hit carry.
+    Pass ``False`` to restore the historical through-the-head plant.
     """
     was_training = getattr(model, "training", False)
     core = model.module if hasattr(model, "module") else model
     core.eval()
-    gen0 = MPCGenerator(kit=kit, config=MPCGenConfig(
+    gen0 = MPCGenerator(kit=kit, waist_cfg=waist_cfg, config=MPCGenConfig(
         horizon=int(horizon), ki=float(ki), ki_windup=float(ki_windup),
         pid_with_lead=bool(pid_with_lead),
         kp_scale=kp_scale, kd_scale=kd_scale,
+        saturate_effort=bool(saturate_effort),
+        waist_upright_ease_wp=waist_upright_ease_wp,
+        waist_pr_ema=bool(waist_pr_ema),
+        waist_pr_ema_alpha=float(waist_pr_ema_alpha),
+        waist_pr_ema_leak=float(waist_pr_ema_leak),
     ))
     if starts is None:
         from .starts import StartSampler
@@ -339,20 +468,28 @@ def closed_loop_probe(
     for ep, clip in enumerate(clips):
         gen = MPCGenerator(
             kit=kit,
+            waist_cfg=waist_cfg,
             config=MPCGenConfig(
                 horizon=int(horizon), hit_lead_s=float(lead_s),
                 cmd_lead_s=cmd_lead_s,
                 ki=float(ki), ki_windup=float(ki_windup),
                 pid_with_lead=bool(pid_with_lead),
                 kp_scale=kp_scale, kd_scale=kd_scale,
+                saturate_effort=bool(saturate_effort),
                 freeze_wp=int(freeze_wp), freeze_waist=bool(freeze_waist),
                 sticky_goal_point=bool(sticky_goal_point),
+                bounce=bounce,
+                waist_upright_ease_wp=waist_upright_ease_wp,
+                waist_pr_ema=bool(waist_pr_ema),
+                waist_pr_ema_alpha=float(waist_pr_ema_alpha),
+                waist_pr_ema_leak=float(waist_pr_ema_leak),
             ),
         )
         record: list = [] if record_drift else None
         plan, st = mpc_model_planner(
             model, num_drums=num_drums, num_future=num_future, device=device,
             amp_dtype=amp_dtype, iterations=iterations, record=record,
+            waist_cfg=waist_cfg,
         )
         t0 = time.perf_counter()
         res = gen.run_episode(
@@ -369,6 +506,7 @@ def closed_loop_probe(
             "clip": clip.name, "ticks": int(res.cmd_hist.shape[0]),
             "hits": len(hits), "diverged": bool(res.diverged),
             "frozen_ticks": int(getattr(res, "frozen_ticks", 0)),
+            "bounced_hands": int(getattr(res, "bounced_hands", 0)),
             "pd_track_p50_mrad": float(np.percentile(track, 50) * 1000),
             "pd_track_p90_mrad": float(np.percentile(track, 90) * 1000),
             "tc_drift_p50_mrad": (float(np.percentile(st["drift"], 50) * 1000)

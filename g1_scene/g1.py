@@ -802,13 +802,10 @@ def _actuators_as_ideal_pd(actuators: dict) -> dict:
                 if val is not None:
                     kwargs[key] = val
         # Pin the explicit clip to the sim limit. An EXPLICIT actuator with
-        # effort_limit=None resolves it from the USD joint prim, which is a
-        # different number than effort_limit_sim on waist pitch/roll (50 vs
-        # 25 N·m, measured 2026-08-04): the Python-side clip then passes
-        # torques PhysX silently caps, so applied_torque over-reports and
-        # every torque-consistency consumer (feasibility clamp, aux-loss
-        # envelope, trajopt tables — all built on 25) disagrees with the
-        # actuator's own arithmetic.
+        # effort_limit=None resolves it from the USD joint prim, which can
+        # disagree with ``effort_limit_sim``; the Python-side clip must match
+        # what PhysX enforces so applied_torque and the amortized cost tables
+        # (``limits.isaac_effort_limits``) stay aligned with the actuator.
         if kwargs.get("effort_limit") is None and kwargs.get("effort_limit_sim") is not None:
             kwargs["effort_limit"] = kwargs["effort_limit_sim"]
         out[name] = IdealPDActuatorCfg(**kwargs)

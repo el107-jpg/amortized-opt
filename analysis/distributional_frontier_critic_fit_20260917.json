@@ -1,0 +1,322 @@
+{
+  "dataset_checkpoint": "/tmp/minimal-critic-cpu-60/last.pt",
+  "rows": {
+    "train": 3360,
+    "calibration": 720,
+    "test": 720,
+    "unknown_train": "fresh_per_update"
+  },
+  "updates": 2000,
+  "batch": 256,
+  "lr": 0.003,
+  "unknown_fraction": 4.0,
+  "unknown_weight": 0.0025,
+  "exposure_mode": "global",
+  "selected_only": true,
+  "arms_run": "oe",
+  "arms": {
+    "softmax_3h_oe": {
+      "kind": "softmax",
+      "heads": 3,
+      "outlier_exposure": true,
+      "train_seconds": 25.95474130898947,
+      "temperature": [
+        1.6014784574508667,
+        1.6981217861175537,
+        1.4075813293457031,
+        1.3632733821868896,
+        1.431890606880188
+      ],
+      "id_raw": {
+        "bin_accuracy": 0.6377778053283691,
+        "final_bin_accuracy": 0.7222222089767456,
+        "nll": 1.4005322456359863,
+        "final_nll": 0.9569591879844666,
+        "categorical_brier": 0.4983518123626709,
+        "ranked_probability_score": 0.07845752686262131,
+        "mean_abs_bin_error": 0.9794444441795349,
+        "final_mean_abs_bin_error": 0.5708333253860474,
+        "final_confidence_ece": 0.05011649802327156,
+        "safe_brier": 0.050552304834127426,
+        "safe_ece": 0.020633362233638763,
+        "safe_accuracy": 0.9291666746139526,
+        "safe_auc": 0.9259347319602966,
+        "safe_recall": 0.28070175647735596,
+        "safe_precision": 0.6153846383094788,
+        "false_safe_rate": 0.013888888992369175,
+        "mean_entropy": 0.35224103927612305,
+        "mean_final_entropy": 0.2921691834926605,
+        "mean_disagreement": 0.05731162056326866,
+        "final_entropy_nll_correlation": 0.48231685161590576,
+        "final_entropy_bin_error_correlation": 0.44170522689819336,
+        "selective_final": {
+          "aurc": 0.09480006992816925,
+          "entropy_error_auc": 0.8314231038093567,
+          "coverage": {
+            "1.0": {
+              "bin_accuracy": 0.7222222089767456,
+              "nll": 0.9569591283798218,
+              "mean_abs_bin_error": 0.5708333253860474
+            },
+            "0.9": {
+              "bin_accuracy": 0.7561728358268738,
+              "nll": 0.8556562662124634,
+              "mean_abs_bin_error": 0.43518519401550293
+            },
+            "0.8": {
+              "bin_accuracy": 0.8142361044883728,
+              "nll": 0.6698825359344482,
+              "mean_abs_bin_error": 0.3385416567325592
+            },
+            "0.7": {
+              "bin_accuracy": 0.8591269850730896,
+              "nll": 0.47095978260040283,
+              "mean_abs_bin_error": 0.2142857164144516
+            },
+            "0.5": {
+              "bin_accuracy": 0.925000011920929,
+              "nll": 0.2740746736526489,
+              "mean_abs_bin_error": 0.10277777910232544
+            }
+          }
+        }
+      },
+      "id_calibrated": {
+        "bin_accuracy": 0.6388888955116272,
+        "final_bin_accuracy": 0.7236111164093018,
+        "nll": 1.2382066249847412,
+        "final_nll": 0.8925859332084656,
+        "categorical_brier": 0.4932558536529541,
+        "ranked_probability_score": 0.07886366546154022,
+        "mean_abs_bin_error": 0.9800000190734863,
+        "final_mean_abs_bin_error": 0.5680555701255798,
+        "final_confidence_ece": 0.05713953450322151,
+        "safe_brier": 0.050762828439474106,
+        "safe_ece": 0.017700279131531715,
+        "safe_accuracy": 0.9236111044883728,
+        "safe_auc": 0.9259876608848572,
+        "safe_recall": 0.17543859779834747,
+        "safe_precision": 0.5555555820465088,
+        "false_safe_rate": 0.011111111380159855,
+        "mean_entropy": 0.4536682069301605,
+        "mean_final_entropy": 0.361535906791687,
+        "mean_disagreement": 0.04632244259119034,
+        "final_entropy_nll_correlation": 0.5818513035774231,
+        "final_entropy_bin_error_correlation": 0.4359125792980194,
+        "selective_final": {
+          "aurc": 0.09287799894809723,
+          "entropy_error_auc": 0.8338043093681335,
+          "coverage": {
+            "1.0": {
+              "bin_accuracy": 0.7236111164093018,
+              "nll": 0.8925859332084656,
+              "mean_abs_bin_error": 0.5680555701255798
+            },
+            "0.9": {
+              "bin_accuracy": 0.7561728358268738,
+              "nll": 0.7930974960327148,
+              "mean_abs_bin_error": 0.45370370149612427
+            },
+            "0.8": {
+              "bin_accuracy": 0.8125,
+              "nll": 0.6280970573425293,
+              "mean_abs_bin_error": 0.3211805522441864
+            },
+            "0.7": {
+              "bin_accuracy": 0.8591269850730896,
+              "nll": 0.45904335379600525,
+              "mean_abs_bin_error": 0.2123015820980072
+            },
+            "0.5": {
+              "bin_accuracy": 0.9333333373069763,
+              "nll": 0.23764197528362274,
+              "mean_abs_bin_error": 0.07777778059244156
+            }
+          }
+        }
+      },
+      "ood": {
+        "factorized": {
+          "raw": {
+            "entropy_auc": 0.5609818696975708,
+            "disagreement_auc": 0.7987442016601562,
+            "combined_sum_auc": 0.677314817905426,
+            "combined_or_auc": 0.6648630499839783,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.3820176124572754
+          },
+          "calibrated": {
+            "entropy_auc": 0.5328954458236694,
+            "disagreement_auc": 0.7989949584007263,
+            "combined_sum_auc": 0.6475481986999512,
+            "combined_or_auc": 0.6330767869949341,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.46967756748199463
+          }
+        },
+        "perturbed": {
+          "raw": {
+            "entropy_auc": 0.5010397434234619,
+            "disagreement_auc": 0.6653703451156616,
+            "combined_sum_auc": 0.5715104341506958,
+            "combined_or_auc": 0.553697943687439,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.3550567924976349
+          },
+          "calibrated": {
+            "entropy_auc": 0.48522377014160156,
+            "disagreement_auc": 0.6698939204216003,
+            "combined_sum_auc": 0.5528916120529175,
+            "combined_or_auc": 0.5304455757141113,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.4494025707244873
+          }
+        },
+        "radial_0": {
+          "raw": {
+            "entropy_auc": 0.5088792443275452,
+            "disagreement_auc": 0.5046740174293518,
+            "combined_sum_auc": 0.5119946002960205,
+            "combined_or_auc": 0.5173919796943665,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.35640838742256165
+          },
+          "calibrated": {
+            "entropy_auc": 0.5103337168693542,
+            "disagreement_auc": 0.4996103346347809,
+            "combined_sum_auc": 0.511805534362793,
+            "combined_or_auc": 0.5189428925514221,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.45846378803253174
+          }
+        },
+        "radial_0.1": {
+          "raw": {
+            "entropy_auc": 0.5089641213417053,
+            "disagreement_auc": 0.5130536556243896,
+            "combined_sum_auc": 0.513647735118866,
+            "combined_or_auc": 0.5180941224098206,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.35672301054000854
+          },
+          "calibrated": {
+            "entropy_auc": 0.5103588104248047,
+            "disagreement_auc": 0.5085339546203613,
+            "combined_sum_auc": 0.5133835077285767,
+            "combined_or_auc": 0.5193923711776733,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.45872771739959717
+          }
+        },
+        "radial_0.25": {
+          "raw": {
+            "entropy_auc": 0.5135069489479065,
+            "disagreement_auc": 0.5446797609329224,
+            "combined_sum_auc": 0.5248591899871826,
+            "combined_or_auc": 0.5245524644851685,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.35865017771720886
+          },
+          "calibrated": {
+            "entropy_auc": 0.5120524764060974,
+            "disagreement_auc": 0.5404099225997925,
+            "combined_sum_auc": 0.5215914249420166,
+            "combined_or_auc": 0.5235108137130737,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.4596072733402252
+          }
+        },
+        "radial_0.5": {
+          "raw": {
+            "entropy_auc": 0.5151234865188599,
+            "disagreement_auc": 0.6011978983879089,
+            "combined_sum_auc": 0.5450617074966431,
+            "combined_or_auc": 0.5353395342826843,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.3596586585044861
+          },
+          "calibrated": {
+            "entropy_auc": 0.5091686248779297,
+            "disagreement_auc": 0.6017033457756042,
+            "combined_sum_auc": 0.5362268686294556,
+            "combined_or_auc": 0.5288406610488892,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.45832905173301697
+          }
+        },
+        "radial_1": {
+          "raw": {
+            "entropy_auc": 0.5104976892471313,
+            "disagreement_auc": 0.6801003217697144,
+            "combined_sum_auc": 0.582361102104187,
+            "combined_or_auc": 0.567731499671936,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.3583022654056549
+          },
+          "calibrated": {
+            "entropy_auc": 0.4947279989719391,
+            "disagreement_auc": 0.6844791769981384,
+            "combined_sum_auc": 0.5644656419754028,
+            "combined_or_auc": 0.5489699244499207,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.4521479308605194
+          }
+        },
+        "radial_2": {
+          "raw": {
+            "entropy_auc": 0.5111400485038757,
+            "disagreement_auc": 0.7596257925033569,
+            "combined_sum_auc": 0.6413753628730774,
+            "combined_or_auc": 0.6479899883270264,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.3600269854068756
+          },
+          "calibrated": {
+            "entropy_auc": 0.48233023285865784,
+            "disagreement_auc": 0.7635648250579834,
+            "combined_sum_auc": 0.6181442737579346,
+            "combined_or_auc": 0.6318866014480591,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.44664281606674194
+          }
+        },
+        "radial_4": {
+          "raw": {
+            "entropy_auc": 0.5246701240539551,
+            "disagreement_auc": 0.8303385376930237,
+            "combined_sum_auc": 0.7018325328826904,
+            "combined_or_auc": 0.7276813387870789,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.36972227692604065
+          },
+          "calibrated": {
+            "entropy_auc": 0.4818248450756073,
+            "disagreement_auc": 0.8373610973358154,
+            "combined_sum_auc": 0.6782851219177246,
+            "combined_or_auc": 0.7207484841346741,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.4466169476509094
+          }
+        },
+        "global": {
+          "raw": {
+            "entropy_auc": 0.9279938340187073,
+            "disagreement_auc": 0.9793460369110107,
+            "combined_sum_auc": 0.9861747622489929,
+            "combined_or_auc": 0.9781442880630493,
+            "id_entropy": 0.35224103927612305,
+            "ood_entropy": 0.5881725549697876
+          },
+          "calibrated": {
+            "entropy_auc": 0.8936651349067688,
+            "disagreement_auc": 0.9727025628089905,
+            "combined_sum_auc": 0.9852796792984009,
+            "combined_or_auc": 0.9718016982078552,
+            "id_entropy": 0.4536682069301605,
+            "ood_entropy": 0.6626209020614624
+          }
+        }
+      }
+    }
+  }
+}

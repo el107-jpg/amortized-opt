@@ -12,7 +12,9 @@ import pytest
 import torch
 
 from amortized_opt.constants import CONTROL_DT, N_DOF
-from amortized_opt.model import AmortizedOptimizer, ModelConfig, param_counts
+from amortized_opt.model import (
+    AmortizedOptimizer, ModelConfig, hold_fill_waypoints, param_counts,
+)
 from amortized_opt.tokenizer import ContextInputs, build_waypoint_masks, pack_state
 
 H = 100
@@ -39,8 +41,12 @@ def make_batch(batch: int, device, *, seed: int = 0, hits=None):
     # the "every parameter gets a gradient" check below actually covers it.
     ctx.goal_valid[-1, 1] = False
     ctx.idle_valid[-1, 1] = True
-    ctx.idle_home_q[-1, 1].copy_(torch.rand(7, generator=g).to(device))
-    ctx.idle_home_tip[-1, 1].copy_(torch.rand(3, generator=g).to(device))
+    # TYPE_IDLE payload is the torso-frame safety cylinder (8-D), not a joint home.
+    ctx.idle_cyl[-1, 1].copy_(torch.rand(8, generator=g).to(device))
+    ctx.idle_cyl[-1, 1, 3:6].copy_(
+        torch.nn.functional.normalize(ctx.idle_cyl[-1, 1, 3:6], dim=0)
+    )
+    ctx.idle_cyl[-1, 1, 6:].clamp_(min=0.05)
     ctx.goal_pos.copy_(torch.rand(batch, 2, 3, generator=g).to(device))
     ctx.goal_vel.copy_((torch.rand(batch, 2, 3, generator=g) - 0.5).to(device) * 6.0)
     ctx.goal_drum.copy_(torch.randint(0, 7, (batch, 2), generator=g).to(device))
@@ -56,7 +62,13 @@ def make_batch(batch: int, device, *, seed: int = 0, hits=None):
         t_r = torch.full((batch,), float(hits[1]))
     t_l, t_r = t_l.to(device), t_r.to(device)
     ctx.goal_tth.copy_(torch.stack([t_l, t_r], dim=1))
-    ctx.future_tth.copy_(torch.stack([t_l, t_r], dim=1).unsqueeze(-1) + 0.5)
+    # The future tokens are HIT-RELATIVE (``ContextInputs.future_gap``): 0.5 s
+    # of gap per slot AFTER the current goal's strike, not 0.5 s after "now".
+    ctx.future_gap.copy_(
+        0.5 * torch.arange(
+            1, ctx.num_future + 1, device=device, dtype=ctx.future_gap.dtype
+        ).view(1, 1, -1).expand_as(ctx.future_gap)
+    )
 
     masks = build_waypoint_masks(t_l, t_r, max_horizon=H, dt=CONTROL_DT)
     init = (torch.rand(batch, H, N_DOF, generator=g).to(device) - 0.5) * 0.6
@@ -264,7 +276,8 @@ def _decoder_args(m, batch, device, seed=0):
         enc = m.encode_context(ctx)
     return (
         init, state, masks.tau_left, masks.tau_right, masks.tau0_left, masks.tau0_right,
-        masks.elem_mask, masks.token_mask, masks.point_mask, enc.memory, enc.mask,
+        masks.hit_tth, masks.elem_mask, masks.token_mask, masks.point_mask,
+        enc.memory, enc.mask,
     )
 
 
@@ -303,9 +316,10 @@ def test_compile_fullgraph_and_latency(cuda_device, capsys):
     assert all(c > 0 for _b, _e, c, _t in rows)
 
 
-def test_compiled_matches_eager(cuda_device):
+@pytest.mark.parametrize("dec_rope", [False, True])
+def test_compiled_matches_eager(cuda_device, dec_rope):
     torch._dynamo.reset()
-    m = make_model(cuda_device)
+    m = make_model(cuda_device, dec_rope=dec_rope)
     args = _decoder_args(m, 4, cuda_device, seed=3)
     with torch.no_grad():
         ref = m.decoder(*args)
@@ -316,6 +330,20 @@ def test_compiled_matches_eager(cuda_device):
             pytest.skip(f"torch.compile unavailable: {type(exc).__name__}: {exc}")
     d = max((a - b).abs().max().item() for a, b in zip(ref, got))
     assert d < 1e-4, d
+
+
+def test_compiled_fp32_traj_head_matches_eager(cuda_device):
+    torch._dynamo.reset()
+    m = make_model(cuda_device, traj_head_fp32=True)
+    args = _decoder_args(m, 4, cuda_device, seed=31)
+    with torch.no_grad():
+        ref = m.decoder(*args)
+        try:
+            got = torch.compile(m.decoder, fullgraph=True)(*args)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile unavailable: {type(exc).__name__}: {exc}")
+    d = max((a - b).abs().max().item() for a, b in zip(ref, got))
+    assert d < 2e-4, d
 
 
 # ---------------------------------------------------------- 7. sync-free --
@@ -365,6 +393,64 @@ def test_config_is_configurable(cuda_device):
     ctx, init, state, masks = make_batch(2, cuda_device)
     out = _fwd(m, init, state, m.encode_context(ctx), masks)
     assert out.traj.shape == (2, H, 17)
+
+
+def test_traj_head_fp32_forward_backward_and_fp32_parity(cuda_device):
+    """Only the trajectory readout escapes AMP; its gradients stay connected."""
+    small = dict(
+        d_model=32, dec_heads=2, dec_layers=1,
+        d_ctx=32, ctx_heads=2, ctx_layers=1,
+    )
+    base = make_model(cuda_device, traj_head_fp32=False, **small)
+    fp32_head = make_model(cuda_device, traj_head_fp32=True, **small)
+    fp32_head.load_state_dict(base.state_dict())
+    ctx, init, state, masks = make_batch(2, cuda_device, seed=29)
+
+    # With autocast disabled the option is numerically identical.
+    enc0 = base.encode_context(ctx)
+    enc1 = fp32_head.encode_context(ctx)
+    ref = base(init, state, enc0, masks).traj
+    got = fp32_head(init, state, enc1, masks).traj
+    assert torch.equal(got, ref)
+
+    captured = {}
+    def capture(name):
+        def hook(_module, _args, output):
+            captured[name] = output
+        return hook
+
+    hooks = [
+        fp32_head.decoder.blocks[0].self_attn.q_proj.register_forward_hook(
+            capture("amp_linear")
+        ),
+        fp32_head.decoder.norm.register_forward_hook(capture("h")),
+    ]
+    device_type = "cuda" if torch.device(cuda_device).type == "cuda" else "cpu"
+    try:
+        with torch.autocast(device_type, dtype=torch.bfloat16):
+            out = fp32_head(
+                init, state, fp32_head.encode_context(ctx), masks
+            )
+            loss = out.traj.square().mean()
+    finally:
+        for hook in hooks:
+            hook.remove()
+    assert captured["amp_linear"].dtype == torch.bfloat16
+    assert out.traj.dtype == torch.float32
+    expected = (
+        fp32_head.decoder.q_center.float()
+        + fp32_head.decoder.q_half.float()
+        * torch.nn.functional.linear(
+            captured["h"][:, 1:].float(),
+            fp32_head.decoder.head_traj.weight.float(),
+            fp32_head.decoder.head_traj.bias.float(),
+        )
+    ) * masks.elem_mask.float()
+    assert torch.equal(out.traj, expected)
+    loss.backward()
+    grad = fp32_head.decoder.head_traj.weight.grad
+    assert grad is not None and grad.dtype == torch.float32
+    assert torch.isfinite(grad).all() and bool(grad.abs().sum() > 0)
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -459,3 +545,215 @@ def test_other_shape_fields_still_round_trip():
     for f in ("dec_layers", "d_model", "d_ctx", "num_future", "max_horizon"):
         assert getattr(got, f) == getattr(cfg, f), f
     AmortizedOptimizer(got).load_state_dict(ck["model"])
+
+
+def test_traj_head_fp32_checkpoint_config_migration():
+    """Missing old key means OFF; an opt-in checkpoint round-trips as ON."""
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False)
+    ck["model_cfg"].pop("traj_head_fp32")
+    assert model_config_from_checkpoint(ck).traj_head_fp32 is False
+
+    ck_on, _ = _fake_ckpt(
+        idle_token=True, drop_cfg_key=False, traj_head_fp32=True
+    )
+    restored = model_config_from_checkpoint(ck_on)
+    assert restored.traj_head_fp32 is True
+    AmortizedOptimizer(restored).load_state_dict(ck_on["model"])
+
+
+# --------------------------------------------------------------- 8. RoPE --
+def _rope_cis(dh: int, seq: int, base: float = 10000.0, shift: int = 0):
+    from amortized_opt.model import rope_inv_freq
+    inv = rope_inv_freq(dh, base)
+    t = torch.arange(shift, shift + seq, dtype=torch.float32)
+    freqs = torch.outer(t, inv)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().view(1, 1, seq, -1), emb.sin().view(1, 1, seq, -1)
+
+
+def test_rope_scores_are_shift_invariant():
+    """Relative position only: sliding every index by 1 leaves QK scores identical."""
+    from amortized_opt.model import apply_rope
+    torch.manual_seed(0)
+    B, h, S, d = 2, 2, 8, 8
+    q = torch.randn(B, h, S, d)
+    k = torch.randn(B, h, S, d)
+    q0, k0 = apply_rope(q, k, *_rope_cis(d, S, shift=0))
+    q1, k1 = apply_rope(q, k, *_rope_cis(d, S, shift=1))
+    s0 = torch.matmul(q0, k0.transpose(-2, -1))
+    s1 = torch.matmul(q1, k1.transpose(-2, -1))
+    assert torch.allclose(s0, s1, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_distinguishes_later_from_earlier():
+    """Signed relative: +1 knot is not the same rotation as -1 knot."""
+    from amortized_opt.model import apply_rope
+    torch.manual_seed(1)
+    B, h, S, d = 1, 1, 7, 8
+    q = torch.randn(B, h, S, d)
+    k = torch.randn(B, h, S, d)
+    qr, kr = apply_rope(q, k, *_rope_cis(d, S))
+    scores = torch.matmul(qr, kr.transpose(-2, -1))[0, 0]
+    i = 3
+    assert not torch.allclose(scores[i, i + 1], scores[i, i - 1], atol=1e-5)
+
+
+def test_dec_rope_off_is_the_default_and_matches_unrotated():
+    """Flag off: same weights, same traj as a model that never heard of RoPE."""
+    torch.manual_seed(0)
+    off = make_model("cpu", d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1)
+    assert off.cfg.dec_rope is False
+    ctx, init, state, masks = make_batch(2, "cpu", seed=4)
+    with torch.no_grad():
+        enc = off.encode_context(ctx)
+        a = off(init, state, enc, masks).traj
+    torch.manual_seed(0)
+    also = make_model("cpu", d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1,
+                      dec_rope=False)
+    with torch.no_grad():
+        b = also(init, state, also.encode_context(ctx), masks).traj
+    assert torch.equal(a, b)
+
+
+def test_dec_rope_changes_the_plan_at_the_same_weights():
+    """ON is a behaviour change, not a new parameter: strict load, different traj."""
+    torch.manual_seed(0)
+    off = make_model("cpu", d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1)
+    on = make_model("cpu", d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1,
+                    dec_rope=True)
+    assert param_counts(off) == param_counts(on)
+    on.load_state_dict(off.state_dict())
+    ctx, init, state, masks = make_batch(2, "cpu", seed=5)
+    with torch.no_grad():
+        a = off(init, state, off.encode_context(ctx), masks).traj
+        b = on(init, state, on.encode_context(ctx), masks).traj
+    assert torch.isfinite(b).all()
+    assert not torch.allclose(a, b, atol=1e-6)
+
+
+def test_dec_rope_is_self_attn_only():
+    m = make_model("cpu", d_model=64, dec_heads=4, dec_layers=2, d_ctx=32, ctx_heads=2, ctx_layers=2,
+                   dec_rope=True)
+    for blk in m.decoder.blocks:
+        assert blk.self_attn.rope is True
+        assert blk.cross_attn.rope is False
+        assert "rope_inv_freq" not in blk.self_attn.state_dict()
+    for blk in m.encoder.blocks:
+        assert blk.attn.rope is False
+
+
+def test_dec_rope_legacy_checkpoint_stays_off():
+    """A config written before the field reconstructs OFF and loads strictly."""
+    from amortized_opt.model import model_config_from_checkpoint
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False, dec_rope=False)
+    ck["model_cfg"].pop("dec_rope", None)
+    ck["model_cfg"].pop("rope_base", None)
+    got = model_config_from_checkpoint(ck)
+    assert got.dec_rope is False
+    AmortizedOptimizer(got).load_state_dict(ck["model"])
+
+
+def test_dec_rope_stored_flag_is_believed():
+    from amortized_opt.model import model_config_from_checkpoint
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False, dec_rope=True)
+    got = model_config_from_checkpoint(ck)
+    assert got.dec_rope is True
+    AmortizedOptimizer(got).load_state_dict(ck["model"])
+
+
+# ----------------------------------------------------- plant features --
+_SMALL = dict(d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1)
+
+
+def test_hold_fill_keeps_last_valid_knot():
+    q0 = torch.zeros(1, N_DOF)
+    wp = torch.zeros(1, 8, N_DOF)
+    wp[0, :3, 4] = torch.tensor([0.1, 0.2, 0.3])
+    mask = torch.zeros(1, 8, N_DOF)
+    mask[:, :3] = 1.0
+    filled = hold_fill_waypoints(q0, wp, mask)
+    assert filled.shape == (1, 9, N_DOF)
+    assert float(filled[0, 3, 4]) == pytest.approx(0.3)
+    assert torch.equal(filled[0, 4:, 4], filled[0, 3, 4].expand(5))
+
+
+def test_dec_plant_feats_off_is_the_default():
+    m = make_model("cpu", **_SMALL)
+    assert m.cfg.dec_plant_feats is False
+    assert not hasattr(m.decoder, "wp_plant_proj")
+
+
+def test_dec_plant_feats_zero_init_is_a_noop():
+    """Untrained plant projections add 0, so the plan matches a flag-off twin."""
+    torch.manual_seed(0)
+    off = make_model("cpu", **_SMALL)
+    torch.manual_seed(0)
+    on = make_model("cpu", **_SMALL, dec_plant_feats=True)
+    missing, unexpected = on.load_state_dict(off.state_dict(), strict=False)
+    assert any("wp_plant_proj" in k for k in missing)
+    assert not unexpected
+    assert torch.count_nonzero(on.decoder.wp_plant_proj.weight) == 0
+    ctx, init, state, masks = make_batch(2, "cpu", seed=11)
+    with torch.no_grad():
+        a = off(init, state, off.encode_context(ctx), masks).traj
+        b = on(init, state, on.encode_context(ctx), masks).traj
+    assert torch.allclose(a, b, atol=1e-5)
+    on.decoder.wp_plant_proj.weight.data.normal_(0.0, 0.05)
+    with torch.no_grad():
+        c = on(init, state, on.encode_context(ctx), masks).traj
+    assert not torch.allclose(a, c, atol=1e-5)
+
+
+def test_dec_plant_feats_held_pose_is_constant_in_cartesian():
+    """When every joint is held, world-frame tip/wrist/elbow stay put.
+
+    A one-handed hit does NOT freeze Cartesian: the waist rides the other
+    hand's horizon, so a parked arm still translates with the torso.  That
+    is the point of hold-fill (keep the parked *joints*, not a world pose).
+    """
+    m = make_model("cpu", **_SMALL, dec_plant_feats=True)
+    ctx, init, state, masks = make_batch(1, "cpu", seed=2, hits=(1.6, 1.6))
+    em = masks.elem_mask.clone()
+    em[:, 10:] = 0.0
+    plant_wp, plant_st = m.decoder._plant_tokens(init, state, em)
+    assert plant_wp.shape[-1] == m.cfg.plant_feat_dim
+    assert plant_st.shape == (1, m.cfg.plant_feat_dim)
+    assert not plant_wp.requires_grad
+    assert torch.isfinite(plant_wp).all()
+    cart = plant_wp[0, :, :18]  # 6 points x 3
+    assert torch.allclose(cart[10:], cart[9], atol=1e-5)
+
+
+def test_dec_plant_feats_legacy_checkpoint_stays_off():
+    from amortized_opt.model import model_config_from_checkpoint
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False)
+    ck["model_cfg"].pop("dec_plant_feats", None)
+    got = model_config_from_checkpoint(ck)
+    assert got.dec_plant_feats is False
+    AmortizedOptimizer(got).load_state_dict(ck["model"])
+
+
+def test_dec_plant_feats_recovered_from_weights():
+    from amortized_opt.model import model_config_from_checkpoint
+    ck, _ = _fake_ckpt(idle_token=True, drop_cfg_key=False, dec_plant_feats=True)
+    ck["model_cfg"].pop("dec_plant_feats")
+    got = model_config_from_checkpoint(ck)
+    assert got.dec_plant_feats is True
+    AmortizedOptimizer(got).load_state_dict(ck["model"])
+
+
+def test_dec_plant_feats_compiled_matches_eager(cuda_device):
+    torch._dynamo.reset()
+    m = make_model(cuda_device, **_SMALL, dec_plant_feats=True)
+    args = _decoder_args(m, 2, cuda_device, seed=3)
+    with torch.no_grad():
+        ref = m.decoder(*args)
+        try:
+            comp = torch.compile(m.decoder, fullgraph=False)
+            got = comp(*args)
+        except Exception as exc:  # pragma: no cover
+            pytest.skip(f"torch.compile unavailable: {type(exc).__name__}: {exc}")
+    d = max((a - b).abs().max().item() for a, b in zip(ref, got))
+    assert d < 1e-4, d

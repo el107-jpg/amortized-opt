@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from amortized_opt.constants import CONTROL_DT as _WAYPOINT_DT
+from amortized_opt.limits import G1_PD_DAMPING_SCALE, G1_PD_STIFFNESS_SCALE
 
 __all__ = [
     "CONTROL_DT",
@@ -91,12 +92,12 @@ class DrumRLEnvCfg:
     pin_pelvis: bool = True
     #: Freeze the legs in the composed USD (``get_g1_cfg(freeze_legs=...)``).
     freeze_legs: bool = True
-    #: ``IdealPDActuatorCfg`` with Kd doubled -- the runtime gains the whole
-    #: amortized stack was identified against (see the "Action space vs torque
-    #: budget" note: the real Kd is 2x the CLAUDE.md table).
+    #: ``IdealPDActuatorCfg`` at the same runtime gains as ``BatchedPDSim``
+    #: (``G1_PD_STIFFNESS_SCALE`` / ``G1_PD_DAMPING_SCALE``: arms Kp 40 / Kd 4,
+    #: waist-yaw Kp 200 / Kd 20).  CLAUDE.md's Kd 1.0 is the pre-scale table.
     use_ideal_pd: bool = True
-    pd_stiffness_scale: float = 1.0
-    pd_damping_scale: float = 2.0
+    pd_stiffness_scale: float = G1_PD_STIFFNESS_SCALE
+    pd_damping_scale: float = G1_PD_DAMPING_SCALE
 
     # ---- episode ----
     episode_length_s: float = 12.0
@@ -192,7 +193,7 @@ class DrumRLEnvCfg:
             ("step_dt", f"{CONTROL_DT} (50 Hz)", "NEW (repo: 1/60)"),
             ("action_space", "trajectory (50 x 17)", "REPLACED (repo: 17 scalars)"),
             ("observation_space", "n/a -- ContextInputs", "DROPPED"),
-            ("robot_cfg", "get_g1_cfg(ideal_pd, Kd x2, frozen legs)", "CARRIED"),
+            ("robot_cfg", f"get_g1_cfg(ideal_pd, Kd x{self.pd_damping_scale:g}, frozen legs)", "CARRIED"),
             ("drum_kit_cfg", "simple_drum_kit_6drums.usd", "CARRIED"),
             ("pin_pelvis", str(self.pin_pelvis), "CARRIED"),
             ("contact sensors", str(self.contact_sensors), "CARRIED"),

@@ -3,21 +3,24 @@ from __future__ import annotations
 
 """Play the amortized MPC model inside the Isaac Sim G1 drummer environment.
 
-.. warning::
+.. note::
 
-   **REPO-ONLY.** Together with ``scripts/repo_adapters/`` this is one of two
-   files under ``amortized/`` that still need the original
-   ``g1-drummer-lab-rythmic`` checkout. It plays into the *repo's* registered
-   task (``Isaac-G1-Drum-Direct-v0``), reading ~25 attributes off
-   ``G1DrummerEnv`` -- including its hit detector, beat telemetry and waist pin
-   -- so it cannot be pointed at the standalone env without being rewritten
-   against it. That env is 6 374 lines plus a 3 333-line cfg; porting it was
-   explicitly not worth it, since ``isaac_rl_ppo/env.py`` already carries the
-   plant the optimizer was identified against.
+   This player drives the *original repo's* registered task
+   (``Isaac-G1-Drum-Direct-v0``), reading ~25 attributes off ``G1DrummerEnv``
+   -- including its hit detector, beat telemetry and waist pin -- so it cannot
+   be pointed at the standalone env without being rewritten against it. That
+   env is 6 374 lines plus a 3 333-line cfg; porting it was explicitly not
+   worth it, since ``isaac_rl_ppo/env.py`` already carries the plant the
+   optimizer was identified against.
 
-   For playback that does not need the repo, use ``isaac_rl_ppo/scripts/``.
-   Put the repo on the path with ``PYTHONPATH=<repo>/source/g1_drummer`` (see
-   ``_require_repo`` below for the exact message on failure).
+   In practice that is no longer a "repo-only" limitation: the standard
+   environment preamble (CLAUDE.md) activates the ``g1drum`` conda env, where
+   ``g1_drummer`` is pip-installed (editable) from the
+   ``g1-drummer-lab-rythmic`` checkout alongside Isaac Sim / Isaac Lab /
+   ``unitree_rl_lab``, so this script runs there as-is.  In an environment
+   without it, ``_require_repo`` below fails with the exact fix
+   (``PYTHONPATH=<repo>/source/g1_drummer``).  For playback that does not
+   need the repo env at all, use ``isaac_rl_ppo/scripts/``.
 
 This is the Isaac bridge for the amortized optimizer: one control tick per
 simulation step, the model's per-joint reference-lead PD compensation applied,
@@ -61,6 +64,7 @@ import datetime
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -80,7 +84,12 @@ parser.add_argument(
     default=False,
     help="Disable fabric and use USD I/O operations.",
 )
-parser.add_argument("--ckpt", default=None, help="Model checkpoint (default: champion)")
+parser.add_argument(
+    "--ckpt", default=None,
+    help="Model checkpoint: a .pt file, a run directory, or a bare run name "
+         "under runs/ (default: phase2b_main). Training, rl2 and isaac_rl_ppo "
+         "PPO (LoRA) checkpoint formats are all accepted.",
+)
 parser.add_argument("--seed", type=int, default=42, help="Seed for the environment.")
 parser.add_argument(
     "--video", action="store_true", default=False, help="Record videos (one mp4 per angle)."
@@ -121,10 +130,29 @@ parser.add_argument(
          "selects which clip from the pool (directory) or is ignored (single file)."
 )
 parser.add_argument(
+    "--first_hit_s", type=float, default=None,
+    help="Delay the clip so the first HAND hit is at this time (seconds). "
+         "Gaps after that are unchanged. Idle-family training uses --lead-s 1.0 "
+         "from ready, so 1.0 matches that first dual request. Overlay JSON is "
+         "rewritten to a temp file so the banner stays in sync. "
+         "Default: off (play the clip's native first-hit time).",
+)
+parser.add_argument(
+    "--drum_dx", type=float, default=0.0,
+    help="Playback-only kit shift along env +x in meters (away from the "
+         "robot). Moves the USD DrumKit spawn, the env hit cylinders, and "
+         "the MPC goal positions together. 0.05 = 5 cm. Does not touch "
+         "assets/drum_kit_layout.yaml.",
+)
+parser.add_argument(
     "--model_device", default="cuda", help="Torch device for the model."
 )
 parser.add_argument(
-    "--steps", type=int, default=250, help="Max control steps per episode."
+    "--steps", type=int, default=250,
+    help="Max control steps per episode. Also sizes the Isaac episode "
+         "horizon (episode_length_s = steps * control dt), so the env "
+         "does not truncate on its own 5 s basic_groove timeout.",
+
 )
 parser.add_argument(
     "--freeze_wp", type=int, default=0,
@@ -140,6 +168,14 @@ parser.add_argument(
     "--pin_waist_lean", action="store_true", default=False,
     help="Hold waist pitch/roll at ready, leave yaw free. A middle ground for "
          "watching the torso aim without the planned +/-30 deg lean.",
+)
+parser.add_argument(
+    "--isaac_ready", action="store_true", default=False,
+    help="Keep the env's composed ready pose (Unitree init_state + "
+         "ready_joint_offsets). Default is amortized ready_joint_pos, the "
+         "absolute start the transformer was trained from. The env offsets "
+         "were written for a different Unitree default, so Isaac ready is "
+         "pitch +0.60 / elbow -0.53 vs training pitch -1.20 / elbow +0.97.",
 )
 parser.add_argument(
     "--isaac_rate", action="store_true", default=False,
@@ -170,6 +206,23 @@ parser.add_argument(
     "--ki_windup", type=float, default=0.0,
     help="Anti-windup clamp on integral error (rad·s). 0 = no clamp.",
 )
+parser.add_argument(
+    "--pd_damping_scale", type=float, default=None,
+    help="Multiply the actuator Kd table (Unitree base: arms 1.0, waist 5.0). "
+         "Default 4 (arms Kd 4), matching the analytic trainer / G1_PD_DAMPING_SCALE.",
+)
+parser.add_argument(
+    "--repo_ff", action="store_true", default=False,
+    help="Keep the original G1DrummerEnv extras: foh_vel_target_ema=0.5 and "
+         "distal inertial feedforward. Default is aligned to pd_sim / isaac_rl "
+         "(raw FOH velocity target, gravity+Coriolis RNEA only).",
+)
+parser.add_argument(
+    "--no_waist_ff", action="store_true", default=False,
+    help="Disable waist reaction feedforward (isaac_rl waist_reaction_ff). "
+         "Default ON: add [M(q) qdd_cmd]_waist to tau_ff so pitch/roll do not "
+         "eat the arms' commanded inertial load.",
+)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -191,13 +244,14 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 def _require_repo():  # noqa: E402
     """Import the repo task + viz, or explain exactly what is missing.
 
-    See the REPO-ONLY warning in the module docstring. Without this the failure
-    is a bare ``ModuleNotFoundError: g1_drummer`` after a ~60 s Isaac startup,
-    which reads like a broken install rather than a deliberate boundary.
+    See the repo-dependency note in the module docstring (the ``g1drum`` conda
+    env satisfies it). Without this the failure is a bare
+    ``ModuleNotFoundError: g1_drummer`` after a ~60 s Isaac startup, which
+    reads like a broken install rather than a deliberate boundary.
     """
     try:
         import g1_drummer.tasks  # noqa: F401
-        from g1_drummer.viz import BeatOverlay, StickVisualizer
+        from g1_drummer.viz import BeatOverlay, StickVisualizer, enable_hit_telemetry
     except ModuleNotFoundError as exc:
         raise SystemExit(
             f"play_isaac.py needs the g1-drummer-lab-rythmic checkout ({exc.name} not "
@@ -206,10 +260,10 @@ def _require_repo():  # noqa: E402
             "  fix : PYTHONPATH=<repo>/source/g1_drummer python scripts/play_isaac.py ...\n"
             "  else: use isaac_rl_ppo/scripts/ for playback on the standalone env."
         ) from exc
-    return BeatOverlay, StickVisualizer
+    return BeatOverlay, StickVisualizer, enable_hit_telemetry
 
 
-BeatOverlay, StickVisualizer = _require_repo()
+BeatOverlay, StickVisualizer, enable_hit_telemetry = _require_repo()
 
 # --- amortized imports (repo root on sys.path) ---------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -218,13 +272,109 @@ import amortized_opt as A  # noqa: E402
 from amortized_opt.lead import LEAD_PRESETS, resolve_lead  # noqa: E402
 from amortized_opt.pd_sim import mass_matrix  # noqa: E402
 from amortized_opt.limits import (  # noqa: E402
+    G1_PD_DAMPING_SCALE,
     isaac_effort_limits, isaac_runtime_stiffness, urdf_position_limits,
 )
-from amortized_opt.constants import G1_UPPER_BODY_JOINTS  # noqa: E402
+from amortized_opt.constants import G1_UPPER_BODY_JOINTS, ready_joint_pos  # noqa: E402
 
 # --- the Isaac-facing MPC driver -----------------------------------------------
 from isaac_rl.mpc import IsaacMPC, MPCConfig  # noqa: E402
 from isaac_rl.schedule import BatchedSchedule, ScheduleConfig  # noqa: E402
+
+
+def _play_horizon_steps(args) -> int:
+    """Control steps the player will actually run (``--video_length`` or ``--steps``)."""
+    if getattr(args, "video", False) and int(getattr(args, "video_length", 0) or 0):
+        return int(args.video_length)
+    return int(args.steps)
+
+
+def _install_train_ready(u) -> None:
+    """Overwrite the env's ready pose with ``amortized_opt.ready_joint_pos``.
+
+    ``G1DrummerEnv`` builds ``ready_joint_pos = default_joint_pos + cfg offsets``.
+    The offsets were authored against a Unitree default that is no longer the
+    USD init_state, so Isaac ready is not the vector the start sampler / idle
+    cylinder / cost all use.  ``env.reset`` copies ``ready_joint_pos``, so
+    rewriting it here (before the episode reset) is the whole fix.
+    """
+    names = tuple(u.upper_body_joint_names)
+    ids = u.upper_body_joint_ids
+    q = torch.as_tensor(
+        ready_joint_pos(names), device=u.ready_joint_pos.device,
+        dtype=u.ready_joint_pos.dtype,
+    )
+    was = u.ready_joint_pos[0, ids].detach().clone()
+    u.ready_joint_pos[:, ids] = q
+    if getattr(u, "joint_pos_target", None) is not None:
+        u.joint_pos_target[:, ids] = q
+    def _deg(i):
+        return float(torch.rad2deg(q[i]).item()), float(torch.rad2deg(was[i]).item())
+    ip = names.index("left_shoulder_pitch_joint")
+    ie = names.index("left_elbow_joint")
+    p_now, p_was = _deg(ip)
+    e_now, e_was = _deg(ie)
+    print(
+        f"[ready] amortized ready_joint_pos "
+        f"(pitch {p_was:+.1f}->{p_now:+.1f}deg, "
+        f"elbow {e_was:+.1f}->{e_now:+.1f}deg)",
+        flush=True,
+    )
+
+
+def play_kit(args) -> A.DrumKit:
+    """Layout kit, optionally shifted along env +x for a playback-only trial."""
+    kit = A.DrumKit.from_layout()
+    dx = float(getattr(args, "drum_dx", 0.0) or 0.0)
+    if abs(dx) < 1e-12:
+        return kit
+    pos = np.array(kit.positions, copy=True)
+    pos[:, 0] += dx
+    return replace(kit, positions=pos)
+
+
+def resolve_play_clip(args) -> tuple[Path, A.RhythmClip]:
+    """The RCC file the MPC will play -- same selection as the agent used to do.
+
+    Returns ``(path, clip)`` so the Isaac env can load THAT file for its beat
+    overlay / hit telemetry, instead of the task default
+    (``basic_groove.yaml``, 10 hihat/snare beats). Episode length is *not*
+    taken from the clip -- ``main`` sizes it from ``--steps``.
+    """
+    kit = play_kit(args)
+    source = (
+        Path(args.rhythm_path) if getattr(args, "rhythm_path", None)
+        else A.default_rcc_dir("eval")
+    )
+    files = sorted(source.glob("*.json")) if source.is_dir() else [source]
+    loaded: list[tuple[Path, A.RhythmClip]] = []
+    for f in files:
+        try:
+            clip = A.load_rcc(f, kit)
+        except ValueError:
+            continue
+        if clip.num_hits:
+            loaded.append((f, clip))
+    if not loaded:
+        raise FileNotFoundError(f"no valid RCC clips found at {source}")
+    idx = min(max(int(args.clip_index), 0), len(loaded) - 1)
+    path, clip = loaded[idx]
+    t_first = getattr(args, "first_hit_s", None)
+    if t_first is not None:
+        clip, dt = A.pad_first_hit_to(clip, float(t_first))
+        if dt > 0.0:
+            dest = (
+                Path(os.environ.get("TMPDIR", "/tmp"))
+                / f"{path.stem}_first{float(t_first):.2f}s.json"
+            )
+            path = A.shift_rcc_json(path, dest, dt)
+            t0 = min(h.time for h in clip.hits)
+            print(
+                f"[clip] first hand hit padded +{dt:.2f}s -> t={t0:.2f}s "
+                f"(--first_hit_s {float(t_first):.2f}; overlay {path.name})",
+                flush=True,
+            )
+    return path, clip
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +405,127 @@ def write_mp4(path, frames, fps):
 # Model load
 # ---------------------------------------------------------------------------
 
+def resolve_ckpt(arg: str | None) -> Path:
+    """A loadable .pt from a file path, a run directory, or a bare run name."""
+    runs = Path(__file__).resolve().parent.parent / "runs"
+    p = Path(arg) if arg else runs / "phase2b_main"
+    if not p.exists() and not p.is_absolute() and (runs / p).exists():
+        p = runs / p
+    if p.is_dir():
+        for name in ("best.pt", "last.pt"):
+            if (p / name).is_file():
+                return p / name
+        raise FileNotFoundError(f"{p} has neither best.pt nor last.pt")
+    if p.is_file():
+        return p
+    raise FileNotFoundError(f"checkpoint not found: {arg}")
+
+
+def _find_backbone(ck: dict, ppo_path: Path) -> Path:
+    """The backbone .pt a PPO LoRA checkpoint fine-tunes, remapping a stale
+    recorded path (e.g. into the old g1-drummer-lab-rythmic checkout) onto this
+    repo's runs/ when the original file is gone."""
+    rec = ck.get("backbone_ckpt")
+    cands = []
+    if rec:
+        rp = Path(rec)
+        cands.append(rp)
+        if "runs" in rp.parts:
+            i = len(rp.parts) - 1 - rp.parts[::-1].index("runs")
+            cands.append(
+                Path(__file__).resolve().parent.parent / "runs" / Path(*rp.parts[i + 1:])
+            )
+    for c in cands:
+        if c.is_file():
+            return c
+    raise SystemExit(
+        f"{ppo_path} is a PPO LoRA checkpoint but its backbone was not found.\n"
+        f"  recorded: {rec}\n  tried: " + ", ".join(str(c) for c in cands)
+    )
+
+
+def _merge_lora(backbone_sd: dict, actor_sd: dict, scaling: float) -> int:
+    """Fold ``W += scaling * B @ A`` into the backbone state dict, in place.
+    Returns the number of adapter pairs merged."""
+    n = 0
+    for k in actor_sd:
+        if not k.endswith(".lora_a"):
+            continue
+        prefix = k[: -len("lora_a")]                       # keeps the trailing "."
+        target = prefix[len("model."):] if prefix.startswith("model.") else prefix
+        wk = target + "weight"
+        if wk not in backbone_sd:
+            raise KeyError(f"LoRA target {wk!r} not in the backbone state dict")
+        w = backbone_sd[wk]
+        b = actor_sd[prefix + "lora_b"]
+        a = actor_sd[k]
+        backbone_sd[wk] = w + scaling * (b.float() @ a.float()).to(w.dtype)
+        n += 1
+    return n
+
+
 def load_model(ckpt_path: Path, device: torch.device):
+    """Build + strictly load the model from any checkpoint format in runs/.
+
+    Three formats exist on disk:
+
+    * training checkpoints (phase1/phase2/ablations): ``model`` + ``model_cfg``
+      + ``step`` -- the straightforward case;
+    * the older RL tree's (``rl2*``): same, but progress is under ``iter``;
+    * ``isaac_rl_ppo`` PPO checkpoints: LoRA adapters (``actor``) over a frozen
+      backbone referenced by path (``backbone_ckpt``).  The adapters are merged
+      into the backbone weights, which reproduces the fine-tuned policy MEAN up
+      to the actor's small ``mean_correction`` head (that head needs the
+      actor's own forward pass, which this player does not drive).
+    """
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    mcfg = A.model_config_from_checkpoint(ck)
-    model = A.build_model(mcfg, device)
-    model.load_state_dict(ck["model"])
+    if not isinstance(ck, dict):
+        raise SystemExit(f"{ckpt_path}: not a dict checkpoint ({type(ck).__name__})")
+
+    if "actor" in ck and "model_cfg" not in ck:
+        bb_path = _find_backbone(ck, ckpt_path)
+        src = torch.load(bb_path, map_location="cpu", weights_only=False)
+        acfg = (ck.get("cfg") or {}).get("actor") or {}
+        scaling = float(acfg.get("lora_alpha", 16.0)) / float(acfg.get("lora_rank", 8))
+        sd = dict(src["model"])
+        n = _merge_lora(sd, ck["actor"], scaling)
+        print(f"[ckpt] PPO LoRA checkpoint: merged {n} adapter pairs "
+              f"(scaling {scaling:g}) into backbone {bb_path}")
+        if any(k.startswith("mean_correction.") for k in ck["actor"]):
+            print("[ckpt] NOTE: the actor's mean_correction head is NOT applied; "
+                  "playback is backbone + merged LoRA only.")
+        step = ck.get("iteration", -1)
+    elif "model" in ck and "model_cfg" in ck:
+        src = ck
+        sd = ck["model"]
+        # Display-only, so no int() cast: rl2's last.pt stores iter='final'.
+        step = next((ck[k] for k in ("step", "iter", "iteration") if k in ck), -1)
+    else:
+        raise SystemExit(
+            f"{ckpt_path}: unrecognized checkpoint (keys: {sorted(ck)}).\n"
+            "Expected 'model'+'model_cfg' (training/rl2) or "
+            "'actor'+'backbone_ckpt' (isaac_rl_ppo PPO)."
+        )
+
+    mcfg = A.model_config_from_checkpoint(src)
+    # Decoder plant feats call BatchedRNEA.from_urdf at build; Isaac's Pinocchio
+    # cannot expose model.parents. Same cache the RL env uses.
+    from isaac_rl.rnea_cache import rnea_from_cache_if_needed
+    with rnea_from_cache_if_needed():
+        model = A.build_model(mcfg, device)
+    model.load_state_dict(sd)
     model.eval()
-    buckets = tuple((ck.get("scenario_cfg") or {}).get("buckets", (25, 50, 100)))
+    buckets = tuple((src.get("scenario_cfg") or {}).get("buckets", (25, 50, 100)))
     cfg = {
         "buckets": buckets,
         "num_drums": mcfg.num_drums,
         "num_future": mcfg.num_future,
+        "step": step,
+        # the seed's pitch/roll convention the checkpoint was trained on;
+        # IsaacMPC's reset seed follows it (None = hold the measured lean)
+        "waist_upright_ease_wp": (
+            (src.get("scenario_cfg") or {}).get("waist_upright_ease_wp")
+        ),
     }
     return model, cfg, ck, mcfg
 
@@ -286,10 +546,13 @@ class AmortizedMPCAgent:
     4. After ``env.step()``, call ``schedule.advance()`` and ``mpc.commit()``
     """
 
-    def __init__(self, env: gym.Env, args, model, cfg, kit, dev, amp):
+    def __init__(self, env: gym.Env, args, model, cfg, kit, dev, amp,
+                 play_clip: A.RhythmClip | None = None,
+                 play_clip_path: Path | None = None):
         u = env.unwrapped
         self.u = u
         self.args = args
+        self.kit = kit
         self.device = dev
         self.amp = amp
 
@@ -312,6 +575,7 @@ class AmortizedMPCAgent:
 
         # --- dynamics lead setup -------------------------------------------
         self._dynamics_lead = bool(getattr(args, "dynamics_lead", False))
+        self._waist_ff = not bool(getattr(args, "no_waist_ff", False))
         # Always set up violation tracking limits (useful for comparison)
         lo, hi = urdf_position_limits(self._joint_names, posture_limits=False)
         self._q_lo = torch.as_tensor(lo, dtype=torch.float32)
@@ -319,24 +583,37 @@ class AmortizedMPCAgent:
         tau_lim = isaac_effort_limits(self._joint_names)
         self._tau_lim = torch.as_tensor(tau_lim, dtype=torch.float32)
 
-        if self._dynamics_lead:
-            # Build BatchedRNEA via the Isaac-safe cache (avoids Pinocchio in-process)
+        self._rnea = None
+        self._vcmd_prev = torch.zeros(len(self._joint_names), dtype=torch.float32)
+        self._waist_tau = None
+        if self._dynamics_lead or self._waist_ff:
             from isaac_rl.env import try_build_rnea  # noqa: E402
             self._rnea = try_build_rnea(dev, dtype=torch.float32)
             if self._rnea is None:
-                print("[agent] WARNING: dynamics_lead=True but env has no RNEA "
-                      "(gravity_feedforward may be OFF); dynamics lead disabled.",
-                      flush=True)
-                self._dynamics_lead = False
+                if self._dynamics_lead:
+                    print("[agent] WARNING: dynamics_lead=True but env has no RNEA "
+                          "(gravity_feedforward may be OFF); dynamics lead disabled.",
+                          flush=True)
+                    self._dynamics_lead = False
+                if self._waist_ff:
+                    print("[agent] WARNING: waist reaction ff requested but RNEA "
+                          "unavailable; waist_reaction_ff OFF.",
+                          flush=True)
+                    self._waist_ff = False
             else:
-                self._kp = torch.as_tensor(
-                    isaac_runtime_stiffness(self._joint_names),
-                    device=dev, dtype=torch.float32,
-                )
-                print(f"[agent] dynamics_lead ON (Kp^-1 * M(q) * qdd_ref); "
-                      f"time lead = OFF", flush=True)
-        else:
-            self._rnea = None
+                if self._dynamics_lead:
+                    self._kp = torch.as_tensor(
+                        isaac_runtime_stiffness(self._joint_names),
+                        device=dev, dtype=torch.float32,
+                    )
+                    print("[agent] dynamics_lead ON (Kp^-1 * M(q) * qdd_ref); "
+                          "time lead = OFF", flush=True)
+                if self._waist_ff:
+                    print("[agent] waist_reaction_ff ON "
+                          "([M(q) qdd_cmd]_waist on tau_ff, waist qdd_cmd=0)",
+                          flush=True)
+        if not self._waist_ff:
+            print("[agent] waist_reaction_ff OFF", flush=True)
 
         # --- control grid -------------------------------------------------
         # THE dt, taken from the plant rather than from A.CONTROL_DT: the
@@ -371,17 +648,17 @@ class AmortizedMPCAgent:
                                         dtype=torch.float32)
 
         # --- load clip ---------------------------------------------------
-        rhythm_source = (
-            Path(args.rhythm_path) if getattr(args, "rhythm_path", None)
-            else A.default_rcc_dir("eval")
+        if play_clip is None:
+            path, play_clip = resolve_play_clip(args)
+            play_clip_path = path
+        self._clip = play_clip
+        n_l = sum(1 for h in play_clip.hits if h.hand == "left")
+        n_r = len(play_clip.hits) - n_l
+        src = play_clip_path if play_clip_path is not None else args.rhythm_path
+        print(
+            f"[clip] {self._clip.name} ({len(self._clip.hits)} hits "
+            f"L={n_l} R={n_r}, {self._clip.duration:.1f}s, source={src})"
         )
-        clips = A.load_rcc_pool(rhythm_source, kit)
-        if len(clips) == 0:
-            raise FileNotFoundError(f"no valid RCC clips found at {rhythm_source}")
-        clip_idx = min(max(int(args.clip_index), 0), len(clips) - 1)
-        self._clip = clips[clip_idx]
-        print(f"[clip] {self._clip.name} (index {clip_idx}/{len(clips)-1}, "
-              f"{len(self._clip.hits)} hits, source={rhythm_source})")
 
         # --- Isaac MPC ----------------------------------------------------
         # Let IsaacMPC create its own GoalPoseLibrary (avoids Pinocchio
@@ -400,8 +677,10 @@ class AmortizedMPCAgent:
             clamp_cmd_to_box=True,
             freeze_wp=int(args.freeze_wp),
             freeze_waist=True,
-            encode_every_tick=True,
+            # ``encode_every_tick`` left at its default (OFF): the player is the
+            # loop the segment-cadence encoder has to be exercised in.
             amp_dtype=amp,
+            waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"),
         )
         self.mpc = IsaacMPC(
             model,
@@ -450,6 +729,16 @@ class AmortizedMPCAgent:
         self._max_joint_excursion = 0.0       # max (q - hi).clamp(0) or (lo - q).clamp(0) in rad
         self._max_torque_over = 0.0           # max (|tau| / tau_lim - 1).clamp(0)
         self._lead_offset = None
+        # PD tracking: squared error vs the executed command and vs the
+        # un-led plan waypoint (last_ref0).  Accumulated in post_step.
+        self._track_cmd_sse = 0.0
+        self._track_plan_sse = 0.0
+        self._track_wrist_cmd_sse = 0.0
+        self._track_wrist_plan_sse = 0.0
+        self._track_n = 0
+        self._wrist_i = [i for i, nm in enumerate(names) if "wrist" in nm]
+        self._last_track_cmd_rms = 0.0
+        self._last_track_plan_rms = 0.0
 
     def _install_direct_target_hook(self) -> None:
         """After the env decodes actions, overwrite PD targets with planned q*."""
@@ -480,7 +769,52 @@ class AmortizedMPCAgent:
                 u.joint_pos_target[:, u._waist_lean_ids] = u._waist_lean_pos
 
         u._pre_physics_step = _pre_physics_step_direct
+        if self._waist_ff:
+            orig_apply = u._apply_action
+
+            def _apply_action_waist_ff() -> None:
+                orig_apply()
+                if self._waist_tau is None:
+                    return
+                ids = self._joint_ids
+                grav = getattr(u, "_grav_tau", None)
+                if grav is not None:
+                    tau = grav.clone()
+                else:
+                    tau = torch.zeros(
+                        1, len(ids), device=u.device,
+                        dtype=u.robot.data.joint_pos.dtype,
+                    )
+                add = self._waist_tau.to(device=tau.device, dtype=tau.dtype)
+                wi = self._waist_i
+                tau[:, wi] = tau[:, wi] + add
+                lim = self._tau_lim.to(device=tau.device, dtype=tau.dtype)
+                u.robot.set_joint_effort_target(
+                    torch.clamp(tau, -lim, lim), joint_ids=ids)
+
+            u._apply_action = _apply_action_waist_ff
         u._amortized_direct_hook = True
+
+    def _update_waist_reaction(self, q: torch.Tensor, cmd: torch.Tensor) -> None:
+        """``[M(q) qdd_cmd]_waist`` for this tick, matching isaac_rl.plant.
+
+        ``qdd_cmd`` is the FOH velocity difference across the tick, with waist
+        columns zeroed so the waist rows are the arms' coupling alone.
+        """
+        dt = float(self.dt)
+        # cmd is CPU (act() copies the MPC output); _q_des is CUDA after
+        # reset (cloned from the measured state). Align before subtracting.
+        prev = self._q_des.to(device=cmd.device, dtype=cmd.dtype)
+        v_cmd = (cmd - prev) / dt
+        qdd = (v_cmd - self._vcmd_prev.to(device=v_cmd.device, dtype=v_cmd.dtype)) / dt
+        self._vcmd_prev = v_cmd.detach().clone()
+        qdd = qdd.clone()
+        qdd[self._waist_i] = 0.0
+        q0 = q.to(device=self.device, dtype=torch.float32).reshape(1, -1)
+        qddb = qdd.to(device=self.device, dtype=torch.float32).reshape(1, -1)
+        with torch.no_grad():
+            tau = self._rnea.mass_matrix_torque(q0, qddb)
+        self._waist_tau = tau[:, self._waist_i].contiguous()
 
     def reset(self) -> None:
         """Called after env.reset(). Seed the schedule + MPC plan."""
@@ -490,7 +824,7 @@ class AmortizedMPCAgent:
         self.schedule.reset(
             env_ids=torch.tensor([0], device=self.device),
             clips=[self._clip],
-            kits=[A.DrumKit.from_layout()],
+            kits=[self.kit],
             t_start=0.0,
         )
 
@@ -506,6 +840,8 @@ class AmortizedMPCAgent:
 
         self._q_des = q.clone()
         self._integral.zero_()
+        self._vcmd_prev.zero_()
+        self._waist_tau = None
         self._step = 0
         self._n_hits = 0
         self._initialized = True
@@ -514,6 +850,13 @@ class AmortizedMPCAgent:
         self._viol_collision.clear()
         self._max_joint_excursion = 0.0
         self._max_torque_over = 0.0
+        self._track_cmd_sse = 0.0
+        self._track_plan_sse = 0.0
+        self._track_wrist_cmd_sse = 0.0
+        self._track_wrist_plan_sse = 0.0
+        self._track_n = 0
+        self._last_track_cmd_rms = 0.0
+        self._last_track_plan_rms = 0.0
         # Waist travel bookkeeping: the whole point of unpinning is that these
         # stop reading zero.
         self._waist_lo = q[self._waist_i].clone()
@@ -604,6 +947,9 @@ class AmortizedMPCAgent:
             self._integral = integral_dev.cpu()
             cmd = cmd_dev.cpu().to(torch.float32)
 
+        if self._waist_ff and self._rnea is not None:
+            self._update_waist_reaction(q, cmd)
+
         self._q_des = cmd.clone()
 
         # Count hits from the schedule (hit_index dropped from k to 0)
@@ -630,6 +976,25 @@ class AmortizedMPCAgent:
         w = q[self._waist_i]
         self._waist_lo = torch.minimum(self._waist_lo, w)
         self._waist_hi = torch.maximum(self._waist_hi, w)
+
+        # PD tracking vs this tick's executed command and the un-led plan.
+        qc = q.cpu()
+        err_cmd = qc - self._q_des
+        self._track_cmd_sse += float(err_cmd.square().mean().item())
+        if self._wrist_i:
+            self._track_wrist_cmd_sse += float(
+                err_cmd[self._wrist_i].square().mean().item())
+        ref = getattr(self.mpc, "last_ref0", None)
+        if ref is not None:
+            err_plan = qc - ref[0].detach().cpu().to(torch.float32)
+            self._track_plan_sse += float(err_plan.square().mean().item())
+            if self._wrist_i:
+                self._track_wrist_plan_sse += float(
+                    err_plan[self._wrist_i].square().mean().item())
+        self._track_n += 1
+        n = max(self._track_n, 1)
+        self._last_track_cmd_rms = (self._track_cmd_sse / n) ** 0.5
+        self._last_track_plan_rms = (self._track_plan_sse / n) ** 0.5
 
         # --- violation tracking --------------------------------------------
         # Joint limit: is any joint outside the URDF box?
@@ -703,6 +1068,8 @@ class AmortizedMPCAgent:
             f"[t={now:5.2f}s] amortized MPC | "
             f"tth L={tth0}wp R={tth1}wp | "
             f"hits={self._n_hits} | "
+            f"track cmd={self._last_track_cmd_rms*1e3:.0f}mrad "
+            f"plan={self._last_track_plan_rms*1e3:.0f}mrad | "
             f"waist cmd y/p/r={cmd_w[0]:+.0f}/{cmd_w[1]:+.0f}/{cmd_w[2]:+.0f}deg "
             f"meas p2p={p2p[0]:.0f}/{p2p[1]:.0f}/{p2p[2]:.0f}deg | "
             f"lead={lead_tag}{off_str}{pid_str}"
@@ -722,20 +1089,54 @@ class AmortizedMPCAgent:
             "max_torque_over": self._max_torque_over,
             "collision_steps": sum(self._viol_collision),
             "collision_frac": sum(self._viol_collision) / n,
+            "track_cmd_rms_mrad": self._last_track_cmd_rms * 1e3,
+            "track_plan_rms_mrad": self._last_track_plan_rms * 1e3,
+            "track_wrist_cmd_rms_mrad": (
+                (self._track_wrist_cmd_sse / max(self._track_n, 1)) ** 0.5 * 1e3
+            ),
+            "track_wrist_plan_rms_mrad": (
+                (self._track_wrist_plan_sse / max(self._track_n, 1)) ** 0.5 * 1e3
+            ),
         }
 
 
-# ---------------------------------------------------------------------------
-# Episode runner
-# ---------------------------------------------------------------------------
+def _print_episode_stats(vs: dict) -> None:
+    print(
+        f"  [violations] joint_limit: {vs['joint_limit_steps']}/{vs['steps']} "
+        f"({vs['joint_limit_frac']*100:.1f}%) "
+        f"peak_excursion={vs['max_joint_excursion_deg']:.1f}deg | "
+        f"torque: {vs['torque_steps']}/{vs['steps']} "
+        f"({vs['torque_frac']*100:.1f}%) "
+        f"peak_over={vs['max_torque_over']*100:.1f}%",
+        flush=True,
+    )
+    print(
+        f"  [track] cmd RMS={vs['track_cmd_rms_mrad']:.0f}mrad "
+        f"(wrist {vs['track_wrist_cmd_rms_mrad']:.0f}) | "
+        f"plan RMS={vs['track_plan_rms_mrad']:.0f}mrad "
+        f"(wrist {vs['track_wrist_plan_rms_mrad']:.0f})",
+        flush=True,
+    )
 
 def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
                 real_time=False):
     u = env.unwrapped
-    env.reset()
-    agent.reset()
     dt = u.step_dt
     steps = int(max_steps) if max_steps else int(u.max_episode_length)
+    # env.step below runs under inference mode, so any buffer the env
+    # REASSIGNS during an episode (e.g. the strike latches) comes back an
+    # inference tensor -- a second reset outside that mode then dies on its
+    # in-place writes ("Inplace update to inference tensor outside
+    # InferenceMode").  Reset in the same mode the episode runs in.
+    with torch.inference_mode():
+        env.reset()
+        agent.reset()
+        # _assign_clips sizes env_max_steps from the env's rhythm clip
+        # (clamped to max_episode_length-1). Playback duration is --steps,
+        # so overwrite. +1 because episode_length_buf is incremented before
+        # _get_dones, and we do not want a timeout on the last commanded tick.
+        if hasattr(u, "env_max_steps"):
+            u.env_max_steps.fill_(steps + 1)
     now = 0.0
 
     # NOT `_` as the loop variable: the env.step unpack below binds `_` too, so
@@ -768,29 +1169,14 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
             print(f"  [end] {why} at step {k}/{steps}  {agent.status_line(now)}",
                   flush=True)
             vs = agent.violation_summary()
-            print(
-                f"  [violations] joint_limit: {vs['joint_limit_steps']}/{vs['steps']} "
-                f"({vs['joint_limit_frac']*100:.1f}%) "
-                f"peak_excursion={vs['max_joint_excursion_deg']:.1f}deg | "
-                f"torque: {vs['torque_steps']}/{vs['steps']} "
-                f"({vs['torque_frac']*100:.1f}%) "
-                f"peak_over={vs['max_torque_over']*100:.1f}%",
-                flush=True,
-            )
+            _print_episode_stats(vs)
             return {}
         if k % 50 == 0:
             print(f"  step {k}/{steps} {agent.status_line(now)}", flush=True)
     print(f"  done {agent.status_line(now)}", flush=True)
     vs = agent.violation_summary()
     if vs["steps"] > 0:
-        print(
-            f"  [violations] joint_limit: {vs['joint_limit_steps']}/{vs['steps']} "
-            f"({vs['joint_limit_frac']*100:.1f}%) "
-            f"peak_excursion={vs['max_joint_excursion_deg']:.1f}deg | "
-            f"torque: {vs['torque_steps']}/{vs['steps']} "
-            f"({vs['torque_frac']*100:.1f}%) "
-            f"peak_over={vs['max_torque_over']*100:.1f}%"
-        )
+        _print_episode_stats(vs)
     return {}
 
 
@@ -802,14 +1188,7 @@ def main():
     # -----------------------------------------------------------------------
     # Parse args and resolve checkpoint
     # -----------------------------------------------------------------------
-    checkpoint = (
-        Path(args_cli.ckpt)
-        if args_cli.ckpt
-        else Path(__file__).resolve().parent.parent / "runs" / "phase2b_main" / "best.pt"
-    )
-    checkpoint = Path(checkpoint)
-    if not checkpoint.exists():
-        raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
+    checkpoint = resolve_ckpt(args_cli.ckpt)
 
     dev = torch.device(args_cli.model_device if torch.cuda.is_available() else "cpu")
     if dev.type == "cuda":
@@ -824,7 +1203,7 @@ def main():
     # Load model
     # -----------------------------------------------------------------------
     model, cfg, ck, mcfg = load_model(checkpoint, dev)
-    print(f"[ckpt] {checkpoint} step={ck['step']} buckets={cfg['buckets']}")
+    print(f"[ckpt] {checkpoint} step={cfg['step']} buckets={cfg['buckets']}")
     print(f"[model] {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
 
     # -----------------------------------------------------------------------
@@ -837,6 +1216,44 @@ def main():
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.seed = args_cli.seed
+    kd_scale = (
+        float(args_cli.pd_damping_scale)
+        if args_cli.pd_damping_scale is not None
+        else float(G1_PD_DAMPING_SCALE)
+    )
+    env_cfg.pd_damping_scale = kd_scale
+    print(
+        f"[pd] pd_damping_scale={kd_scale:g} "
+        f"(arms Kd={1.0 * kd_scale:.1f}, waist-yaw Kd={5.0 * kd_scale:.1f}; "
+        f"trainer G1_PD_DAMPING_SCALE={G1_PD_DAMPING_SCALE:g})",
+        flush=True,
+    )
+    if not args_cli.repo_ff:
+        if hasattr(env_cfg, "foh_vel_target_ema"):
+            env_cfg.foh_vel_target_ema = 1.0  # 1.0 = off; pd_sim uses the raw FOH rate
+        if hasattr(env_cfg, "dynamics_ff_inertial_enable"):
+            env_cfg.dynamics_ff_inertial_enable = False
+        print(
+            "[ff] aligned to pd_sim / isaac_rl: gravity+Coriolis RNEA ON, "
+            "vel-target EMA off, distal inertial ff off; "
+            "waist_reaction_ff ON in the player (see --no_waist_ff)",
+            flush=True,
+        )
+    else:
+        print(
+            "[ff] --repo_ff: keeping G1DrummerEnv vel-target EMA and inertial ff",
+            flush=True,
+        )
+    drum_dx = float(getattr(args_cli, "drum_dx", 0.0) or 0.0)
+    if abs(drum_dx) > 1e-12 and hasattr(env_cfg, "drum_kit_cfg"):
+        st = env_cfg.drum_kit_cfg.init_state
+        x, y, z = st.pos
+        env_cfg.drum_kit_cfg.init_state.pos = (float(x) + drum_dx, float(y), float(z))
+        print(
+            f"[kit] DrumKit USD spawn +{drum_dx * 100:.0f} cm in +x "
+            "(away from robot; playback only)",
+            flush=True,
+        )
     # Zero start jitter for deterministic demo
     if hasattr(env_cfg, "start_joint_jitter_rad"):
         env_cfg.start_joint_jitter_rad = 0.0
@@ -844,6 +1261,23 @@ def main():
         env_cfg.perturb_enable = False
     if hasattr(env_cfg, "dr_enable"):
         env_cfg.dr_enable = False
+
+    # The overlay and stick markers read the ENV's beat tables -- not
+    # IsaacMPC's schedule.  Without this, play_isaac keeps the task default
+    # (configs/rhythms/basic_groove.yaml: 10 hihat/snare beats) while the MPC
+    # plays --rhythm_path, so the banner is a different song.
+    clip_path, play_clip = resolve_play_clip(args_cli)
+    enable_hit_telemetry(env_cfg)
+    if hasattr(env_cfg, "rhythm_file"):
+        env_cfg.rhythm_file = str(clip_path)
+        env_cfg.rhythm_pool = None
+        env_cfg.rhythm_curriculum = None
+        env_cfg.__post_init__()
+        print(
+            f"[rhythm] env overlay <- {clip_path.name} "
+            f"({play_clip.num_hits} hand hits, clip={play_clip.duration:.1f}s)",
+            flush=True,
+        )
 
     # --- THE control grid: pd_sim's, not the RL env's ----------------------
     # amortized_opt runs a 50 Hz waypoint grid over a 250 Hz PD loop
@@ -875,6 +1309,27 @@ def main():
         f"{A.CONTROL_DT * 1e3:.2f} ms ({A.CONTROL_HZ:.0f} Hz)"
     )
 
+    # Episode horizon follows --steps (or --video_length), not the env's
+    # rhythm clip.  __post_init__ just sized episode_length_s to the clip
+    # (or to basic_groove's 5 s); overwrite it *after* the grid so
+    # max_episode_length = ceil(episode_length_s / step_dt) covers the
+    # player loop.  +1 step: buf is incremented before _get_dones, and
+    # the env clamps per-clip env_max_steps to max_episode_length-1.
+    play_steps = _play_horizon_steps(args_cli)
+    env_cfg.episode_length_s = (play_steps + 1) * _step_dt
+    print(
+        f"[horizon] episode_length_s={env_cfg.episode_length_s:.2f}s "
+        f"from {play_steps} steps x {_step_dt * 1e3:.2f} ms "
+        f"(--steps={args_cli.steps}"
+        + (
+            f", --video_length={args_cli.video_length}"
+            if args_cli.video and args_cli.video_length
+            else ""
+        )
+        + ")",
+        flush=True,
+    )
+
     # --- the waist ---------------------------------------------------------
     # OFF by default.  pin_waist is a KINEMATIC lock (the env teleports the
     # three waist DoFs back to ready every physics substep), so with it on the
@@ -897,14 +1352,36 @@ def main():
         render_mode="rgb_array" if args_cli.video else None,
     )
     u = env.unwrapped
+    if abs(drum_dx) > 1e-12:
+        u.drum_pos[:, 0] += drum_dx
+        u.drum_pos_env[:, :, 0] += drum_dx
+        snare = u.drum_pos[0].detach().cpu().numpy()
+        print(
+            f"[kit] hit cylinders follow: snare env-xy now "
+            f"({snare[0]:+.3f}, {snare[1]:+.3f})",
+            flush=True,
+        )
+    if not args_cli.isaac_ready:
+        _install_train_ready(u)
+    else:
+        print("[ready] --isaac_ready: keeping env composed pose", flush=True)
 
     # -----------------------------------------------------------------------
     # Build the agent
     # -----------------------------------------------------------------------
     print("[player] Building AmortizedMPCAgent...", flush=True)
-    kit = A.DrumKit.from_layout()
-    agent = AmortizedMPCAgent(env, args_cli, model, cfg, kit, dev, amp)
+    kit = play_kit(args_cli)
+    agent = AmortizedMPCAgent(
+        env, args_cli, model, cfg, kit, dev, amp,
+        play_clip=play_clip, play_clip_path=clip_path,
+    )
     print("[player] Agent built OK.", flush=True)
+    if hasattr(u, "beat_valid"):
+        n_env = int(u.beat_valid[0].sum().item())
+        print(
+            f"[rhythm] env beat slots={n_env}  mpc hits={len(agent._clip.hits)}",
+            flush=True,
+        )
 
     # -----------------------------------------------------------------------
     # Cameras and overlays
@@ -926,9 +1403,11 @@ def main():
         overlay = BeatOverlay(env, tag="amortized") if not args_cli.no_overlay else None
         sticks = StickVisualizer(env) if not args_cli.no_sticks else None
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        kd = getattr(args_cli, "pd_damping_scale", None)
+        kd_tag = f"_kd{kd:g}" if kd is not None else ""
         video_folder = os.path.join(
             str(Path(__file__).resolve().parent.parent / "runs" / "render"),
-            f"isaac_{stamp}",
+            f"isaac_{stamp}{kd_tag}",
         )
         os.makedirs(video_folder, exist_ok=True)
         fps = int(round(1.0 / u.step_dt))

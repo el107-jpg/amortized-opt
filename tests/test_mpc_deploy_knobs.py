@@ -244,3 +244,45 @@ def test_planner_is_still_called_every_tick_under_freeze(kit):
     res = gen.run_episode(clip, *_start(gen), seed=0, max_steps=40, planner=planner)
     assert n_calls[0] == res.cmd_hist.shape[0] == 40
     assert res.frozen_ticks > 0
+
+
+def test_bounce_off_by_default(kit):
+    clip = _clip(kit)
+    gen = _gen(kit)
+    res = gen.run_episode(clip, *_start(gen), seed=3, max_steps=80)
+    assert len(res.hit_steps) > 0
+    assert res.bounced_hands == 0
+
+
+def test_bounce_counts_each_fire(kit):
+    clip = _clip(kit)
+    gen = _gen(kit, bounce=True)
+    res = gen.run_episode(clip, *_start(gen), seed=3, max_steps=80)
+    assert res.bounced_hands == len(res.hit_steps) >= 1
+
+
+def test_bounce_fired_reflects_incoming_tip(kit):
+    """The wiring is apply_bounce: incoming tip-normal speed reverses, q stays."""
+    from amortized_opt.ik import tip_jacobian
+    from amortized_opt.train_cost import BounceConfig
+
+    bcfg = BounceConfig(
+        restitution=(0.5, 0.5), tip_vel_noise=0.0, q_noise=0.0, qd_noise=0.0,
+    )
+    gen = _gen(kit, bounce=bcfg)
+    rng = np.random.default_rng(0)
+    snap = gen._snapshot(_clip(kit), 0.20, rng)
+    assert snap.goal["left"].active
+    drum = int(snap.goal["left"].drum)
+    q = np.zeros(N)
+    n = np.asarray(kit.axes[drum], float)
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    J = tip_jacobian(gen.fk, gen._t(q)[None], "left")[0].detach().cpu().numpy()
+    qd, *_ = np.linalg.lstsq(J, -2.0 * n, rcond=None)
+    vn0 = float((J @ qd) @ n)
+    assert vn0 < -1.0
+    q2, qd2 = gen._bounce_fired(q, qd, ["left"], snap, rng)
+    J2 = tip_jacobian(gen.fk, gen._t(q2)[None], "left")[0].detach().cpu().numpy()
+    vn1 = float((J2 @ qd2) @ n)
+    assert vn1 > 0.0
+    np.testing.assert_allclose(q2, q, atol=1e-9)

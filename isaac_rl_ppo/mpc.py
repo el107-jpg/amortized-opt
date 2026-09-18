@@ -49,12 +49,17 @@ import numpy as np
 import torch
 
 from amortized_opt.constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, N_DOF
+from amortized_opt.fk import ChainFK
+from amortized_opt.ik import adjust_arm_terminal, correct_quintic_init_arms
 from amortized_opt.lead import LEAD_PRESETS, lead_fraction, lead_waypoints, resolve_lead
-from amortized_opt.limits import isaac_velocity_limits, urdf_position_limits
+from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from amortized_opt.model import ContextEncoding
 from amortized_opt.tokenizer import build_waypoint_masks
 from amortized_opt.train_cost import ramp_seed
-from amortized_opt.warmstart import GoalPoseLibrary, arm_slice, waist_slice
+from amortized_opt.warmstart import (
+    GoalPoseLibrary, arm_slice, seed_waist_pr_to_sp, update_waist_pr_ema,
+    waist_pr_slice, waist_slice,
+)
 
 from .schedule import BatchedSchedule
 
@@ -80,14 +85,58 @@ class MPCConfig:
     #: ships the per-joint lead alone.
     freeze_wp: int = 0
     freeze_waist: bool = True
-    #: Re-encode the context every tick.  ``False`` caches the encoding for the
-    #: life of a hit segment, which is cheaper but feeds the decoder a STALE
-    #: ``goal_tth``; see the DECISION note in ``isaac_rl/README.md``.
-    encode_every_tick: bool = True
+    #: Leaky EMA of clipped P/R cmd (mirrors ``MPCRoller`` / ``MPCGenerator``).
+    waist_pr_ema: bool = False
+    waist_pr_ema_alpha: float = 0.1
+    waist_pr_ema_leak: float = 0.02
+    #: Re-encode the context every tick.  DEFAULT OFF as of the decoder-tth
+    #: change: the encoding is cached for the life of a goal segment and rebuilt
+    #: on a segment boundary or a yaw-BC move (:meth:`IsaacMPC._encode_key`).
+    #:
+    #: The staleness objection that made every-tick the default is GONE, not
+    #: traded away.  ``isaac_rl/README.md`` DECISION 2 defaulted to every-tick
+    #: because ``goal_tth`` and ``future_tth`` were both encoder inputs that
+    #: ticked down every 20 ms, so a cached encoding fed the decoder a stale
+    #: time-to-hit.  ``future_tth`` became the hit-relative ``future_gap`` and
+    #: ``goal_tth`` moved to the DECODER (``ModelConfig.dec_tth_feats`` /
+    #: ``enc_goal_tth``), which re-runs every tick anyway.  Every remaining
+    #: encoder input is now constant inside a goal segment by construction, so
+    #: the cache is EXACT, not an approximation -- and the per-tick re-encode it
+    #: replaces is the path by which measured state echoed into the encoder and
+    #: ran the waist away in closed loop (see ``yaw_cond``).
+    #:
+    #: ``True`` is kept as the A/B escape hatch.
+    encode_every_tick: bool = False
+    #: Re-encode when the ``yaw_cond`` conditioning yaw has moved this far, rad,
+    #: since the encoding was built.  It is the one encoder input that is not
+    #: segment-constant -- a slew-limited ramp toward the analytic aim -- so a
+    #: big commanded turn must be allowed to refresh the aim conditioning inside
+    #: a long segment.  0.05 rad is ~3 deg, well under the aim law's 0.09 rad
+    #: deadband, so the token never drifts far enough to change which side of
+    #: that switch the context sits on.
+    enc_yaw_tol: float = 0.05
     #: Autocast dtype for the model pass (``None`` = fp32).
     amp_dtype: torch.dtype | None = torch.bfloat16
     joint_names: tuple[str, ...] = field(default=G1_UPPER_BODY_JOINTS)
     yaw_bins: int = 129
+    #: Waist pitch/roll ease-to-upright window of the RESET seed, in waypoints
+    #: (``warmstart_trajectory``'s ``waist_upright_ease_wp``).  MUST match the
+    #: ``ScenarioConfig`` the checkpoint was trained with -- ``play_isaac``
+    #: reads it off ``ck["scenario_cfg"]``.  ``None`` = hold the measured lean,
+    #: the pre-ease behaviour bit for bit.
+    waist_upright_ease_wp: int | None = None
+    #: What fills the ``yaw_now`` conditioning token (and the aim recompute).
+    #: ``"aim_ramp"`` reproduces ``MPCGenConfig.planned_yaw_bc``: the token is
+    #: a slew-limited BC state ramping toward the ANALYTIC aim -- an anchor
+    #: exogenous to both the model and the plant -- leashed to the measurement.
+    #: Conditioning on anything the loop itself produces (measured yaw OR the
+    #: model's own plan) closes a positive-feedback loop through the waist-sp
+    #: head; see the 2026-08-14 note in ``isaac_rl.mpc.MPCConfig.yaw_cond``.
+    #: ``"measured"`` keeps the old behaviour for the A/B.
+    yaw_cond: str = "aim_ramp"
+    #: Bound, rad, on the |BC state - measured| offset the token may carry --
+    #: see ``isaac_rl.mpc.MPCConfig.yaw_cond_leash``.
+    yaw_cond_leash: float = 0.35
 
 
 @dataclass
@@ -133,16 +182,20 @@ class IsaacMPC:
         self.q_lo = torch.as_tensor(lo, device=self.device, dtype=dtype)
         self.q_hi = torch.as_tensor(hi, device=self.device, dtype=dtype)
         eta = self.cfg.cmd_slew_eta
-        self.step_max = (
-            None if eta is None else
-            torch.as_tensor(float(eta) * isaac_velocity_limits(self.names) * self.dt,
-                            device=self.device, dtype=dtype)
+        #: per-waypoint step at the HARD speed rating; the ease stretch and the
+        #: slew bound both derive from it, the latter scaled by ``cmd_slew_eta``.
+        self._vstep = torch.as_tensor(
+            isaac_velocity_limits(self.names) * self.dt, device=self.device, dtype=dtype
         )
+        self.step_max = None if eta is None else float(eta) * self._vstep
         self.lead_f = lead_fraction(resolve_lead(self.cfg.cmd_lead_s), self.dt, self.n,
                                     device=self.device, dtype=dtype)
         self.arm_cols = {h: arm_slice(hand, self.names)
                          for h, hand in enumerate(("left", "right"))}
         self.waist_cols = waist_slice(self.names)
+        self.pr_idx = torch.as_tensor(
+            waist_pr_slice(self.names), device=self.device, dtype=torch.long
+        )
         self.yaw_i = self.names.index("waist_yaw_joint")
 
         # goal-pose library, flattened to a (2, D, bins, n_arm) gather table --
@@ -160,11 +213,33 @@ class IsaacMPC:
         # rolling state
         self.init = torch.zeros(self.B, self.H, self.n, device=self.device, dtype=dtype)
         self.prev_cmd = torch.zeros(self.B, self.n, device=self.device, dtype=dtype)
+        self.waist_pr_ema = torch.zeros(self.B, 2, device=self.device, dtype=dtype)
+        self._waist_frozen = torch.zeros(self.B, dtype=torch.bool, device=self.device)
         self._enc: ContextEncoding | None = None
         self.last_ref0 = torch.zeros(self.B, self.n, device=self.device, dtype=dtype)
+        #: The ``yaw_cond="aim_ramp"`` BC state (fix A's planned yaw), rad.
+        self.yaw_bc = torch.zeros(self.B, device=self.device, dtype=dtype)
+        #: Segment identity and conditioning yaw AT the cached encoding, plus
+        #: the aim the ramp is currently heading for.  ``_aim`` is refreshed
+        #: only when the context is rebuilt, which is what keeps the yaw ramp
+        #: off the ~0.1 ms/env host-side solve inside ``sched.context``.
         self._enc_key: torch.Tensor | None = None
+        self._yaw_enc: torch.Tensor | None = None
+        self._aim: torch.Tensor | None = None
         self.n_encodes = 0
         self.n_ticks = 0
+        self._fk: ChainFK | None = None
+        self._arm_dls_pending = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+
+    def _chain_fk(self) -> ChainFK:
+        if (
+            self._fk is None
+            or self._fk.device != self.device
+            or self._fk.dtype != self.dtype
+        ):
+            self._fk = ChainFK(device=self.device, dtype=self.dtype)
+        return self._fk
+
 
     # ------------------------------------------------------- lookup table --
     def _goal_pose_table(self):
@@ -200,13 +275,49 @@ class IsaacMPC:
             0, env_ids, q0.index_select(0, env_ids).unsqueeze(1).expand(-1, self.H, -1)
             .contiguous()
         )
+        if self.cfg.waist_upright_ease_wp is not None:
+            # pitch/roll recover to upright instead of holding the lean --
+            # same quintic, same 1.875x stretch rule as the training seed
+            # (``warmstart_trajectory``'s ``waist_upright_ease_wp`` branch).
+            # Isaac resets envs AT REST, so the rest-to-rest ``ramp_seed`` IS
+            # the velocity-matched ease with v0 = 0 (``vel_ramp_seed`` reduces
+            # to it exactly); a measured-rate BC would need qd at reset, which
+            # this signature does not carry.
+            pr = [c for c in self.waist_cols if c != self.yaw_i]
+            q0w = q0.index_select(0, env_ids)[:, pr]
+            step = (ETA_VELOCITY * self._vstep[pr]).clamp_min(1e-9)
+            need = torch.ceil(1.875 * q0w.abs() / step)
+            L = need.clamp(float(self.cfg.waist_upright_ease_wp), float(self.H))
+            sub = ramp_seed(q0w, torch.zeros_like(q0w), L, self.H)
+            buf = self.init.index_select(0, env_ids)
+            buf[:, :, pr] = sub
+            self.init.index_copy_(0, env_ids, buf)
         self.prev_cmd.index_copy_(0, env_ids, q0.index_select(0, env_ids))
+        if self.cfg.waist_pr_ema:
+            self.waist_pr_ema.index_copy_(
+                0, env_ids,
+                q0.index_select(0, env_ids).index_select(1, self.pr_idx),
+            )
+        # Anchor the yaw-BC ramp: before the first tick the planned yaw IS the
+        # measured one, so ``yaw_cond="aim_ramp"`` starts honest.
+        self.yaw_bc.index_copy_(0, env_ids, q0.index_select(0, env_ids)[:, self.yaw_i])
         self._enc = None
+        self._enc_key = None
+        self._yaw_enc = None
+        self._aim = None
         hidx = self.sched.hit_index()
         self._reseed(env_ids, hidx >= 1, q0, hidx)
+        self._arm_dls_pending.index_fill_(0, env_ids, True)
 
     # -------------------------------------------------------------- masks --
     def masks(self, hit_index: torch.Tensor):
+        # ``hit_index`` is WAYPOINT-QUANTIZED, so ``masks.hit_tth`` -- the
+        # countdown the decoder reads (``ModelConfig.dec_tth_feats``) -- is
+        # quantized too, by at most half a control period (10 ms).  That is
+        # below the ~20 ms strike-timing sigma the cost scores against, and it
+        # matches training: the phase-1/2 pools are waypoint-aligned, so their
+        # ``hit_tth`` is quantized identically.  A continuous path would feed
+        # the decoder a resolution the model never saw.
         active = hit_index >= 0
         t = hit_index.clamp_min(0).to(self.dtype) * self.dt
         return build_waypoint_masks(
@@ -226,7 +337,27 @@ class IsaacMPC:
         active = hit_index >= 0
         masks = self.masks(hit_index)
 
-        enc, did_encode = self._encoding(hit_index)
+        enc, did_encode = self._encoding(hit_index, q)
+        if getattr(enc, "waist_pr_sp", None) is not None:
+            self.init = seed_waist_pr_to_sp(
+                self.init, q, qd, enc.waist_pr_sp,
+                joint_names=self.names, dt=self.dt,
+                ease_wp=self.cfg.waist_upright_ease_wp,
+            )
+        if bool(self._arm_dls_pending.any()):
+            _tth, _d, gp, _w, _v, gactive = self.sched.goal()
+            live = (
+                self._arm_dls_pending.unsqueeze(-1)
+                & gactive
+                & (hit_index >= 1)
+            )
+            self.init = correct_quintic_init_arms(
+                self._chain_fk(), self.init, q, hit_index, gp,
+                active=live, steps=1,
+                q_bounds=(self.q_lo, self.q_hi),
+                joint_names=self.names, qd0=qd, dt=self.dt,
+            )
+            self._arm_dls_pending.zero_()
         init = self.init * masks.elem_mask
         state = torch.cat([q, qd], dim=-1)
 
@@ -261,7 +392,12 @@ class IsaacMPC:
                 m = hit_any.view(-1, 1, 1)
                 traj[:, :, self.waist_cols] = torch.where(
                     m, self.init[:, :, self.waist_cols], traj[:, :, self.waist_cols])
+                self._waist_frozen.copy_(hit_any)
+            else:
+                self._waist_frozen.zero_()
             frozen = hit_any
+        else:
+            self._waist_frozen.zero_()
 
         # ---- reference lead, then slew, then box ---------------------------
         # ``last_ref0`` is the plan's own first waypoint BEFORE the lead: the
@@ -284,20 +420,89 @@ class IsaacMPC:
             frozen=frozen, encoded=did_encode,
         )
 
-    def _encoding(self, hit_index: torch.Tensor):
-        """The context encoding, re-run every tick unless caching is asked for."""
-        if self.cfg.encode_every_tick or self._enc is None:
+    def _encode_key(self, hit_index: torch.Tensor) -> torch.Tensor:
+        """``(B, 2)`` goal-segment identity -- which scheduled hit each hand owns.
+
+        Derived from the schedule's CURSOR, never from a countdown: ``goal_tth``
+        moves every tick and would make every tick a new segment, which is the
+        whole thing this change removes.
+
+        The cursor alone is not enough.  A hit further out than ``cap_wp`` is
+        demoted to ``future[0]`` and later PROMOTED to the goal without the
+        cursor moving (``BatchedSchedule.context``'s ``shift``), and that
+        promotion rewrites every goal field.  Pairing the cursor with the goal's
+        activity covers the re-goal and the promotion with one integer; a reset
+        is covered separately, by ``reset`` clearing the cache outright.
+        """
+        return self.sched.cursor * 2 + (hit_index >= 0).long()
+
+    def _encoding(self, hit_index: torch.Tensor, q: torch.Tensor | None = None):
+        """The context encoding, rebuilt on a SEGMENT boundary, not every tick.
+
+        ``q`` is the measured pose; its waist-yaw column feeds
+        ``BatchedSchedule.context(yaw_now=...)`` so a waist-sp-head checkpoint
+        is conditioned on the actual torso yaw rather than the field's zero
+        default ("hold 0 rad").
+
+        Three things force a rebuild: no cache at all (first tick, or a reset),
+        a change of ``_encode_key`` on ANY env, and the conditioning yaw moving
+        past ``enc_yaw_tol``.  Nothing else can move an encoder input now -- see
+        ``MPCConfig.encode_every_tick``.
+
+        The ``yaw_cond="aim_ramp"`` BC state advances EVERY tick regardless,
+        toward the aim of the last encode.  It has to: the ramp is what the
+        yaw-move trigger measures, so freezing it between encodes would freeze
+        the trigger with it and the aim conditioning would never refresh inside
+        a long segment.  Advancing it against the cached aim rather than a fresh
+        one keeps ``sched.context``'s host-side aim solve off the cached ticks,
+        and re-encoding is exactly what corrects the aim when it has moved.
+        """
+        cfg = self.cfg
+        ramp = cfg.yaw_cond == "aim_ramp" and q is not None
+        if q is None:
+            yaw_now = None
+        elif ramp:
+            # fix A's planned-yaw BC: leash the ramp state to reality, then
+            # condition on it.
+            meas = q[:, self.yaw_i]
+            leash = float(cfg.yaw_cond_leash)
+            self.yaw_bc = meas + (self.yaw_bc - meas).clamp(-leash, leash)
+            yaw_now = self.yaw_bc
+        else:
+            yaw_now = q[:, self.yaw_i]
+
+        key = self._encode_key(hit_index)
+        need = (
+            self._enc is None
+            or cfg.encode_every_tick
+            or self._enc_key is None
+            or bool((key != self._enc_key).any())
+            or (
+                yaw_now is not None and self._yaw_enc is not None
+                and bool(((yaw_now - self._yaw_enc).abs() > float(cfg.enc_yaw_tol)).any())
+            )
+        )
+        if need:
             core = self.model.module if hasattr(self.model, "module") else self.model
             amp = (
-                torch.autocast(device_type="cuda", dtype=self.cfg.amp_dtype)
-                if (self.cfg.amp_dtype is not None and self.device.type == "cuda")
+                torch.autocast(device_type="cuda", dtype=cfg.amp_dtype)
+                if (cfg.amp_dtype is not None and self.device.type == "cuda")
                 else torch.autocast(device_type="cuda", enabled=False)
             )
+            ctx = self.sched.context(yaw_now=yaw_now)
+            if ramp and ctx.aim_yaw is not None:
+                self._aim = ctx.aim_yaw.to(self.yaw_bc.dtype)
             with amp:
-                self._enc = core.encode_context(self.sched.context())
+                self._enc = core.encode_context(ctx)
+            self._enc_key = key.clone()
+            # ``.clone()``: ``reset`` writes ``yaw_bc`` IN PLACE, so the
+            # reference would follow it and the trigger would never fire.
+            self._yaw_enc = None if yaw_now is None else yaw_now.clone()
             self.n_encodes += 1
-            return self._enc, True
-        return self._enc, False
+        if ramp and self._aim is not None:
+            step = float(ETA_VELOCITY) * self._vstep[self.yaw_i]
+            self.yaw_bc = self.yaw_bc + (self._aim - self.yaw_bc).clamp(-step, step)
+        return self._enc, need
 
     def _command(self, traj: torch.Tensor, hit_index: torch.Tensor) -> torch.Tensor:
         """``q_ref(t + delta)``, held past each hand's terminal, then clamped.
@@ -352,6 +557,16 @@ class IsaacMPC:
         """
         traj, _hidx = self._pending
         self.prev_cmd = cmd.to(self.dtype)
+        if self.cfg.waist_pr_ema:
+            live = ~self._waist_frozen
+            if bool(live.any()):
+                new = update_waist_pr_ema(
+                    self.waist_pr_ema,
+                    cmd.to(self.dtype).index_select(1, self.pr_idx),
+                    alpha=float(self.cfg.waist_pr_ema_alpha),
+                    leak=float(self.cfg.waist_pr_ema_leak),
+                )
+                self.waist_pr_ema = torch.where(live.unsqueeze(-1), new, self.waist_pr_ema)
         self.init = torch.cat([traj[:, 1:], traj[:, -1:]], dim=1)
         new_index = self.sched.hit_index()
         if bool(fired.any()):
@@ -359,36 +574,129 @@ class IsaacMPC:
 
     def _reseed(self, env_ids, mask: torch.Tensor, q: torch.Tensor,
                 hit_index: torch.Tensor) -> None:
-        """Ramp the arm columns of ``mask``'ed hands to their library terminal.
+        """Ramp arm columns of ``mask``'ed hands; rebuild waist from aim.
 
-        Mirrors ``MPCRoller._regoal``'s re-seed block: only that hand's arm
-        columns move, the other hand and the waist carry straight through, and
-        the terminal is the library pose selected at the CURRENT waist-yaw bin
-        (the pose library is yaw-indexed, so the entry follows the torso).
+        Mirrors ``MPCRoller._regoal``: only the fired hand's arm columns move,
+        the other hand carries through, and the waist is rewritten from the
+        analytic aim whenever ANY hand reseeds (not held leftover).
         """
         if env_ids is not None:
             keep = torch.zeros(self.B, dtype=torch.bool, device=self.device)
             keep[env_ids] = True
             mask = mask & keep.unsqueeze(-1)
-        yaw_bin = torch.round((q[:, self.yaw_i] - self.yaw_lo) / self.yaw_step) \
+        any_rows = mask.any(dim=1).nonzero(as_tuple=True)[0]
+        self._rebuild_waist_from_aim(any_rows, q)
+        yaw_src = q[:, self.yaw_i]
+        if self._aim is not None:
+            yaw_src = self._aim.to(dtype=q.dtype)
+        yaw_bin = torch.round((yaw_src - self.yaw_lo) / self.yaw_step) \
             .long().clamp(0, self.n_bins - 1)
         drum = self.sched.goal()[1]
+        _tth, _d, gp, _w, _v, _gactive = self.sched.goal()
+        n = self.n
         for h in (0, 1):
             rows = mask[:, h].nonzero(as_tuple=True)[0]
             if rows.numel() == 0:
                 continue
             cols = self.arm_cols[h]
+            hand = "left" if h == 0 else "right"
             d = drum.index_select(0, rows)[:, h].clamp(0, self.D - 1)
             ok = self.lib_ok[h][d]
-            term = self.lib_q[h][d, yaw_bin.index_select(0, rows)]
-            q0r = q.index_select(0, rows)[:, cols]
-            term = torch.where(ok.unsqueeze(-1), term, q0r)
-            L = hit_index.index_select(0, rows)[:, h].clamp(1, self.H) \
-                .view(-1, 1).expand(-1, len(cols))
-            sub = ramp_seed(q0r, term, L, self.H)
+            term_lib = self.lib_q[h][d, yaw_bin.index_select(0, rows)]
+            q0r = q.index_select(0, rows)
+            term_lib = torch.where(ok.unsqueeze(-1), term_lib, q0r[:, cols])
+            k = hit_index.index_select(0, rows)[:, h].clamp(1, self.H)
             buf = self.init.index_select(0, rows)
+            q_seed = buf.gather(
+                1, (k - 1).view(-1, 1, 1).expand(-1, 1, n)
+            ).squeeze(1).clone()
+            q_seed[:, cols] = term_lib
+            q_fix = adjust_arm_terminal(
+                self._chain_fk(), q_seed, gp.index_select(0, rows)[:, h], hand,
+                steps=1, q_bounds=(self.q_lo, self.q_hi),
+                joint_names=self.names,
+            )
+            term = q_fix[:, cols]
+            L = k.view(-1, 1).expand(-1, len(cols))
+            sub = ramp_seed(q0r[:, cols], term, L, self.H)
+            buf = buf.clone()
             buf[:, :, cols] = sub
             self.init.index_copy_(0, rows, buf)
+        self._arm_dls_pending[any_rows] = True
+
+    def _rebuild_waist_from_aim(self, rows: torch.Tensor, q: torch.Tensor) -> None:
+        """Waist ``init`` from analytic aim (``waist_reference_block``), sparse.
+
+        Aim comes from ``sched.context`` (same future-aware law as encode), so
+        the waist seed and the conditioning token describe the same drums after
+        a single-hand promote.
+        """
+        if rows.numel() == 0:
+            return
+        from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits
+        from amortized_opt.waist_aim import waist_reference_block
+
+        wc = self.waist_cols
+        H, dt = self.H, self.dt
+        waist_names = [self.names[c] for c in wc]
+        jy = waist_names.index("waist_yaw_joint")
+        v_lim = isaac_velocity_limits(self.names)
+        yaw_step = float(ETA_VELOCITY) * float(v_lim[self.yaw_i]) * float(dt)
+
+        # Match ``_encoding``'s yaw_cond: aim_ramp conditions on the BC state.
+        yaw_cond = q[:, self.yaw_i]
+        if self.cfg.yaw_cond == "aim_ramp" and self.yaw_bc is not None:
+            yaw_cond = self.yaw_bc
+        ctx = self.sched.context(yaw_now=yaw_cond)
+        if ctx.aim_yaw is not None:
+            self._aim = ctx.aim_yaw.to(
+                self.yaw_bc.dtype if self.yaw_bc is not None else self.dtype
+            )
+
+        n = int(rows.numel())
+        aim = ctx.aim_yaw.index_select(0, rows).detach().cpu().numpy()
+        aval = ctx.aim_valid.index_select(0, rows).detach().cpu().numpy()
+        q0_np = q.index_select(0, rows).detach().cpu().numpy()
+        block = np.zeros((n, H, len(wc)), dtype=np.float64)
+        ease_wp = self.cfg.waist_upright_ease_wp
+        for i in range(n):
+            yaw_start = float(q0_np[i, self.yaw_i])
+            yaw_tgt = float(aim[i]) if bool(aval[i]) else yaw_start
+            if ease_wp is not None:
+                sp = np.zeros(len(wc), dtype=float)
+            else:
+                sp = np.array([float(q0_np[i, c]) for c in wc], dtype=float)
+            sp[jy] = yaw_start
+            ref = waist_reference_block(
+                waist_names, yaw_start=yaw_start, yaw_target=yaw_tgt,
+                n_waypoints=H + 1, setpoint=sp, dt=dt, settle_wp=3,
+                yaw_rate_start=0.0, max_move_s=0.2,
+            )
+            yaw = ref[:, jy].copy()
+            for k in range(1, yaw.shape[0]):
+                d = yaw[k] - yaw[k - 1]
+                if d > yaw_step:
+                    yaw[k] = yaw[k - 1] + yaw_step
+                elif d < -yaw_step:
+                    yaw[k] = yaw[k - 1] - yaw_step
+            ref[:, jy] = yaw
+            block[i] = ref[1:]
+            if ease_wp is not None:
+                pr = [j for j, c in enumerate(wc) if c != self.yaw_i]
+                for j in pr:
+                    q_from = float(q0_np[i, wc[j]])
+                    step_lim = max(ETA_VELOCITY * float(v_lim[wc[j]]) * dt, 1e-9)
+                    need = int(np.ceil(1.875 * abs(q_from) / step_lim))
+                    k_ease = int(np.clip(max(int(ease_wp), need), 1, H))
+                    qq = torch.tensor([[q_from]], dtype=self.dtype, device=self.device)
+                    tt = torch.zeros_like(qq)
+                    LL = torch.full_like(qq, float(k_ease))
+                    block[i, :, j] = ramp_seed(qq, tt, LL, H)[0, :, 0].cpu().numpy()
+
+        sub = torch.as_tensor(block, device=self.device, dtype=self.dtype)
+        buf = self.init.index_select(0, rows)
+        buf[:, :, wc] = sub
+        self.init.index_copy_(0, rows, buf)
 
     # -------------------------------------------------------------- stats --
     @property

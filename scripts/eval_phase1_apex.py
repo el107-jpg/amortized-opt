@@ -108,13 +108,17 @@ def main(argv=None) -> int:
         model.load_state_dict(ck["model"])
         model.eval()
         buckets = tuple(ck.get("scenario_cfg", {}).get("buckets", (25, 50, 100)))
-        print(f"[ckpt] {label}: {path} step={ck['step']}", flush=True)
+        # seed convention follows the checkpoint's training data
+        ease_wp = ck.get("scenario_cfg", {}).get("waist_upright_ease_wp")
+        print(f"[ckpt] {label}: {path} step={ck['step']} waist_ease={ease_wp}",
+              flush=True)
         for init in args.inits:
             planners[f"{label}::{init}"] = ApexModelPlanner(
                 model=model, device=str(dev), iterations=args.iterations, init=init,
                 buckets=buckets, num_drums=model_cfg.num_drums,
                 num_future=model_cfg.num_future, library=library, kit=kit,
                 apex_cfg=acfg, solver=solver, amp_dtype=amp,
+                waist_upright_ease_wp=ease_wp,
             )
 
     summary: dict = {"grid": args.grid, "seed": args.seed, "n_cases": len(cases),

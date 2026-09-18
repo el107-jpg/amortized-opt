@@ -166,13 +166,29 @@ def test_aux_gate_defaults_to_auto():
     assert cfg.aux.enabled
 
 
-def test_extra_lead_mechanisms_are_refused():
-    """README 7c decision 2: the lead ALONE; the 3-mechanism stack is worse."""
-    for field, value in (("hit_lead_s", 0.02), ("freeze_wp", 3)):
-        cfg = PpoRunConfig()
-        setattr(cfg.env, field, value)
-        with pytest.raises(ValueError, match="hit_lead_s / freeze_wp"):
-            cfg.validate()
+def test_extra_lead_mechanisms_hit_lead_is_refused():
+    """README 7c: hit_lead_s stays off; freeze_wp is an explicit overlay."""
+    cfg = PpoRunConfig()
+    cfg.env.hit_lead_s = 0.02
+    with pytest.raises(ValueError, match="hit_lead_s"):
+        cfg.validate()
+
+
+def test_freeze_wp_default_is_off_and_five_is_allowed():
+    cfg = PpoRunConfig()
+    assert cfg.env.freeze_wp == 0
+    assert cfg.actor.freeze_wp == 0
+    cfg.env.freeze_wp = 5
+    cfg.actor.freeze_wp = 5
+    cfg.validate()
+
+
+def test_freeze_wp_must_match_on_actor_and_env():
+    cfg = PpoRunConfig()
+    cfg.env.freeze_wp = 5
+    cfg.actor.freeze_wp = 0
+    with pytest.raises(ValueError, match="freeze_wp"):
+        cfg.validate()
 
 
 def test_validate_rejects_a_bad_sigma_init():
@@ -194,6 +210,42 @@ def test_plan_cost_reward_is_off_by_default():
     cfg = PpoRunConfig()
     assert cfg.reward_plan_cost_weight == 0.0
     assert cfg.aux.enabled and cfg.aux.weight > 0.0
+
+
+def test_orth_combine_is_on_by_default():
+    """Waypoint-0 PPO is always-projected onto the cost nullspace."""
+    cfg = PpoRunConfig()
+    assert cfg.orth.enabled
+    assert cfg.orth.rl_to_cost_norm == 1.0
+    assert cfg.orth.cost_to_rl_norm == 1.0
+    assert cfg.orth.traj_grad_scale == 0.2
+    assert cfg.orth.wp0_leak == 0.0
+    assert cfg.ppo.learning_rate == pytest.approx(1e-5)
+    assert cfg.ppo.lr_min == pytest.approx(1e-6)
+
+
+def test_validate_rejects_a_negative_orth_scale():
+    cfg = PpoRunConfig()
+    cfg.orth.rl_to_cost_norm = -0.1
+    with pytest.raises(ValueError, match="rl_to_cost_norm"):
+        cfg.validate()
+
+
+def test_validate_rejects_a_negative_traj_grad_scale():
+    cfg = PpoRunConfig()
+    cfg.orth.traj_grad_scale = -0.1
+    with pytest.raises(ValueError, match="traj_grad_scale"):
+        cfg.validate()
+
+
+def test_validate_rejects_wp0_leak_outside_unit_interval():
+    cfg = PpoRunConfig()
+    cfg.orth.wp0_leak = -0.01
+    with pytest.raises(ValueError, match="wp0_leak"):
+        cfg.validate()
+    cfg.orth.wp0_leak = 1.1
+    with pytest.raises(ValueError, match="wp0_leak"):
+        cfg.validate()
 
 
 # ================================================ the shared-FK trap ==========

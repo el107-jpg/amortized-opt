@@ -11,6 +11,7 @@ only its own actor and update rule.
 ```
 bridge.py       the ONLY module that touches isaac_rl; the compatibility contract
 cfg.py          one dataclass tree + the checkpoint-resolution rules
+start.py        play_isaac start pose + first-hit pad (used by train_ppo)
 actor.py        LoRA + Gaussian head + AR(1) + the MLP critic (rsl_rl-shaped)
 ppo_loop.py     storage, GAE, the fused update, and the rollout driver
 train_ppo.py    the entry point (JSONL metrics, checkpoints, resume)
@@ -36,10 +37,19 @@ One control tick:
    state; `std` is a learned state-independent per-dim parameter (init 0.45,
    clamped to `[0.02, 1.0]` on the forward path). Log-prob and entropy are stock
    `Normal` — **the PPO math is exact and untouched.**
-3. Exploration noise is AR(1)-correlated in time (per-joint-group τ: waist
+3. At update time the analytic `FusedCost` on the full plan and the PPO
+   surrogate are combined in **trajectory space** at waypoint 0: always-project
+   the PPO gradient onto the cost nullspace, **rescale cost per sample to the
+   PPO gradient's magnitude**, then add the leftover at PPO's native scale.
+   `--orth-leak α` re-injects fraction `α` of the *parallel* PPO component at
+   waypoint 0 only (default 0 = hard orth). Unscaled cost (aux ~4000) railed
+   KL and NaNed the first Isaac run.
+   Waypoints `1..H-1` are cost-only — they are the next tick's warm start.
+   `--no-orth` restores the previous scalar sum.
+4. Exploration noise is AR(1)-correlated in time (per-joint-group τ: waist
    0.30 s, shoulder 0.25 s, elbow 0.15 s, wrist 0.10 s), variance-preserving so
    the marginal stays exactly `N(mean, std)`.
-4. The sample becomes a command through the deployed path — the reference lead
+5. The sample becomes a command through the deployed path — the reference lead
    (**OFF in Isaac**, see below), the slew bound, the joint-box clamp — with the
    noise added as an additive joint-space offset *after* the lead.
 
@@ -364,10 +374,15 @@ number to compare against; the analytic 63 % is a different plant.
    changes the action the stored log-prob was computed for. Correct handling
    (store the *projected* action, or treat projection as env dynamics) is a real
    design question, not a flag flip.
-8. **Episode resets are a placeholder.** `on_done` teleports to the current pose
-   with zero velocity and re-draws the clip. Real training should reset to a
-   fresh `StartSampler` state; as written the start distribution is whatever the
-   previous episode ended in.
+8. **Episode start matches `play_isaac`; clip-end keeps leftover `q` with a
+   1 s gap.** After Isaac `env.reset`, the USD `init_state` is overwritten with
+   `amortized_opt.ready_joint_pos`. Clips are padded so the first hand hit is at
+   `--first-hit-s` (default 1.0 s). `BatchedSchedule.done` is patched to wait
+   until `t_now >= duration` so the RCC `post_buffer` (last hit + `--clip-gap-s`,
+   default 1.0 s) actually plays — leftover pose, no next clip yet. Then
+   `on_done` teleports to that leftover `q` at rest and redraws the clip.
+   `--isaac-ready` keeps Unitree standing; `--first-hit-s 0` / `--clip-gap-s 0`
+   restore native first-hit times and chain-on-last-hit.
 9. **Time-limit bootstrapping.** Episodes end on clip exhaustion — a time limit,
    not a failure — but GAE cuts the bootstrap at `done`. The standard fix is to
    bootstrap through time-limit terminations. Left as-is to match the sibling's
@@ -403,6 +418,19 @@ number to compare against; the analytic 63 % is a different plant.
     Caveat carried from decision 5: at weight 0.1 the aux term *dominates* the
     loss (aux ~1500 against surrogate ~0.1), so the weight — not the gate — is
     the thing to tune first on the real backbone.
+15. **Always-orth combine at waypoint 0, ON by default.** Scalar
+    `surrogate + aux.weight * cost` lets aux's magnitude swallow PPO. The
+    update always-projects the waypoint-0 PPO gradient onto the analytic
+    cost's nullspace. **Cost is then rescaled per sample** so
+    `||g_cost||_F = cost_to_rl_norm · ||g_rl0||` (default 1) and the leftover
+    RL is added at PPO's native scale. The first Isaac run skipped that match
+    (`g_cost` at aux ~4000 vs surrogate ~0.08): KL sat at 0.07 (target 0.015),
+    the LR railed, and the plan NaNed on iter 5. `--cost-to-rl` / `--orth-scale`
+    / `--orth-leak` are the knobs (`--orth-leak` is the parallel-component
+    leak at waypoint 0; default 0). `kl_early_stop` (ON) aborts the rest of
+    an iteration once a minibatch exceeds `2 · desired_kl`. Nonfinite
+    advantages skip the update.
+    Log `train/orth_cos` and `train/orth_cost_scale`.
 
 ---
 

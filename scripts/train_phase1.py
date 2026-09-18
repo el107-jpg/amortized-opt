@@ -58,6 +58,13 @@ def parse_args(argv=None):
     p.add_argument("--aux-weight", type=float, default=0.1)
     p.add_argument("--d-model", type=int, default=None, help="decoder width (default 384)")
     p.add_argument("--dec-layers", type=int, default=None, help="decoder depth (default 3)")
+    p.add_argument("--dec-rope", action="store_true",
+                   help="rotary position on decoder SELF-attention (see "
+                        "ModelConfig.dec_rope); off by default")
+    p.add_argument("--dec-plant-feats", action="store_true",
+                   help="analytic Cartesian (tip/wrist/elbow) + knot-RNEA of "
+                        "init_traj on decoder tokens (see "
+                        "ModelConfig.dec_plant_feats); off by default")
     p.add_argument("--no-compile", action="store_true")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-kit-randomization", action="store_true")
@@ -82,6 +89,29 @@ def parse_args(argv=None):
                    help="keep the idle-arm TARGETS but drop the encoder's IDLE "
                         "context token, so the park pose has to be inferred from "
                         "the seed alone.  The ablation against the default")
+    p.add_argument("--waist-upright-ease-wp", type=int, default=None,
+                   help="seed AND target pitch/roll ease from the sampled lean "
+                        "to upright over this many waypoints, then hold "
+                        "(try 5).  Default None keeps the old hold-the-lean "
+                        "targets")
+    p.add_argument("--waist-sp-head", action="store_true",
+                   help="learned waist-yaw set-point head on the encoder")
+    p.add_argument("--waist-pr-sp-head", action="store_true",
+                   help="learned waist pitch/roll set-point head on the encoder")
+    p.add_argument("--waist-follow-frac", type=float, default=0.0,
+                   help="REMOVED. Non-zero exits; use --w-waist-gain")
+    p.add_argument("--waist-follow-jitter", type=float, default=0.3)
+    p.add_argument("--waist-pr-follow-jitter", type=float, default=0.1)
+    p.add_argument("--waist-hold-wp", type=int, default=10)
+    p.add_argument("--w-waist-mimic", type=float, default=0.0,
+                   help="Huber weight of encoder set-point vs aim / upright "
+                        "(0.1 with heads)")
+    p.add_argument("--w-waist-gain", type=float, default=0.0,
+                   help="identity Jacobian (∂ hold / ∂ sp − 1)² so the decoder "
+                        "passes the encoder set-point through (try 1.0 with heads). "
+                        "No token jitter, no rewritten target")
+    p.add_argument("--waist-gain-frac", type=float, default=1.0,
+                   help="fraction of each batch used for the Jacobian VJP")
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--out", default=None, help="run directory (default runs/phase1_<ts>)")
@@ -117,6 +147,7 @@ def main(argv=None) -> int:
         idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
         idle_settle_wp=int(args.idle_settle_wp),
         rest_frac=float(args.rest_frac),
+        waist_upright_ease_wp=args.waist_upright_ease_wp,
     )
     noise = NoiseConfig()
     pool_dev = args.pool_device or args.device
@@ -167,11 +198,17 @@ def main(argv=None) -> int:
         max_horizon=int(args.horizon), num_drums=scen.num_drums,
         num_future=scen.num_future,
         idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
+        waist_sp_head=bool(args.waist_sp_head),
+        waist_pr_sp_head=bool(args.waist_pr_sp_head),
     )
     for attr in ("d_model", "dec_layers"):
         val = getattr(args, attr, None)
         if val is not None:
             setattr(model_cfg, attr, val)
+    if args.dec_rope:
+        model_cfg.dec_rope = True
+    if args.dec_plant_feats:
+        model_cfg.dec_plant_feats = True
     model = A.build_model(model_cfg, dev)
     print(f"[model] {A.param_counts(model)}", flush=True)
 
@@ -186,8 +223,22 @@ def main(argv=None) -> int:
         patience_evals=int(args.patience),
         seed=int(args.seed),
         device=str(args.device),
+        waist_hold_wp=int(args.waist_hold_wp),
+        waist_gain_frac=float(args.waist_gain_frac),
     )
-    weights = LossWeights(aux=float(args.aux_weight))
+    if float(args.waist_follow_frac) > 0.0:
+        raise SystemExit(
+            "--waist-follow-frac is removed; use --w-waist-gain (identity Jacobian)"
+        )
+    if float(args.w_waist_gain) > 0.0 and not (args.waist_sp_head or args.waist_pr_sp_head):
+        raise SystemExit("--w-waist-gain > 0 requires --waist-sp-head and/or --waist-pr-sp-head")
+    if float(args.w_waist_mimic) > 0.0 and not (args.waist_sp_head or args.waist_pr_sp_head):
+        raise SystemExit("--w-waist-mimic > 0 requires a waist set-point head")
+    weights = LossWeights(
+        aux=float(args.aux_weight),
+        mimic=float(args.w_waist_mimic),
+        gain=float(args.w_waist_gain),
+    )
 
     summary = train(
         model=model, train_pool=train_pool, val_pool=val_pool, cfg=cfg,

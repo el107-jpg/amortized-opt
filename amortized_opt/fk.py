@@ -27,6 +27,9 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import math
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 
@@ -80,19 +83,131 @@ def _skew_np(a) -> np.ndarray:
     return np.array([[0.0, -a[2], a[1]], [a[2], 0.0, -a[0]], [-a[1], a[0], 0.0]])
 
 
-def stick_mount_transform(hand: str) -> tuple[np.ndarray, np.ndarray]:
+@dataclass(frozen=True)
+class StickSpec:
+    """One hand's stick geometry, so it can vary per SAMPLE.
+
+    ``amortized_opt/constants.py`` is still the single source of the NOMINAL
+    stick -- ``g1_scene/g1.py`` authors the PhysX colliders from it and
+    ``tests/test_g1_scene.py`` pins the two together at machine epsilon.  This
+    is the per-sample perturbation of it, threaded explicitly so nothing can
+    mutate the module-level constants underneath the collider.
+
+    ``tilt`` / ``roll`` rotate the mount ABOUT the nominal axes rather than
+    replacing them, which is what "randomize along the existing stick angles"
+    means: the sampled stick is always a perturbation of the shipped one.
+
+    LENGTH IS HANDLE-FIXED.  Nominally the mount sits at the stick's CENTRE
+    (``STICK_TIP_SIGMA = STICK_LENGTH / 2``), so a naive length change would
+    move the butt and the tip in opposite directions.  Fixing the handle --
+    what swapping a real stick does -- keeps the butt at ``-STICK_LENGTH / 2``
+    and lets the tip run out to ``length - STICK_LENGTH / 2``.  That is why
+    :attr:`tip_sigma` is not ``length / 2``.
+    """
+
+    hand: str
+    #: Extra rotation of the mount, radians, about the two axes perpendicular
+    #: to the nominal stick direction.
+    tilt: float = 0.0
+    roll: float = 0.0
+    #: TOTAL stick length, metres.  Nominal is ``STICK_LENGTH``.
+    length: float = STICK_LENGTH
+
+    @property
+    def tip_sigma(self) -> float:
+        """Arc coordinate of the tip, handle fixed at ``-STICK_LENGTH / 2``."""
+        return float(self.length) - STICK_LENGTH / 2.0
+
+    @property
+    def butt_sigma(self) -> float:
+        return -STICK_LENGTH / 2.0
+
+    def rotation(self) -> np.ndarray:
+        """(3, 3) mount rotation: the nominal one, then the sampled tilt/roll."""
+        _pos, quat = _STICK_MOUNT[self.hand]
+        R0 = _quat_wxyz_to_R(quat)
+        if not self.tilt and not self.roll:
+            return R0
+        # Rotate about the mount's own x then y; +z is the stick direction, so
+        # these two tip the stick without spinning it about its own axis.
+        cx, sx = math.cos(self.tilt), math.sin(self.tilt)
+        cy, sy = math.cos(self.roll), math.sin(self.roll)
+        Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], float)
+        Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], float)
+        return R0 @ Rx @ Ry
+
+
+@dataclass(frozen=True)
+class StickRandomization:
+    """Bounds for the per-sample stick perturbation.
+
+    Deliberately shaped like :class:`~amortized_opt.rhythm.KitRandomization`:
+    every bound is a half-width, zero means "off", and the defaults are all
+    zero so the shipped stick is reproduced exactly until a caller opts in.
+
+    ``tilt`` / ``roll`` are drawn uniformly in ``[-b, b]`` and applied ABOUT the
+    nominal mount rotation, so the sampled stick is always a perturbation of the
+    shipped one rather than a fresh orientation.  ``length`` is a half-width in
+    METRES about ``STICK_LENGTH``, handle-fixed (see :class:`StickSpec`).
+    """
+
+    tilt: float = 0.0
+    roll: float = 0.0
+    length: float = 0.0
+
+    def __post_init__(self) -> None:
+        for k in ("tilt", "roll", "length"):
+            if float(getattr(self, k)) < 0.0:
+                raise ValueError(f"{k} must be >= 0")
+        # The real invariant: the shortest drawable stick must keep
+        # ``tip_sigma - SHAFT_TIP_CLEAR > butt_sigma``, i.e. total length
+        # ``> SHAFT_TIP_CLEAR``, or ``stick_shaft_offsets``'s linspace inverts
+        # and the shaft samples walk tip-ward past the clearance band.
+        if self.length >= STICK_LENGTH - SHAFT_TIP_CLEAR:
+            raise ValueError(
+                f"length half-width {self.length} would allow a stick shorter "
+                f"than SHAFT_TIP_CLEAR ({SHAFT_TIP_CLEAR}), inverting the shaft "
+                f"sample linspace"
+            )
+
+    def sample(self, rng, hand: str) -> "StickSpec":
+        """One hand's stick for one scenario."""
+        u = lambda b: float(rng.uniform(-b, b)) if b > 0.0 else 0.0  # noqa: E731
+        return StickSpec(
+            hand=hand,
+            tilt=u(self.tilt),
+            roll=u(self.roll),
+            length=STICK_LENGTH + u(self.length),
+        )
+
+
+def _spec(hand: str, stick: "StickSpec | None") -> "StickSpec":
+    if stick is None:
+        return StickSpec(hand)
+    if stick.hand != hand:
+        raise ValueError(f"stick spec is for {stick.hand!r}, asked for {hand!r}")
+    return stick
+
+
+def stick_mount_transform(
+    hand: str, stick: "StickSpec | None" = None
+) -> tuple[np.ndarray, np.ndarray]:
     """(R, p) of the stick mount in the wrist-yaw joint frame."""
-    pos, quat = _STICK_MOUNT[hand]
-    return _quat_wxyz_to_R(quat), np.asarray(pos, float)
+    sp = _spec(hand, stick)
+    pos, _quat = _STICK_MOUNT[hand]
+    return sp.rotation(), np.asarray(pos, float)
 
 
-def stick_tip_offset(hand: str) -> np.ndarray:
-    """Stick tip position in the wrist-yaw frame (mount +Z * L/2)."""
-    R, p = stick_mount_transform(hand)
-    return p + R @ np.array([0.0, 0.0, STICK_LENGTH / 2.0])
+def stick_tip_offset(hand: str, stick: "StickSpec | None" = None) -> np.ndarray:
+    """Stick tip position in the wrist-yaw frame (mount +Z * tip_sigma)."""
+    sp = _spec(hand, stick)
+    R, p = stick_mount_transform(hand, stick)
+    return p + R @ np.array([0.0, 0.0, sp.tip_sigma])
 
 
-def stick_contact_offset(hand: str, sigma: float) -> np.ndarray:
+def stick_contact_offset(
+    hand: str, sigma: float, stick: "StickSpec | None" = None
+) -> np.ndarray:
     """Stick point at arc coordinate ``sigma`` in the wrist-yaw frame.
 
     ``sigma`` is measured along the stick axis from the mount origin (the
@@ -100,25 +215,28 @@ def stick_contact_offset(hand: str, sigma: float) -> np.ndarray:
     back toward the hand -- the same convention as
     ``trajopt.robot.contact_position`` and ``strike.StrikeSpec.contact_sigma``.
     """
-    R, p = stick_mount_transform(hand)
+    R, p = stick_mount_transform(hand, stick)
     return p + R @ np.array([0.0, 0.0, float(sigma)])
 
 
-def stick_axis_local(hand: str) -> np.ndarray:
+def stick_axis_local(hand: str, stick: "StickSpec | None" = None) -> np.ndarray:
     """Handle->tip unit direction of the stick, in the wrist-yaw frame.
 
     Rotate by the wrist frame's ``R`` to get the world stick axis, which is what
     the strike-elevation band is measured against.
     """
-    R, _p = stick_mount_transform(hand)
+    R, _p = stick_mount_transform(hand, stick)
     return R @ np.array([0.0, 0.0, 1.0])
 
 
-def stick_shaft_offsets(hand: str, n_samples: int) -> np.ndarray:
+def stick_shaft_offsets(
+    hand: str, n_samples: int, stick: "StickSpec | None" = None
+) -> np.ndarray:
     """(n, 3) sample points along the handle-side shaft in the wrist frame."""
-    R, p = stick_mount_transform(hand)
+    sp = _spec(hand, stick)
+    R, p = stick_mount_transform(hand, stick)
     z = np.linspace(
-        -STICK_LENGTH / 2.0, STICK_LENGTH / 2.0 - SHAFT_TIP_CLEAR, max(int(n_samples), 2)
+        sp.butt_sigma, sp.tip_sigma - SHAFT_TIP_CLEAR, max(int(n_samples), 2)
     )
     return np.stack([p + R @ np.array([0.0, 0.0, zi]) for zi in z], axis=0)
 
@@ -158,6 +276,17 @@ def _chain_to_joint(joints_by_child: dict[str, _UrdfJoint], target: _UrdfJoint) 
         link = j.parent
     chain.reverse()
     return chain
+
+
+def _autograd_tensor(t: torch.Tensor) -> torch.Tensor:
+    """Clone inference-mode buffers so they can be saved for backward.
+
+    ``ChainFK`` is often first constructed inside ``play_isaac``'s
+    ``inference_mode`` reset, which makes ``qidx_t`` / Rodrigues constants
+    inference tensors. ``tip_jacobian`` exits that mode and graphs ``q``, then
+    ``index_select`` still tries to save those constants.
+    """
+    return t.clone() if t.is_inference() else t
 
 
 class ChainFK:
@@ -285,9 +414,10 @@ class ChainFK:
         raw = self._chains[name]
         qidx, qidx_t = raw["qidx"], raw["qidx_t"]
         Rk, pk, K, K2 = ch["R"], ch["p"], ch["K"], ch["K2"]
+        Rk, pk, K, K2 = (_autograd_tensor(t) for t in (Rk, pk, K, K2))
         B = q.shape[0]
 
-        theta = q.index_select(1, qidx_t)  # (B, S) -- one gather, one sin/cos
+        theta = q.index_select(1, _autograd_tensor(qidx_t))  # (B, S) -- one gather, one sin/cos
         s = torch.sin(theta).unsqueeze(-1).unsqueeze(-1)
         c = torch.cos(theta).unsqueeze(-1).unsqueeze(-1)
         eye = torch.eye(3, device=q.device, dtype=q.dtype)
@@ -299,8 +429,8 @@ class ChainFK:
         for k in range(len(qidx)):
             p = p + (R @ pk[k].view(1, 3, 1)).squeeze(-1)
             R = R @ M[:, k]
-        p = p + (R @ ch["p_tail"].view(1, 3, 1)).squeeze(-1)
-        R = R @ ch["R_tail"]
+        p = p + (R @ _autograd_tensor(ch["p_tail"]).view(1, 3, 1)).squeeze(-1)
+        R = R @ _autograd_tensor(ch["R_tail"])
         return R, p
 
     def forward(self, q: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
@@ -312,7 +442,15 @@ class ChainFK:
 
     @staticmethod
     def points_world(R: torch.Tensor, p: torch.Tensor, local: torch.Tensor) -> torch.Tensor:
-        """Transform local points (P, 3) by batched frames -> (B, P, 3)."""
+        """Transform local points by batched frames -> ``(B, P, 3)``.
+
+        ``local`` is ``(P, 3)`` when every sample carries the SAME stick -- the
+        shipped case, one contraction -- or ``(B, P, 3)`` when the stick is
+        randomized per sample, which is the only shape change per-sample stick
+        geometry needs anywhere in the hot path.
+        """
+        if local.dim() == 3:
+            return p.unsqueeze(1) + torch.einsum("bij,bpj->bpi", R, local)
         return p.unsqueeze(1) + torch.einsum("bij,pj->bpi", R, local)
 
 

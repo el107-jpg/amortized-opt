@@ -2,6 +2,8 @@ Amortized trajectory optimizer for a two-stick **Unitree G1** drummer: a learned
 warm-start + cost model that replaces an online SQP, trained and evaluated
 against a batched analytic model of the plant (FK, RNEA, SDF, PD/FOH sim).
 
+Current-iteration index (input space, train recipe, scripts, live run): **`quick.md`**.
+
 This folder is **standalone**. It was extracted from `g1-drummer-lab-rythmic`
 and carries its own URDF, meshes, drum layout and rhythm clips under `assets/`.
 
@@ -37,30 +39,21 @@ constants from `amortized_opt`, never the reverse. `tests/test_standalone.py`
 enforces this statically and in a clean subprocess — if you add an
 `import isaaclab` anywhere under `amortized_opt/`, that test fails.
 
-## Two files still need the original repo
+## One file still needs the original repo
 
-Both are benchmarking/playback tools, not part of the system, and both fail with
-a clear message rather than a traceback when the repo is absent:
+A benchmarking tool, not part of the system; it fails with a clear message
+rather than a traceback when the repo is absent:
 
 * `scripts/repo_adapters/trajopt_hpipm_planner.py` — the trajopt SQP baseline
   the amortized optimizer is measured against.
-* `scripts/play_isaac.py` — drives the *repo's* `G1DrummerEnv`
-  (`Isaac-G1-Drum-Direct-v0`), a 13k-line task with its own hit detector and
-  reward. The standalone env is `isaac_rl_ppo/env.py`; use its own scripts
-  (`isaac_rl_ppo/scripts/smoke_rl.py`) for playback that does not need the repo.
 
-Point them at a checkout with `--add-dir` / `REPO_ROOT` if you want them.
+Point it at a checkout with `--add-dir` / `REPO_ROOT` if you want it.
+(`scripts/play_isaac.py` used to be the second such file, but the `g1drum`
+conda env from the preamble ships `g1_drummer` pip-installed from the
+checkout, so it runs there as-is.)
 
 ## Gotchas
 
-* **`simplified_cost` is the default** and `validate()` silently zeroes ~12
-  weights, including the impact-speed floor — the declared defaults are not what
-  the solver sees. Check `amortized_opt/train_cost.py` before trusting a weight.
-* **GPUs 0 and 2 are often held** by other sessions on this box; the test
-  conftest picks 1 or 3. Override with `AMORTIZED_TEST_DEVICE=cuda:3` or `cpu`.
-  A "NoneType has no attribute create_articulation_view" crash in Isaac is
-  really VRAM exhaustion on *physical* GPU 0 — use `CUDA_VISIBLE_DEVICES`,
-  `--device` does not move the allocation.
 * **The composed G1-with-sticks USD is a cache**, rebuilt under
   `assets/robots/_generated/` whenever `g1_scene/g1.py` or the upstream USD is
   newer. Redirect it with `$AMORTIZED_USD_CACHE` if the checkout is read-only.
@@ -68,6 +61,15 @@ Point them at a checkout with `--add-dir` / `REPO_ROOT` if you want them.
   `g1_scene/g1.py` imports it to author the PhysX colliders, so the simulated
   stick and the tip the cost function scores cannot drift.
   `tests/test_g1_scene.py` pins them to machine epsilon.
+* **Resume LR is absolute step**, not “fresh cosine from this job.”
+  `Phase2Config.lr_at(step)` decays against `--lr-horizon` using the
+  checkpoint’s step. A 59k resume with `LR_HORIZON=60000` is already at the
+  ~5e-6 floor. Encoder-only terms (gated P/R distill, hold-band hinge `hB`)
+  cannot walk the head there — `pr` stays glued and `hB` plateaus even when
+  the loss is on. **When adding or changing those terms, reset the LR
+  schedule** (raise `--lr-horizon` so the cosine is not at the floor). Do not
+  reuse the parent run’s leftover decay. `hB` in the train line is mean
+  `relu(|sp − clamp(q0)| − band)` mrad; the encoder still does not see `q0`.
 
 ## Testing
 
@@ -75,3 +77,5 @@ Point them at a checkout with `--add-dir` / `REPO_ROOT` if you want them.
 pytest -q                      # repo-dependent tests SKIP, they do not fail
 pytest -q tests/test_standalone.py tests/test_g1_scene.py
 ```
+
+When you run your things in shell, clean up the shell after you are done. Do not leave dead things running and taking up memory and compute

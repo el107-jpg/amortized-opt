@@ -269,7 +269,8 @@ def main() -> None:
           f"accepted {m_pert['accepted']:.2f} -> {m_opt['accepted']:.2f} "
           f"(trajopt {m_ref['accepted']:.2f})")
     print("  (contact_pos_err_mm is distance to the AIM point; "
-          "w_terminal_aim = 0 by default, so the cost does not price it)")
+          "CostConfig.w_terminal_aim = 0 by default, so validate() does not "
+          "price it; phase2_cost_config turns on a weak in-plane pull)")
 
     # ---------------------------------------------------- 4. finiteness ----
     print("\n== 4. gradient finiteness at training scale ==")

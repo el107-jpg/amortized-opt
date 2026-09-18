@@ -127,6 +127,20 @@ class WaypointMasks:
     elem_mask: torch.Tensor  # (B, H, N_DOF) float
     token_mask: torch.Tensor  # (B, H) bool
     point_mask: torch.Tensor  # (B, H, N_FK_POINTS) float
+    #: ``(B, 2)`` seconds: each hand's OWN scheduled strike, ``[:, 0]`` = left.
+    #: This is the current-goal countdown, carried on the masks so it reaches
+    #: the DECODER (``ModelConfig.dec_tth_feats``) without any producer changing
+    #: its call signature -- every masks producer in the tree goes through
+    #: :func:`build_waypoint_masks`.  It moved off the encoder because a from-now
+    #: countdown ticks down every 20 ms and forced the deployment MPC to
+    #: re-encode the context every tick (``isaac_rl/README.md`` DECISION 2),
+    #: which is what let robot state echo back into the encoder.
+    #:
+    #: It is NOT ``tau0_*``: those are the RESOLVED horizons, so an idle hand's
+    #: ``tau0`` is the other hand's horizon, borrowed for masking.  ``hit_tth``
+    #: is exactly 0 on a hand with no scheduled strike, and an active hand's
+    #: hit is never nearer than one waypoint, so 0 is unambiguously "idle".
+    hit_tth: torch.Tensor  # (B, 2)
 
     def to(self, device) -> "WaypointMasks":
         return WaypointMasks(**{k: getattr(self, k).to(device) for k in self.__dataclass_fields__})
@@ -185,6 +199,16 @@ def build_waypoint_masks(
     elements are predicted over the other hand's horizon, and if neither hand
     is active the whole grid is used. That keeps an idle arm under the model's
     control instead of dropping it from the loss.
+
+    ``hit_tth`` reports the times as PASSED for an active hand and exactly 0 for
+    an inactive one.  The gate is here rather than left to the consumer because
+    the callers disagree about what they pass for an idle hand -- the deployment
+    MPCs pass ``hit_index.clamp_min(0) * dt`` (0) while ``MPCRoller.masks``
+    passes ``effective_hits`` (the BORROWED horizon) -- and the decoder, which
+    is the only consumer, has no activity mask of its own to gate with.  Ungated
+    the same idle hand would carry a different decoder input in training than at
+    deployment, which is the silent distribution bug this whole seam exists to
+    avoid.
     """
     tl = hit_time_left
     tr = hit_time_right
@@ -225,6 +249,10 @@ def build_waypoint_masks(
         elem_mask=elem,
         token_mask=valid_any > 0.5,
         point_mask=point,
+        hit_tth=torch.stack(
+            [torch.where(al, tl, torch.zeros_like(tl)),
+             torch.where(ar, tr, torch.zeros_like(tr))], dim=-1
+        ),
     )
 
 
@@ -238,13 +266,14 @@ def pack_state(q: torch.Tensor, qd: torch.Tensor) -> torch.Tensor:
 DRUM_FEAT_DIM: int = 9
 #: Goal / future-hit token payload width (see :func:`context_features`).
 GOAL_RAW_DIM: int = 18  # hit pos(3), hit pos rel head(3), vel(3), speed, geom(8)
-#: IDLE-HOME token payload width: the park pose the hand is being asked to hold.
-#: ``home arm joints(7)`` + ``home stick-tip position(3)``.  The joint block is
-#: the one the decoder must actually emit, in its own units; the tip position
-#: gives the token a spatial anchor comparable to the drum / goal tokens, so the
-#: encoder can relate "where I am parked" to "where the kit is".
-IDLE_RAW_DIM: int = 10
-#: Arm joints per hand -- the width of the home-pose block.
+#: IDLE-CYLINDER token payload width: packed torso-frame safety cylinder.
+#: ``center(3) + axis(3) + radius + half_height`` -- see
+#: :class:`~amortized_opt.idle_cylinder.IdleCylinder.pack`.  Same width for
+#: both hands; a busy hand's row is zeroed via ``idle_valid``.
+IDLE_RAW_DIM: int = 8
+#: Stick token payload: axis (3) + tip offset (3) + length (1).
+STICK_RAW_DIM: int = 7
+#: Arm joints per hand -- kept for callers that still reason about arm width.
 N_ARM_JOINTS: int = 7
 
 
@@ -272,20 +301,51 @@ class ContextInputs:
     future_drum: torch.Tensor  # (B, 2, F) long
     future_pos: torch.Tensor  # (B, 2, F, 3)
     future_vel: torch.Tensor  # (B, 2, F, 3)
-    future_tth: torch.Tensor  # (B, 2, F)
+    #: HIT-RELATIVE future timing: the gap from this hand's CURRENT goal strike
+    #: to future hit ``j``, seconds -- not a time-to-hit from now.  A from-now
+    #: quantity ticks down every 20 ms and forces the deployment MPC to re-encode
+    #: the whole context every tick (``isaac_rl/README.md`` DECISION 2), which is
+    #: what let robot state echo back into the encoder and ran the waist away in
+    #: closed loop.  The gap is CONSTANT inside a goal segment, it is the
+    #: musically meaningful number ("how long to relocate after this hit"), and
+    #: it is what pose selection at the strike actually needs.  A hand with NO
+    #: active current goal has no strike to measure from and falls back to
+    #: anchoring at now, so ``future_gap[..., 0]`` is then its plain
+    #: time-to-hit -- which is exactly what the IDLE token reads it as.
+    future_gap: torch.Tensor  # (B, 2, F)
     future_valid: torch.Tensor  # (B, 2, F) bool
 
     # ---- the IDLE arm's "goal" ---------------------------------------------
     #: A hand with no scheduled strike has no goal token -- its row is zeroed and
     #: masked out of the encoder entirely, so the only thing the context says
-    #: about it is *absence*.  These three fields give it a goal of its own: the
-    #: park posture it is being asked to hold (see
-    #: :mod:`~amortized_opt.idle_home`).  ``idle_valid`` is normally
+    #: about it is *absence*.  These fields give it a goal of its own: the
+    #: torso-frame safety cylinder its tip must stay inside (see
+    #: :mod:`~amortized_opt.idle_cylinder`).  ``idle_valid`` is normally
     #: ``~goal_valid``, but it is carried explicitly rather than derived so a
-    #: caller with no home table simply leaves it False and the token is absent.
-    idle_home_q: torch.Tensor = None      # (B, 2, 7) home arm joints
-    idle_home_tip: torch.Tensor = None    # (B, 2, 3) home stick-tip position
+    #: caller with no cylinder simply leaves it False and the token is absent.
+    idle_cyl: torch.Tensor = None         # (B, 2, 8) packed IdleCylinder
     idle_valid: torch.Tensor = None       # (B, 2) bool
+    #: THE STICK.  Per-hand geometry of the stick actually fitted this sample
+    #: (:class:`~amortized_opt.fk.StickSpec`).  Constant across a run until
+    #: ``StickRandomization`` is switched on; carried in the context because a
+    #: randomized stick the model is not TOLD about is unlearnable noise -- the
+    #: same trap the drum jitter fell into.  ``stick_valid`` is False when the
+    #: caller has no per-sample stick, and the token is then masked out.
+    stick_axis: torch.Tensor = None       # (B, 2, 3) handle->tip, wrist frame
+    stick_tip: torch.Tensor = None        # (B, 2, 3) tip offset, wrist frame
+    stick_length: torch.Tensor = None     # (B, 2) metres
+    stick_valid: torch.Tensor = None      # (B, 2) bool
+    #: THE WAIST-YAW SET-POINT INPUTS (``ModelConfig.waist_sp_head``).
+    #: ``yaw_now`` is the waist yaw at the moment the encoder runs; ``aim_yaw``
+    #: is the analytic :func:`~amortized_opt.waist_aim.aim_yaw` command computed
+    #: from the ACTIVE current goals at that yaw.  The head predicts a residual
+    #: ON TOP of ``aim_yaw``, so the untrained model is exactly the analytic
+    #: law.  ``aim_valid`` False means the caller supplied neither (an old pool
+    #: or a call site without robot state); the head then falls back to
+    #: ``yaw_now``, i.e. "hold where you are".
+    yaw_now: torch.Tensor = None          # (B,) rad
+    aim_yaw: torch.Tensor = None          # (B,) rad
+    aim_valid: torch.Tensor = None        # (B,) bool
 
     def __post_init__(self) -> None:
         """Materialize the idle block when a caller omits it.
@@ -293,19 +353,31 @@ class ContextInputs:
         ``CONTEXT_FIELDS`` is derived from these dataclass fields and the data
         pipeline iterates it with ``getattr(ctx, f)``, so every field has to be a
         real tensor.  Defaulting to zeros + ``idle_valid = False`` is exactly
-        "this context carries no idle-home target", which is what a caller
-        without a home table means -- and it keeps every pre-existing call site
+        "this context carries no idle-cylinder target", which is what a caller
+        without a cylinder means -- and it keeps every pre-existing call site
         (and every pool cached before the field existed) working unchanged.
         """
         ref = self.drum_pos
         B = int(ref.shape[0])
         f = dict(device=ref.device, dtype=ref.dtype)
-        if self.idle_home_q is None:
-            self.idle_home_q = torch.zeros(B, 2, N_ARM_JOINTS, **f)
-        if self.idle_home_tip is None:
-            self.idle_home_tip = torch.zeros(B, 2, 3, **f)
+        if self.idle_cyl is None:
+            self.idle_cyl = torch.zeros(B, 2, IDLE_RAW_DIM, **f)
         if self.idle_valid is None:
             self.idle_valid = torch.zeros(B, 2, device=ref.device, dtype=torch.bool)
+        if self.stick_axis is None:
+            self.stick_axis = torch.zeros(B, 2, 3, **f)
+        if self.stick_tip is None:
+            self.stick_tip = torch.zeros(B, 2, 3, **f)
+        if self.stick_length is None:
+            self.stick_length = torch.zeros(B, 2, **f)
+        if self.stick_valid is None:
+            self.stick_valid = torch.zeros(B, 2, device=ref.device, dtype=torch.bool)
+        if self.yaw_now is None:
+            self.yaw_now = torch.zeros(B, **f)
+        if self.aim_yaw is None:
+            self.aim_yaw = torch.zeros(B, **f)
+        if self.aim_valid is None:
+            self.aim_valid = torch.zeros(B, device=ref.device, dtype=torch.bool)
 
     @property
     def batch(self) -> int:
@@ -350,11 +422,14 @@ class ContextInputs:
             future_drum=torch.zeros(batch, 2, num_future, device=device, dtype=torch.long),
             future_pos=torch.zeros(batch, 2, num_future, 3, **f),
             future_vel=torch.zeros(batch, 2, num_future, 3, **f),
-            future_tth=torch.zeros(batch, 2, num_future, **f),
+            future_gap=torch.zeros(batch, 2, num_future, **f),
             future_valid=torch.zeros(batch, 2, num_future, **b),
-            idle_home_q=torch.zeros(batch, 2, N_ARM_JOINTS, **f),
-            idle_home_tip=torch.zeros(batch, 2, 3, **f),
+            idle_cyl=torch.zeros(batch, 2, IDLE_RAW_DIM, **f),
             idle_valid=torch.zeros(batch, 2, **b),
+            stick_axis=torch.zeros(batch, 2, 3, **f),
+            stick_tip=torch.zeros(batch, 2, 3, **f),
+            stick_length=torch.zeros(batch, 2, **f),
+            stick_valid=torch.zeros(batch, 2, **b),
         )
 
 
@@ -448,13 +523,28 @@ def goal_features(
 
 
 def idle_features(ctx: ContextInputs) -> torch.Tensor:
-    """``(B, 2, IDLE_RAW_DIM)`` idle-home payload, zeroed on hands that are busy.
+    """``(B, 2, IDLE_RAW_DIM)`` idle-cylinder payload, zeroed on hands that are busy.
 
     The idle counterpart of :func:`goal_features`: where a goal token says "put
-    the stick HERE, moving THAT fast, at time t", the idle token says "hold this
-    arm posture, whose tip sits there".  Zeroed (and, in the encoder, masked out)
-    for any hand that has a scheduled strike, so a hand can never be handed both
-    a strike target and a park target at once.
+    the stick HERE, moving THAT fast, at time t", the idle token says "keep the
+    tip inside this torso-frame cylinder".  Zeroed (and, in the encoder, masked
+    out) for any hand that has a scheduled strike, so a hand can never be handed
+    both a strike target and a park target at once.
     """
-    feat = torch.cat([ctx.idle_home_q, ctx.idle_home_tip], dim=-1)
-    return feat * ctx.idle_valid.unsqueeze(-1).to(feat.dtype)
+    return ctx.idle_cyl * ctx.idle_valid.unsqueeze(-1).to(ctx.idle_cyl.dtype)
+
+
+def stick_features(ctx: ContextInputs) -> torch.Tensor:
+    """``(B, 2, STICK_RAW_DIM)`` stick payload, zeroed where invalid.
+
+    Axis and tip offset are in the WRIST frame, which is where they are
+    constant for a given stick -- expressing them in the world would make the
+    token a function of the arm pose and tell the model nothing about the
+    hardware.  Length is carried explicitly even though it is implied by the
+    tip offset: it is the quantity that changes the lever arm, and the decoder
+    should not have to infer it through a norm.
+    """
+    feat = torch.cat(
+        [ctx.stick_axis, ctx.stick_tip, ctx.stick_length.unsqueeze(-1)], dim=-1
+    )
+    return feat * ctx.stick_valid.unsqueeze(-1).to(feat.dtype)

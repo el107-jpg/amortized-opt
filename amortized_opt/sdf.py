@@ -1,15 +1,21 @@
 """Differentiable analytic signed-distance penalty over the drum scene.
 
-Vendored from ``control/safety/sdf_torch.py`` with two changes:
+Collision geometry matches :class:`~amortized_opt.cost.FusedCost` and
+:class:`~amortized_opt.eval_harness.TrajectoryScorer`: each hand is a stick
+capsule (butt→tip) plus a wrist sphere, scored against every drum body /
+under-volume and against the torso capsule / head sphere.  A target-drum
+exemption covers the stick capsule (a hit is contact); the wrist is never
+exempted.
 
-* **Branch-free target-drum exemption.** The original built the exemption
-  one-hot with ``if bool(valid.any()): onehot[rows, tgt[rows]] = 1.0`` -- a
-  device->host sync inside the hand loop. Replaced by
-  ``F.one_hot(tgt.clamp(min=0), D) * (tgt >= 0)``.
-* **Externally-computed FK.** ``forward(..., frames=...)`` accepts a frame dict
-  from a single shared :class:`~amortized_opt.fk.ChainFK` pass so a fused cost
-  head runs FK once for the SDF, the aux outputs and the torque rows. Passing
-  ``q`` alone keeps the internal-FK convenience path.
+The original repo class was a tip/shaft/wrist **point cloud**.  This module
+kept that form for bit-match tests; those tests now skip.  Callers -- start
+sampling, MPC screening, idle-home, the Isaac safety filter -- share this
+capsule path so they cannot accept a pose the cost would reject for a shaft
+through a pad.
+
+``forward(..., frames=...)`` accepts a frame dict from a shared
+:class:`~amortized_opt.fk.ChainFK` pass.  Passing ``q`` alone keeps the
+internal-FK convenience path.
 
 The layout is loaded from ``amortized/assets/drum_kit_layout.yaml`` by default.
 """
@@ -35,6 +41,15 @@ from .constants import (
 from .fk import ChainFK, stick_shaft_offsets, stick_tip_offset
 
 _EPS = 1.0e-9
+#: Floor for 1-D parameter solves (s along a segment).  ``_EPS**2`` (1e-18)
+#: makes ``s = q / den`` overflow float32 grads on a degenerate (zero-length
+#: or edge-on) segment and those NaNs show up in ``FusedCost`` on pads, whose
+#: playing shaft collapses to a point.
+_DEN = 1.0e-8
+#: Floor under ``sqrt(discriminant)`` in :func:`_quad_roots_01`.  A double root
+#: (stick tangent to a drum wall or the legal hit rim) has ``Δ = 0``; ``sqrt``
+#: is finite there but ``d(sqrt)/dΔ`` is inf, and those NaNs reach ``FusedCost``.
+_DISC_EPS = 1.0e-12
 
 
 def _unit_np(v: np.ndarray) -> np.ndarray:
@@ -145,6 +160,345 @@ def point_sphere_sdf(x: torch.Tensor, center: torch.Tensor, radius: float) -> to
     return torch.sqrt((d * d).sum(dim=-1) + _EPS**2) - radius
 
 
+def segment_segment_sdf(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    b0: torch.Tensor,
+    b1: torch.Tensor,
+    ra: float | torch.Tensor = 0.0,
+    rb: float | torch.Tensor = 0.0,
+) -> torch.Tensor:
+    """Capsule-capsule signed distance between segments ``[a0,a1]``/``[b0,b1]``.
+
+    ``|closest(A, B)| - ra - rb``, i.e. the gap between the two capsule
+    SURFACES: negative means the capsules interpenetrate.  Every input
+    broadcasts on the leading dims and carries the 3-vector in the last one, so
+    a ``(B, S, 3)`` pair of sticks costs one call.
+
+    The math is the textbook clamped closest-point-between-segments (Ericson,
+    *Real-Time Collision Detection* §5.1.9) with its endpoint fix-up written as
+    two plain coordinate-descent steps, which is what makes it branch-free.
+    With ``d1 = a1 - a0``, ``d2 = b1 - b0``, ``r = a0 - b0``::
+
+        A = d1.d1   E = d2.d2   B = d1.d2   C = d1.r   F = d2.r
+        den = A*E - B*B                        (>= 0, zero iff parallel)
+        s = clamp((B*F - C*E) / den, 0, 1)      [den > eps; else s = 0]
+        t = clamp((B*s + F) / E, 0, 1)          best t for that s
+        s = clamp((B*t - C) / A, 0, 1)          best s for that t
+        d = |(a0 + s*d1) - (b0 + t*d2)| - ra - rb
+
+    The two clamped re-solves ARE Ericson's ``t<0 -> s = clamp(-C/A)`` /
+    ``t>1 -> s = clamp((B-C)/A)`` branches -- substitute ``t = 0`` / ``t = 1``
+    into the third line and they fall out -- and at an interior optimum each is
+    a no-op, because ``s`` already minimizes the distance for that ``t``.
+    Running the third line unconditionally is what makes the DEGENERATE cases
+    right as well: when ``b`` collapses to a point, ``den`` and ``t`` are both
+    zero and it is the only line that finds the foot of the perpendicular on
+    ``a``.  Dropping it (the literal transcription of the branchy original)
+    returns ``|a0 - b0|`` instead, and the function is then not even symmetric
+    in its two arguments.
+
+    DEGENERACIES.  ``den``, ``A`` and ``E`` are clamped away from zero *before*
+    any division, so parallel segments (``den -> 0``) and zero-length ones
+    (``A`` or ``E`` ``-> 0``) take the clamped path rather than dividing by
+    zero -- and the unselected branch of the one :func:`torch.where` is finite
+    too, which is what keeps the BACKWARD pass NaN-free (``where`` propagates a
+    NaN gradient from the branch it did not take).  A zero-length segment is
+    therefore a legal sphere: pass ``a0 == a1`` to price a wrist ball against a
+    stick.  The final norm is ``sqrt(|d|^2 + eps^2)``, so touching axes (exact
+    zero distance) stay differentiable, exactly as :func:`point_capsule_sdf`
+    does it.
+    """
+    d1 = a1 - a0
+    d2 = b1 - b0
+    r = a0 - b0
+    A = (d1 * d1).sum(dim=-1)
+    E = (d2 * d2).sum(dim=-1)
+    B = (d1 * d2).sum(dim=-1)
+    C = (d1 * r).sum(dim=-1)
+    F = (d2 * r).sum(dim=-1)
+    A_s = A.clamp_min(_EPS**2)
+    E_s = E.clamp_min(_EPS**2)
+    den = A * E - B * B
+    den_s = den.clamp_min(_EPS**2)
+    # Interior solution; parallel (den ~ 0) falls back to s = 0 and lets the
+    # t-clamp below place the pair, which is the standard degenerate branch.
+    s_int = ((B * F - C * E) / den_s).clamp(0.0, 1.0)
+    s = torch.where(den > _EPS, s_int, torch.zeros_like(s_int))
+    t = ((B * s + F) / E_s).clamp(0.0, 1.0)
+    s = ((B * t - C) / A_s).clamp(0.0, 1.0)
+    diff = (a0 + s.unsqueeze(-1) * d1) - (b0 + t.unsqueeze(-1) * d2)
+    dist = torch.sqrt((diff * diff).sum(dim=-1) + _EPS**2)
+    return dist - ra - rb
+
+
+def _match_lead(x, ref: torch.Tensor) -> torch.Tensor:
+    """Broadcast ``x`` to the leading shape of a 3-vector ``ref`` ``(..., 3)``."""
+    lead = ref.shape[:-1]
+    if not torch.is_tensor(x):
+        # ``new_tensor`` from a Python float is a CUDA host sync.
+        x = torch.full(
+            (),
+            float(x) if np.ndim(x) == 0 else float(np.asarray(x, dtype=float).reshape(-1)[0]),
+            device=ref.device,
+            dtype=ref.dtype,
+        )
+    else:
+        x = x.to(device=ref.device, dtype=ref.dtype)
+    while x.ndim < len(lead):
+        x = x.unsqueeze(0)
+    return x.expand(*lead) if x.shape != lead else x
+
+
+def hit_region_dist(
+    p: torch.Tensor,
+    p_star: torch.Tensor,
+    n_out: torch.Tensor,
+    hit_R: torch.Tensor | float,
+    disk_offset: torch.Tensor,
+    half_plane_dir: torch.Tensor,
+    has_half_plane: torch.Tensor | float,
+    axial_lo: torch.Tensor | float,
+    axial_hi: torch.Tensor | float,
+    *,
+    margin: torch.Tensor | float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hypot distance of points ``p`` to the legal hit cylinder.
+
+    ``dist = hypot(r_disk, r_hp, r_ax)`` with the same residuals
+    :meth:`~amortized_opt.cost.FusedCost._terminal` and
+    :meth:`~amortized_opt.eval_harness.TrajectoryScorer.score` share.
+    ``dist == 0`` iff the point is in the (optionally expanded) region.
+    Returns ``(dist, axial, d_in)``.
+    """
+    p, p_star, n_out, disk_offset, half_plane_dir = torch.broadcast_tensors(
+        p, p_star, n_out, disk_offset, half_plane_dir
+    )
+    hit_R = _match_lead(hit_R, p)
+    has_hp = _match_lead(has_half_plane, p)
+    lo = _match_lead(axial_lo, p)
+    hi = _match_lead(axial_hi, p)
+    m = _match_lead(margin, p)
+    e = p - p_star
+    axial = (e * n_out).sum(dim=-1)
+    d_in = e - axial.unsqueeze(-1) * n_out - disk_offset
+    rho = torch.sqrt((d_in * d_in).sum(dim=-1) + _EPS**2)
+    r_disk = (rho - (hit_R + m)).clamp_min(0.0)
+    hp = (d_in * half_plane_dir).sum(dim=-1)
+    r_hp = (-hp - m).clamp_min(0.0) * has_hp
+    r_ax = (axial - (hi + m)).clamp_min(0.0) + ((lo - m) - axial).clamp_min(0.0)
+    dist = torch.sqrt(r_disk * r_disk + r_hp * r_hp + r_ax * r_ax + _EPS**2) - _EPS
+    return dist, axial, d_in
+
+
+def _quad_roots_01(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``A s^2 + B s + C = 0`` on ``[0, 1]``.  Invalid roots are 0 with valid=0.
+
+    Unused branches are evaluated on dummy well-conditioned coefficients so a
+    degenerate (A=B=0) segment cannot inject 0/0 NaNs into the backward pass.
+    The dummy is ``s^2 - 1 = 0`` (``Δ = 4``), not ``s^2 = 0``: ``torch.where``
+    still backprops through the unselected branch, and ``sqrt(0)`` is inf there.
+    Live discriminants are floored at ``_DISC_EPS`` for the same reason -- a
+    grazing (double) root is a legal geometry, not a dummy.
+    """
+    quad = (B * B - 4.0 * A * C >= 0.0) & (A.abs() > _EPS)
+    lin = (A.abs() <= _EPS) & (B.abs() > _EPS)
+    A_q = torch.where(quad, A, torch.ones_like(A))
+    B_q = torch.where(quad, B, torch.zeros_like(B))
+    C_q = torch.where(quad, C, -torch.ones_like(C))
+    disc = (B_q * B_q - 4.0 * A_q * C_q).clamp_min(_DISC_EPS)
+    den = (2.0 * A_q).abs().clamp_min(_DEN) * torch.where(
+        A_q >= 0.0, torch.ones_like(A_q), -torch.ones_like(A_q)
+    )
+    sqrt_d = torch.sqrt(disc)
+    s_p = (-B_q + sqrt_d) / den
+    s_m = (-B_q - sqrt_d) / den
+    B_l = torch.where(lin, B, torch.ones_like(B))
+    C_l = torch.where(lin, C, torch.zeros_like(C))
+    s_lin = -C_l / B_l
+    s_p = torch.where(lin, s_lin, s_p).clamp(-10.0, 10.0)
+    s_m = torch.where(lin, s_lin, s_m).clamp(-10.0, 10.0)
+    v_p = ((quad & (s_p >= 0.0) & (s_p <= 1.0)) | (lin & (s_p >= 0.0) & (s_p <= 1.0))).to(A.dtype)
+    v_m = (quad & (s_m >= 0.0) & (s_m <= 1.0) & ~lin).to(A.dtype)
+    s_p = torch.where(v_p > 0.5, s_p, torch.zeros_like(s_p))
+    s_m = torch.where(v_m > 0.5, s_m, torch.zeros_like(s_m))
+    return s_p, s_m, v_p, v_m
+
+
+def _interior_01(
+    numer: torch.Tensor, denom: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``s = -numer/denom`` on ``(0, 1)`` (open), invalid -> ``(0, 0)``."""
+    live = denom.abs() > _EPS
+    den = torch.where(live, denom, torch.ones_like(denom))
+    num = torch.where(live, numer, torch.zeros_like(numer))
+    s = (-num / den).clamp(-10.0, 10.0)
+    valid = (live & (s > 0.0) & (s < 1.0)).to(numer.dtype)
+    s = torch.where(valid > 0.5, s, torch.zeros_like(s))
+    return s, valid
+
+
+def segment_hit_region(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    p_star: torch.Tensor,
+    n_out: torch.Tensor,
+    hit_R: torch.Tensor | float,
+    disk_offset: torch.Tensor,
+    half_plane_dir: torch.Tensor,
+    has_half_plane: torch.Tensor | float,
+    axial_lo: torch.Tensor | float,
+    axial_hi: torch.Tensor | float,
+    *,
+    margin: torch.Tensor | float = 0.0,
+    return_candidates: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Exact min of :func:`hit_region_dist` along the segment ``[a, b]``.
+
+    ``dist(s)`` is convex.  The min is the best of O(1) critical points:
+    endpoints, closest in-plane to the disk centre, ``||d_in|| = R`` (0-2
+    roots), the half-plane crossing, and the two axial-slab faces.  Grip /
+    stick radius are NOT folded in; hit membership is the same hypot metric
+    as a single point, minimized over the playing-shaft continuum.
+
+    Returns ``(dist, s, p_contact)`` with ``p_contact = a + s (b - a)``,
+    ``s`` in ``[0, 1]``.  Every input broadcasts on the leading dims.
+
+    With ``return_candidates=True`` also returns ``(cand_s, cand_dist,
+    cand_valid)`` each ``(..., C)`` so a training head can softmin over the
+    same points the hard min uses.
+    """
+    a, b, p_star, n_out, disk_offset, half_plane_dir = torch.broadcast_tensors(
+        a, b, p_star, n_out, disk_offset, half_plane_dir
+    )
+    hit_R_t = _match_lead(hit_R, a)
+    has_hp = _match_lead(has_half_plane, a)
+    lo = _match_lead(axial_lo, a)
+    hi = _match_lead(axial_hi, a)
+    mrg = _match_lead(margin, a)
+    d = b - a
+    e0 = a - p_star
+    ax0 = (e0 * n_out).sum(dim=-1)
+    ax1 = (d * n_out).sum(dim=-1)
+    q0 = e0 - ax0.unsqueeze(-1) * n_out - disk_offset
+    q1 = d - ax1.unsqueeze(-1) * n_out
+    q00 = (q0 * q0).sum(dim=-1)
+    q01 = (q0 * q1).sum(dim=-1)
+    q11 = (q1 * q1).sum(dim=-1)
+    R_eff = hit_R_t + mrg
+
+    z = torch.zeros_like(ax0)
+    o = torch.ones_like(ax0)
+    # Closest in-plane is a clamped endpoint projection: always on the segment.
+    live = q11 > 1.0e-6
+    q11_s = torch.where(live, q11, torch.ones_like(q11))
+    q01_s = torch.where(live, q01, torch.zeros_like(q01))
+    s_rho_cl = torch.where(
+        live, (-q01_s / (q11_s + _DEN)).clamp(0.0, 1.0), torch.zeros_like(q01)
+    )
+    s_circ_p, s_circ_m, v_circ_p, v_circ_m = _quad_roots_01(
+        q11, 2.0 * q01, q00 - R_eff * R_eff
+    )
+    hp0 = (q0 * half_plane_dir).sum(dim=-1)
+    hp1 = (q1 * half_plane_dir).sum(dim=-1)
+    # Expanded half-plane boundary is ``hp = -margin``.
+    s_hp, v_hp = _interior_01(hp0 + mrg, hp1)
+    v_hp = v_hp * has_hp
+    s_lo, v_lo = _interior_01(ax0 - (lo - mrg), ax1)
+    s_hi, v_hi = _interior_01(ax0 - (hi + mrg), ax1)
+
+    cand_s = torch.stack(
+        [z, o, s_rho_cl, s_circ_p, s_circ_m, s_hp, s_lo, s_hi], dim=-1
+    )
+    cand_valid = torch.stack(
+        [o, o, o, v_circ_p, v_circ_m, v_hp, v_lo, v_hi], dim=-1
+    )
+    p = a.unsqueeze(-2) + cand_s.unsqueeze(-1) * d.unsqueeze(-2)
+    cand_dist, _, _ = hit_region_dist(
+        p,
+        p_star.unsqueeze(-2),
+        n_out.unsqueeze(-2),
+        hit_R_t.unsqueeze(-1),
+        disk_offset.unsqueeze(-2),
+        half_plane_dir.unsqueeze(-2),
+        has_hp.unsqueeze(-1),
+        lo.unsqueeze(-1),
+        hi.unsqueeze(-1),
+        margin=mrg.unsqueeze(-1),
+    )
+    big = 1.0e3
+    scored = cand_dist + big * (1.0 - cand_valid)
+    dist = scored.amin(dim=-1)
+    idx = scored.argmin(dim=-1)
+    s = cand_s.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+    p_contact = a + s.unsqueeze(-1) * d
+    if return_candidates:
+        return dist, s, p_contact, cand_s, cand_dist, cand_valid
+    return dist, s, p_contact
+
+
+def segment_cylinder_sdf(
+    a0: torch.Tensor,
+    a1: torch.Tensor,
+    center: torch.Tensor,
+    axis: torch.Tensor,
+    radius: torch.Tensor | float,
+    half_height: torch.Tensor | float,
+    ra: float | torch.Tensor = 0.0,
+) -> torch.Tensor:
+    """Signed distance from capsule ``[a0, a1]`` (radius ``ra``) to a capped cylinder.
+
+    Min of :func:`point_cylinder_sdf` along the segment, minus ``ra``.  Critical
+    points: endpoints, closest approach to the axis, the two cap planes, and
+    ``rho = R`` on the side wall.  Denominators are clamped like
+    :func:`segment_segment_sdf`.
+    """
+    a0, a1, center, axis = torch.broadcast_tensors(a0, a1, center, axis)
+    radius = _match_lead(radius, a0)
+    half_height = _match_lead(half_height, a0)
+    d = a1 - a0
+    u0 = a0 - center
+    z0 = (u0 * axis).sum(dim=-1)
+    z1 = (d * axis).sum(dim=-1)
+    q0 = u0 - z0.unsqueeze(-1) * axis
+    q1 = d - z1.unsqueeze(-1) * axis
+    q00 = (q0 * q0).sum(dim=-1)
+    q01 = (q0 * q1).sum(dim=-1)
+    q11 = (q1 * q1).sum(dim=-1)
+    live = q11 > 1.0e-6
+    q11_s = torch.where(live, q11, torch.ones_like(q11))
+    q01_s = torch.where(live, q01, torch.zeros_like(q01))
+    s_rho = torch.where(
+        live, (-q01_s / (q11_s + _DEN)).clamp(0.0, 1.0), torch.zeros_like(q01)
+    )
+    z = torch.zeros_like(z0)
+    o = torch.ones_like(z0)
+    s_cap_p, v_cap_p = _interior_01(z0 - half_height, z1)
+    s_cap_m, v_cap_m = _interior_01(z0 + half_height, z1)
+    s_side_p, s_side_m, v_side_p, v_side_m = _quad_roots_01(
+        q11, 2.0 * q01, q00 - radius * radius
+    )
+    cand_s = torch.stack(
+        [z, o, s_rho, s_cap_p, s_cap_m, s_side_p, s_side_m], dim=-1
+    )
+    cand_valid = torch.stack(
+        [o, o, o, v_cap_p, v_cap_m, v_side_p, v_side_m], dim=-1
+    )
+    p = a0.unsqueeze(-2) + cand_s.unsqueeze(-1) * d.unsqueeze(-2)
+    sdf = point_cylinder_sdf(
+        p,
+        center.unsqueeze(-2),
+        axis.unsqueeze(-2),
+        radius.unsqueeze(-1),
+        half_height.unsqueeze(-1),
+    )
+    big = 1.0e3
+    scored = sdf + big * (1.0 - cand_valid)
+    return scored.amin(dim=-1) - ra
+
+
 @dataclass
 class SdfPenaltyDetails:
     """Diagnostics from one :class:`SdfPenalty` call (all detached)."""
@@ -157,7 +511,10 @@ class SdfPenaltyDetails:
 
 
 class SdfPenalty:
-    """hinge(margin - SDF)^p summed over collision pairs, batched + differentiable."""
+    """hinge(margin - SDF)^p summed over collision pairs, batched + differentiable.
+
+    Stick capsule + wrist sphere, same pairs as :class:`~amortized_opt.cost.FusedCost`.
+    """
 
     def __init__(
         self,
@@ -204,7 +561,10 @@ class SdfPenalty:
         off = PELVIS_IN_ENV if scene.frame == "env" else np.zeros(3)
         self.frame_offset = t(off)  # (3,)
 
-        # Robot sample points per hand: [tip, shaft*S, wrist], local wrist frame.
+        # Stick endpoints, wrist-local: [tip, shaft*S, wrist].  Row 0 is the
+        # bead and row 1 is the first shaft sample, which
+        # ``stick_shaft_offsets`` places at the butt, so [row 1 -> row 0] is
+        # the whole stick capsule.  The wrist is a separate sphere.
         pts = {}
         for hand in ("left", "right"):
             local = np.concatenate(
@@ -219,12 +579,8 @@ class SdfPenalty:
         self.local_points = pts
         self.n_points = int(pts["left"].shape[0])
         self.tip_index = 0
-        tip_mask = np.zeros((self.n_points, 1))
-        tip_mask[self.tip_index, 0] = 1.0
-        self.tip_mask = t(tip_mask)  # (P, 1)
-        self.point_radii = t(
-            np.concatenate([[TIP_RADIUS], np.full(shaft_samples, STICK_RADIUS), [WRIST_RADIUS]])
-        )  # (P,)
+        self.stick_r = float(max(TIP_RADIUS, STICK_RADIUS))
+        self.wrist_r = float(WRIST_RADIUS)
         a, b, r = TORSO_CAPSULE
         self.torso_a = t(a)
         self.torso_b = t(b)
@@ -242,18 +598,6 @@ class SdfPenalty:
         under = under_top - self.under_half * ax
         return body, under
 
-    def _hand_cyl_sdf(
-        self, pts: torch.Tensor, centers: torch.Tensor, half_heights: torch.Tensor
-    ) -> torch.Tensor:
-        """(B, P, D) sphere-vs-solid-cylinder signed distances."""
-        x = pts.unsqueeze(2)  # (B, P, 1, 3)
-        c = centers.view(1, 1, -1, 3) if centers.dim() == 2 else centers.unsqueeze(1)
-        ax = self.axes.to(pts.dtype).view(1, 1, -1, 3)
-        sdf = point_cylinder_sdf(
-            x, c, ax, self.radii.to(pts.dtype).view(1, 1, -1), half_heights.view(1, 1, -1)
-        )
-        return sdf - self.point_radii.to(pts.dtype).view(1, -1, 1)
-
     def _hinge(self, sdf: torch.Tensor) -> torch.Tensor:
         h = (self.margin - sdf).clamp_min(0.0)
         if self.clamp_depth is not None:
@@ -269,6 +613,7 @@ class SdfPenalty:
         *,
         frames: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         drum_head_centers: torch.Tensor | None = None,  # (B, D, 3), scene frame
+        drum_radii: torch.Tensor | None = None,  # (B, D), per-sample head radii
         target_drum_left: torch.Tensor | None = None,  # (B,) long, -1 = none
         target_drum_right: torch.Tensor | None = None,
         return_details: bool = False,
@@ -277,6 +622,12 @@ class SdfPenalty:
 
         Pass ``frames`` (the output of :meth:`ChainFK.forward`) to reuse a shared
         FK pass; otherwise ``q`` (B, 17) is run through the internal FK.
+
+        ``drum_head_centers`` / ``drum_radii`` override the scene's baked-in
+        geometry per sample.  A screen run against a domain-randomized kit must
+        pass BOTH whenever the kit randomizes both, or it accepts poses that sit
+        inside a drum that is really there (see
+        :attr:`~amortized_opt.cost.StrikeContext.drum_head_centers`).
         """
         if frames is None:
             if q is None:
@@ -288,11 +639,21 @@ class SdfPenalty:
         dtype, dev = ref.dtype, ref.device
         B = ref.shape[0]
         off = self.frame_offset.to(dtype)
+        D = self.num_drums
 
         heads = self.head_centers.to(dtype) if drum_head_centers is None else drum_head_centers
         body_c, under_c = self._cylinder_centers(heads)
+        if body_c.dim() == 2:
+            body_c = body_c.unsqueeze(0)
+            under_c = under_c.unsqueeze(0)
+        ax = self.axes.to(dtype).view(1, D, 3)
+        half_h = self.half_heights.to(dtype).view(1, D)
+        under_half = self.under_half_t.to(dtype).view(1, D)
+        rad = (
+            self.radii.to(dtype).view(1, D) if drum_radii is None
+            else drum_radii.to(dtype)
+        )
 
-        D = self.num_drums
         pen_drum = ref.new_zeros(B)
         pen_under = ref.new_zeros(B)
         pen_self = ref.new_zeros(B)
@@ -305,28 +666,41 @@ class SdfPenalty:
         per_hand: dict[str, torch.Tensor] = {}
         for hand, frame_name in (("left", "left_wrist"), ("right", "right_wrist")):
             R, p = frames[frame_name]
-            pts = ChainFK.points_world(R, p, self.local_points[hand].to(dtype)) + off
+            local = self.local_points[hand]
+            pts = ChainFK.points_world(R, p, local.to(dtype)) + off
+            tip, butt, wrist = pts[:, 0], pts[:, 1], pts[:, -1]
 
-            sdf_drum = self._hand_cyl_sdf(pts, body_c, self.half_heights.to(dtype))
-            sdf_under = self._hand_cyl_sdf(pts, under_c, self.under_half_t.to(dtype))
+            cap_b = segment_cylinder_sdf(
+                butt.unsqueeze(1), tip.unsqueeze(1),
+                body_c, ax, rad, half_h, ra=self.stick_r,
+            )
+            cap_u = segment_cylinder_sdf(
+                butt.unsqueeze(1), tip.unsqueeze(1),
+                under_c, ax, rad, under_half, ra=self.stick_r,
+            )
+            wr = wrist.unsqueeze(1)
+            sdf_wb = point_cylinder_sdf(wr, body_c, ax, rad, half_h) - self.wrist_r
+            sdf_wu = point_cylinder_sdf(wr, under_c, ax, rad, under_half) - self.wrist_r
 
-            # Target-drum exemption: this hand's TIP vs its target drum + under.
-            # Branch-free -- the original's `if bool(valid.any())` was a sync.
-            keep = ref.new_ones(B, self.n_points, D)
+            # Stick capsule vs the TARGET drum is exempted: a hit is contact.
+            # The wrist sphere is never exempted.  Branch-free one-hot.
+            keep_cap = ref.new_ones(B, D)
             tgt = targets[hand]
             if tgt is not None:
                 tgt = tgt.to(device=dev, dtype=torch.long).clamp(-1, D - 1)
                 onehot = F.one_hot(tgt.clamp(min=0), D).to(dtype) * (tgt >= 0).to(dtype).unsqueeze(-1)
-                keep = keep - self.tip_mask.to(dtype).unsqueeze(0) * onehot.unsqueeze(1)
-            hinge_d = self._hinge(sdf_drum) * keep
-            hinge_u = self._hinge(sdf_under) * keep
-            pen_drum = pen_drum + hinge_d.sum(dim=(1, 2))
-            pen_under = pen_under + hinge_u.sum(dim=(1, 2))
+                keep_cap = keep_cap - onehot
+            hinge_d = self._hinge(cap_b) * keep_cap + self._hinge(sdf_wb)
+            hinge_u = self._hinge(cap_u) * keep_cap + self._hinge(sdf_wu)
+            pen_drum = pen_drum + hinge_d.sum(dim=1)
+            pen_under = pen_under + hinge_u.sum(dim=1)
 
-            exempt = keep <= 0.5
-            masked_d = sdf_drum.masked_fill(exempt, float("inf"))
-            masked_u = sdf_under.masked_fill(exempt, float("inf"))
-            hand_min = torch.minimum(masked_d.amin(dim=(1, 2)), masked_u.amin(dim=(1, 2)))
+            cap_b_m = cap_b.masked_fill(keep_cap <= 0.5, float("inf"))
+            cap_u_m = cap_u.masked_fill(keep_cap <= 0.5, float("inf"))
+            hand_min = torch.minimum(
+                torch.minimum(cap_b_m.amin(dim=1), cap_u_m.amin(dim=1)),
+                torch.minimum(sdf_wb.amin(dim=1), sdf_wu.amin(dim=1)),
+            )
             min_sdf = torch.minimum(min_sdf, hand_min)
 
             if self.include_self:
@@ -334,12 +708,15 @@ class SdfPenalty:
                 a = pt + (Rt @ self.torso_a.to(dtype).view(1, 3, 1)).squeeze(-1) + off
                 b = pt + (Rt @ self.torso_b.to(dtype).view(1, 3, 1)).squeeze(-1) + off
                 hc = pt + (Rt @ self.head_c.to(dtype).view(1, 3, 1)).squeeze(-1) + off
-                sdf_t = point_capsule_sdf(pts, a.unsqueeze(1), b.unsqueeze(1), self.torso_r)
-                sdf_h = point_sphere_sdf(pts, hc.unsqueeze(1), self.head_r)
-                sdf_s = torch.minimum(sdf_t, sdf_h) - self.point_radii.to(dtype).view(1, -1)
-                pen_self = pen_self + self._hinge(sdf_s).sum(dim=1)
-                min_sdf = torch.minimum(min_sdf, sdf_s.amin(dim=1))
-                hand_min = torch.minimum(hand_min, sdf_s.amin(dim=1))
+                s_t = segment_segment_sdf(butt, tip, a, b, self.stick_r, self.torso_r)
+                s_h = segment_segment_sdf(butt, tip, hc, hc, self.stick_r, self.head_r)
+                s_wt = point_capsule_sdf(wrist, a, b, self.torso_r) - self.wrist_r
+                s_wh = point_sphere_sdf(wrist, hc, self.head_r) - self.wrist_r
+                sdf_st = torch.minimum(s_t, s_h)
+                sdf_wr = torch.minimum(s_wt, s_wh)
+                pen_self = pen_self + self._hinge(sdf_st) + self._hinge(sdf_wr)
+                min_sdf = torch.minimum(min_sdf, torch.minimum(sdf_st, sdf_wr))
+                hand_min = torch.minimum(hand_min, torch.minimum(sdf_st, sdf_wr))
             per_hand[hand] = hand_min
 
         pen = self.w_drum * pen_drum + self.w_under * pen_under + self.w_self * pen_self
@@ -353,3 +730,42 @@ class SdfPenalty:
             extras={f"min_sdf_{h}": v.detach() for h, v in per_hand.items()},
         )
         return pen, details
+
+
+@torch.no_grad()
+def q0_collision_clear(
+    sdf: SdfPenalty,
+    q: torch.Tensor,
+    *,
+    drum_head_centers: torch.Tensor | None = None,
+    drum_radii: torch.Tensor | None = None,
+    exempt_drum: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-row start-pose screen: stick + wrist ``min_sdf > 0``.
+
+    Same geometry as Pool A ``_sdf_clear`` / :class:`StartSampler`.  ``exempt_drum``
+    is ``(B, 2)`` long (``-1`` = none): the stick capsule vs that hand's drum is
+    not a collision -- a just-struck rest, matching the cost's departure
+    exemption.  The wrist is never exempted.
+    """
+    tgt_l = tgt_r = None
+    if exempt_drum is not None:
+        ex = exempt_drum.to(device=q.device, dtype=torch.long)
+        tgt_l, tgt_r = ex[:, 0], ex[:, 1]
+    D = int(sdf.num_drums)
+    if drum_head_centers is not None and drum_head_centers.shape[-2] != D:
+        drum_head_centers = drum_head_centers[..., :D, :]
+    if drum_radii is not None and drum_radii.shape[-1] != D:
+        drum_radii = drum_radii[..., :D]
+    if tgt_l is not None:
+        tgt_l = tgt_l.where(tgt_l < D, torch.full_like(tgt_l, -1))
+        tgt_r = tgt_r.where(tgt_r < D, torch.full_like(tgt_r, -1))
+    _pen, det = sdf.forward(
+        q,
+        drum_head_centers=drum_head_centers,
+        drum_radii=drum_radii,
+        target_drum_left=tgt_l,
+        target_drum_right=tgt_r,
+        return_details=True,
+    )
+    return det.min_sdf > 0.0

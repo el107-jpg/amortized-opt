@@ -73,6 +73,8 @@ __all__ = [
     "PpoStorage",
     "PpoUpdater",
     "RolloutDriver",
+    "combine_wp0_orth",
+    "clone_encoding",
     "compute_gae",
     "index_dataclass",
     "stack_dataclass",
@@ -118,6 +120,7 @@ class PpoStorage:
     state: list = field(default_factory=list)         # (B, 34)
     hit_index: list = field(default_factory=list)     # (B, 2) long
     ctx: list = field(default_factory=list)           # ContextInputs
+    encoding: list = field(default_factory=list)      # ContextEncoding used by refine
     strike: list = field(default_factory=list)        # StrikeContext
     critic_obs: list = field(default_factory=list)    # (B, obs_dim)
     actions: list = field(default_factory=list)       # (B, 17)
@@ -142,7 +145,8 @@ class PpoStorage:
         return len(self.rewards)
 
     def clear(self) -> None:
-        for k in ("init", "state", "hit_index", "ctx", "strike", "critic_obs",
+        for k in ("init", "state", "hit_index", "ctx", "encoding", "strike",
+                  "critic_obs",
                   "actions", "log_probs", "mu", "sigma", "values", "rewards",
                   "dones"):
             getattr(self, k).clear()
@@ -168,6 +172,7 @@ class PpoStorage:
             "advantages": self.advantages.flatten(0, 1),
         }
         self.flat["ctx"] = stack_dataclass(self.ctx)
+        self.flat["encoding"] = stack_dataclass(self.encoding)
         self.flat["strike"] = stack_dataclass(self.strike)
 
     def minibatches(self, num_mini_batches: int, generator: torch.Generator | None = None):
@@ -213,9 +218,109 @@ def compute_gae(
     return adv + values, adv
 
 
+def clone_encoding(enc):
+    """Detach-clone a ``ContextEncoding`` so the next tick cannot overwrite it."""
+    if enc is None:
+        return None
+    def c(v):
+        return None if v is None else v.detach().clone()
+    return type(enc)(
+        memory=enc.memory.detach().clone(),
+        mask=enc.mask.detach().clone(),
+        waist_yaw_sp=c(getattr(enc, "waist_yaw_sp", None)),
+        waist_yaw_res=c(getattr(enc, "waist_yaw_res", None)),
+        waist_pr_sp=c(getattr(enc, "waist_pr_sp", None)),
+        waist_pr_res=c(getattr(enc, "waist_pr_res", None)),
+    )
+
+
+def combine_wp0_orth(
+    g_rl: torch.Tensor,
+    g_cost: torch.Tensor,
+    *,
+    cost_to_rl_norm: float = 1.0,
+    rl_to_cost_norm: float = 1.0,
+    traj_grad_scale: float = 1.0,
+    wp0_leak: float = 0.0,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Always-project RL onto the cost nullspace at the executed waypoint.
+
+    ``g_rl`` / ``g_cost`` are ``(B, H, n)`` trajectory gradients.  PPO only
+    scores waypoint 0, so the tail of ``g_rl`` is ignored.  Cost is **rescaled
+    per sample** so ``||g_cost||_F = cost_to_rl_norm * ||g_rl0||``; without
+    that, FusedCost's raw gradient (~aux 4000) swallows the 17-dim KL budget
+    and the plan NaNs.  The projected PPO leftover is then added at waypoint 0
+    at PPO's native scale (``rl_to_cost_norm``), not inflated to ``||g_cost0||``.
+    ``traj_grad_scale`` then shrinks the whole combined tensor (relative mix
+    unchanged) so one Adam step stays inside the 17-dim KL budget.
+
+    ``wp0_leak`` in ``[0, 1]`` re-injects that fraction of the *parallel* PPO
+    component at waypoint 0 (the knot that actually runs).  0 is a hard
+    nullspace; 1 is full PPO at wp0 on top of scaled cost.  The tail stays
+    cost-only either way.
+    """
+    if g_rl.shape != g_cost.shape:
+        raise ValueError(
+            f"g_rl {tuple(g_rl.shape)} vs g_cost {tuple(g_cost.shape)}")
+    B = g_rl.shape[0]
+    leak = float(wp0_leak)
+    g_rl0 = g_rl[:, 0]
+    g_c0 = g_cost[:, 0]
+    dots = (g_rl0 * g_c0).sum(dim=-1, keepdim=True)
+    c2 = (g_c0 * g_c0).sum(dim=-1, keepdim=True)
+    g_para = torch.where(
+        c2 > eps, (dots / c2.clamp_min(eps)) * g_c0, torch.zeros_like(g_rl0))
+    g_orth = torch.where(c2 > eps, g_rl0 - g_para, g_rl0)
+    orth_norm = g_orth.norm(dim=-1, keepdim=True)
+    cost0_norm = g_c0.norm(dim=-1, keepdim=True)
+    rl_norm = g_rl0.norm(dim=-1, keepdim=True)
+    rel_orth = orth_norm / rl_norm.clamp_min(eps)
+    g_orth = torch.where(rel_orth > 1e-4, g_orth, torch.zeros_like(g_orth))
+    g_orth = torch.where(cost0_norm > eps, g_orth, g_rl0)
+    g_used = g_orth + leak * g_para
+
+    cost_ref = g_cost.flatten(1).norm(dim=-1).clamp_min(eps)          # (B,)
+    rl_ref = rl_norm.squeeze(-1)
+    scale = torch.where(
+        rl_ref > eps,
+        float(cost_to_rl_norm) * rl_ref / cost_ref,
+        torch.where(cost_ref > eps, float(cost_to_rl_norm) / cost_ref,
+                    torch.zeros_like(cost_ref)),
+    )
+    g = g_cost * scale.view(B, 1, 1)
+    g[:, 0] = g[:, 0] + float(rl_to_cost_norm) * g_used
+    g = g * float(traj_grad_scale)
+
+    valid = (rl_ref > eps) & (cost0_norm.squeeze(-1) > eps)
+    cos = (g_rl0 * g_c0).sum(dim=-1) / (
+        rl_norm.squeeze(-1) * cost0_norm.squeeze(-1)).clamp_min(eps)
+    remain = orth_norm.squeeze(-1) / rl_norm.squeeze(-1).clamp_min(eps)
+    para_frac = g_para.norm(dim=-1) / rl_norm.squeeze(-1).clamp_min(eps)
+    stats = {
+        "orth_cos": float(cos[valid].mean()) if bool(valid.any()) else 0.0,
+        "orth_remain": float(remain[rl_ref > eps].mean())
+        if bool((rl_ref > eps).any()) else 0.0,
+        "orth_cost_norm": float(cost0_norm.mean()),
+        "orth_rl_norm": float(rl_norm.mean()),
+        "orth_cost_scale": float(scale.mean()),
+        "orth_traj_scale": float(traj_grad_scale),
+        "orth_leak": leak,
+        "orth_para_frac": float(para_frac[rl_ref > eps].mean())
+        if bool((rl_ref > eps).any()) else 0.0,
+    }
+    return g, stats
+
+
 # ================================================================== updater ===
 class PpoUpdater:
-    """The PPO update, with the analytic cost fused into the same backward."""
+    """The PPO update, with the analytic cost fused into the same forward.
+
+    Default combine (``OrthGradConfig``): always-project the waypoint-0 PPO
+    gradient onto the analytic cost's nullspace, then add it back as a small
+    scaled direction.  The tail of the plan is cost-only -- that tail is the
+    next tick's warm start.  ``--no-orth`` restores the previous scalar sum.
+    """
 
     def __init__(
         self,
@@ -269,13 +374,34 @@ class PpoUpdater:
         micro = int(p.micro_batch_size) or n
 
         adv_all = flat["advantages"]
+        if not torch.isfinite(adv_all).all() or not torch.isfinite(flat["returns"]).all():
+            return {
+                "surrogate": float("nan"), "value": float("nan"),
+                "entropy": float("nan"), "aux": float("nan"), "kl": float("nan"),
+                "clip_frac": 0.0, "ratio_dev": 0.0, "orth_cos": 0.0,
+                "orth_remain": 0.0, "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+                "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
+                "orth_leak": 0.0, "orth_para_frac": 0.0,
+                "orth_skipped": 1.0,
+                "learning_rate": self.learning_rate,
+                "lr_floor_hits": float(self.lr_floor_hits),
+                "noise_std_mean": float(self.actor.current_std().mean()),
+                "noise_std_max_dim": float(self.actor.current_std().max()),
+                "kl_early_stops": 0.0,
+            }
         if p.normalize_advantage:
             adv_all = (adv_all - adv_all.mean()) / (adv_all.std() + 1e-8)
 
         acc = {k: 0.0 for k in ("surrogate", "value", "entropy", "aux", "kl",
-                                "clip_frac", "ratio_dev")}
+                                "clip_frac", "ratio_dev", "orth_cos",
+                                "orth_remain", "orth_cost_norm", "orth_rl_norm",
+                                "orth_cost_scale", "orth_traj_scale",
+                                "orth_leak", "orth_para_frac",
+                                "orth_skipped")}
         n_updates = 0
+        kl_early_stops = 0
 
+        stop = False
         for epoch in range(int(p.num_learning_epochs)):
             for idx in storage.minibatches(p.num_mini_batches):
                 mb = idx.shape[0]
@@ -286,8 +412,7 @@ class PpoUpdater:
                     sel = idx[s: s + micro]
                     w = sel.shape[0] / mb          # exact chunk reweighting, so
                     # gradient accumulation is numerically identical to one pass
-                    part = self._chunk_loss(flat, sel, adv_all)
-                    (w * part["loss"]).backward()
+                    part = self._chunk_loss(flat, sel, adv_all, weight=w)
                     for k in stats:
                         if k in part:
                             stats[k] += w * float(part[k])
@@ -296,9 +421,17 @@ class PpoUpdater:
                     self.actor.assert_frozen()
                     self._checked_frozen = True
 
+                if not math.isfinite(stats["kl"]):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 # ---- adaptive KL, in the minibatch loop as rsl_rl does it ----
+                # Fresh-rollout minibatch 0 has KL≈0 after a correct replay, so
+                # a raise there ratchets LR every iteration (v3: 1e-5 → 6.7e-4
+                # in 6 iters) and then early-stop cuts only once.  Only cut on
+                # minibatch 0; raises start after at least one step this iter.
                 if p.desired_kl is not None and p.schedule == "adaptive":
-                    self._adapt_lr(stats["kl"])
+                    self._adapt_lr(stats["kl"], allow_increase=(n_updates > 0))
 
                 nn.utils.clip_grad_norm_(self.actor.trainable_parameters(),
                                          p.max_grad_norm)
@@ -306,17 +439,39 @@ class PpoUpdater:
                 for k in acc:
                     acc[k] += stats[k]
                 n_updates += 1
+                if (p.kl_early_stop and p.desired_kl is not None
+                        and stats["kl"] > p.desired_kl * 2.0):
+                    stop = True
+                    kl_early_stops += 1
+                    break
+            if stop:
+                break
 
         out = {k: v / max(n_updates, 1) for k, v in acc.items()}
         out["learning_rate"] = self.learning_rate
         out["lr_floor_hits"] = float(self.lr_floor_hits)
         out["noise_std_mean"] = float(self.actor.current_std().mean())
         out["noise_std_max_dim"] = float(self.actor.current_std().max())
+        out["kl_early_stops"] = float(kl_early_stops)
         return out
 
-    def _chunk_loss(self, flat: dict, sel: torch.Tensor, adv_all: torch.Tensor) -> dict:
+    def _rl_only_params(self) -> list[nn.Parameter]:
+        """Parameters PPO owns that the traj-space combine must not touch.
+
+        ``std`` is not a function of the plan; the mean-correction linear reads
+        a decoder hidden state but is not in ``traj``'s graph.  Both get the
+        raw PPO gradient.  LoRA is updated only through ``traj.backward``.
+        """
+        params: list[nn.Parameter] = [self.actor.std]
+        if self.actor.mean_correction is not None:
+            params.extend(self.actor.mean_correction.parameters())
+        return params
+
+    def _chunk_loss(self, flat: dict, sel: torch.Tensor, adv_all: torch.Tensor,
+                    *, weight: float = 1.0) -> dict:
         p = self.p
         actor = self.actor
+        w = float(weight)
 
         inputs = MpcInputs(
             init=flat["init"].index_select(0, sel),
@@ -324,7 +479,9 @@ class PpoUpdater:
             ctx=index_dataclass(flat["ctx"], sel),
             hit_index=flat["hit_index"].index_select(0, sel),
         )
-        plan = actor.plan(inputs)
+        plan = actor.plan(
+            inputs, encoding=index_dataclass(flat["encoding"], sel)
+            if "encoding" in flat else None)
         dist = actor.update_distribution(plan.mean)
 
         actions = flat["actions"].index_select(0, sel)
@@ -358,11 +515,20 @@ class PpoUpdater:
         # ---- the analytic anchor -------------------------------------------
         aux = self._aux_cost(plan.traj, plan.elem_mask, inputs.state,
                              index_dataclass(flat["strike"], sel))
+        aux_w = self.cfg.aux.weight * aux
+        ppo_head = surrogate_loss - p.entropy_coef * entropy.mean()
+        loss = ppo_head + p.value_loss_coef * value_loss + aux_w
 
-        loss = (surrogate_loss
-                + p.value_loss_coef * value_loss
-                - p.entropy_coef * entropy.mean()
-                + self.cfg.aux.weight * aux)
+        orth_stats = {"orth_cos": 0.0, "orth_remain": 0.0,
+                      "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+                      "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
+                      "orth_leak": 0.0, "orth_para_frac": 0.0,
+                      "orth_skipped": 0.0}
+        if self.cfg.orth.enabled:
+            self._backward_orth(plan.traj, surrogate_loss, ppo_head, aux_w,
+                                value_loss, weight=w, stats=orth_stats)
+        else:
+            (w * loss).backward()
 
         with torch.no_grad():
             kl = torch.sum(
@@ -372,12 +538,70 @@ class PpoUpdater:
             clip_frac = ((ratio - 1.0).abs() > p.clip_param).float().mean()
             ratio_dev = (ratio - 1.0).abs().mean()
 
-        return {"loss": loss, "surrogate": surrogate_loss.detach(),
+        return {"loss": loss.detach(), "surrogate": surrogate_loss.detach(),
                 "value": value_loss.detach(), "entropy": entropy.mean().detach(),
                 "aux": aux.detach(), "kl": kl, "clip_frac": clip_frac,
-                "ratio_dev": ratio_dev}
+                "ratio_dev": ratio_dev, **orth_stats}
 
-    def _adapt_lr(self, kl_mean: float) -> None:
+    def _backward_orth(
+        self,
+        traj: torch.Tensor,
+        surrogate_loss: torch.Tensor,
+        ppo_head: torch.Tensor,
+        aux_w: torch.Tensor,
+        value_loss: torch.Tensor,
+        *,
+        weight: float,
+        stats: dict[str, float],
+    ) -> None:
+        """Two-backward combine: cost + always-orth RL at waypoint 0.
+
+        Decoder LoRA sees the combined traj gradient.  ``std`` / mean-correction
+        see raw PPO.  The critic sees only the value loss.
+        """
+        p = self.p
+        zeros = torch.zeros_like(traj)
+        g_rl = torch.autograd.grad(
+            surrogate_loss, traj, retain_graph=True, allow_unused=True)[0]
+        if g_rl is None:
+            g_rl = zeros
+        if aux_w.requires_grad:
+            g_cost = torch.autograd.grad(
+                aux_w, traj, retain_graph=True, allow_unused=True)[0]
+            if g_cost is None:
+                g_cost = zeros
+        else:
+            g_cost = zeros
+        if not torch.isfinite(g_rl).all() or not torch.isfinite(g_cost).all():
+            stats["orth_skipped"] = 1.0
+            return
+
+        g, orth_stats = combine_wp0_orth(
+            g_rl, g_cost,
+            cost_to_rl_norm=self.cfg.orth.cost_to_rl_norm,
+            rl_to_cost_norm=self.cfg.orth.rl_to_cost_norm,
+            traj_grad_scale=self.cfg.orth.traj_grad_scale,
+            wp0_leak=self.cfg.orth.wp0_leak,
+            eps=self.cfg.orth.eps)
+        stats.update(orth_stats)
+        if not torch.isfinite(g).all():
+            stats["orth_skipped"] = 1.0
+            return
+        traj.backward(weight * g, retain_graph=True)
+
+        rl_params = self._rl_only_params()
+        head_grads = torch.autograd.grad(
+            ppo_head, rl_params, retain_graph=False, allow_unused=True)
+        for param, grad in zip(rl_params, head_grads):
+            if grad is None or not torch.isfinite(grad).all():
+                continue
+            scaled = weight * grad
+            param.grad = scaled if param.grad is None else param.grad + scaled
+
+        if torch.isfinite(value_loss):
+            (weight * p.value_loss_coef * value_loss).backward()
+
+    def _adapt_lr(self, kl_mean: float, *, allow_increase: bool = True) -> None:
         """rsl_rl's controller, with the floor made visible.
 
         The documented in-repo failure is not that this controller is wrong but
@@ -386,13 +610,16 @@ class PpoUpdater:
         silently stops learning while every other logged quantity looks normal.
         The floor hit is counted and surfaced so the trace is readable without
         patching anything.
+
+        ``allow_increase=False`` blocks the *1.5 branch.  Used on the first
+        minibatch of an iteration, whose KL is ~0 whenever replay matches.
         """
         p = self.p
         if kl_mean > p.desired_kl * 2.0:
             self.learning_rate = max(p.lr_min, self.learning_rate / 1.5)
             if self.learning_rate <= p.lr_min * (1.0 + 1e-9):
                 self.lr_floor_hits += 1
-        elif 0.0 < kl_mean < p.desired_kl / 2.0:
+        elif allow_increase and 0.0 < kl_mean < p.desired_kl / 2.0:
             self.learning_rate = min(p.lr_max, self.learning_rate * 1.5)
         for g in self.optimizer.param_groups:
             g["lr"] = self.learning_rate
@@ -458,7 +685,7 @@ class RolloutDriver:
             tth, active,
             ctx.goal_pos.flatten(1), ctx.goal_vel.flatten(1),
             ctx.goal_valid.to(q.dtype),
-            ctx.future_tth.flatten(1),
+            ctx.future_gap.flatten(1),
         ]
         if spec.include_tips:
             blocks.append(self._tip_positions(q))
@@ -514,10 +741,15 @@ class RolloutDriver:
         ctx_strike = sched.strike_context()
         ctx_inputs = sched.context()
         hit_index = sched.hit_index()
-        init_before = mpc.init.clone()
         state = torch.cat([q, qd], dim=-1)
 
         res = mpc.plan(q, qd)             # deterministic feature extractor
+        # Replay must see the init refine actually consumed (waist-PR seed /
+        # arm DLS mutate ``mpc.init`` in place) and the encoding it used.
+        # Storing the pre-plan warm start and re-encoding from ``ctx`` is what
+        # made first-minibatch KL ~0.07 before any Adam step.
+        init_replay = mpc.init.clone()
+        encoding = clone_encoding(getattr(mpc, "_enc", None))
         mean = mpc.last_ref0              # traj[:, 0] BEFORE the lead
         if actor.mean_correction is not None and actor._hidden is not None:
             mean = mean + cfg.actor.mean_correction_scale * actor.mean_correction(
@@ -570,9 +802,15 @@ class RolloutDriver:
 
         done = sched.done()
         if storage is not None:
+            if encoding is None:
+                raise RuntimeError(
+                    "IsaacMPC.plan left no context encoding to replay; "
+                    "without it the update re-encodes and first-minibatch KL "
+                    "is not zero")
             storage.add(
-                init=init_before, state=state, hit_index=hit_index,
-                ctx=ctx_inputs, strike=ctx_strike, critic_obs=critic_obs,
+                init=init_replay, state=state, hit_index=hit_index,
+                ctx=ctx_inputs, encoding=encoding, strike=ctx_strike,
+                critic_obs=critic_obs,
                 actions=action, log_probs=log_prob, mu=mean.clone(),
                 sigma=dist.stddev.clone(), values=value,
                 rewards=terms.total, dones=done,

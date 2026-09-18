@@ -1327,7 +1327,11 @@ on `sigma`/`shaft`/`elev`).
 stale time-to-hit while the mask's Fourier τ encodings — built from `hit` — told
 it the truth.  `MPCGenerator._context_row` rebuilds them from a fresh snapshot
 every tick, so the replay distribution simply disagreed with deployment.
-`_tick_tth()` fixes it.
+`_tick_tth()` fixes it.  (`future_tth` has since become `future_gap`, measured
+from the current goal's strike rather than from now — see the tokenizer's field
+doc.  It is segment-constant, so `_tick_tth()` now ages it only on the hands
+whose gaps fall back to a from-now anchor, i.e. those with no active goal, and
+`_regoal` re-anchors what survives a promotion.)
 
 Measured at 256 slots on `cuda:1`, driven by the trained checkpoint, 50 timed
 ticks:

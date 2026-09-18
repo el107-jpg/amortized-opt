@@ -11,6 +11,22 @@ from amortized_opt.spline import joint_path_spline, peak_rate, quintic_time_scal
 from conftest import import_repo
 
 
+def test_scale_soft_wrist_effort_is_scoring_only():
+    names = C.G1_UPPER_BODY_JOINTS
+    base = L.isaac_effort_limits(names)
+    same = L.scale_soft_wrist_effort(base, names, scale=1.0)
+    assert np.allclose(same, base)
+    scaled = L.scale_soft_wrist_effort(base, names, scale=2.0)
+    for i, n in enumerate(names):
+        if n in L.SOFT_WRIST_EFFORT_JOINTS:
+            assert scaled[i] == pytest.approx(2.0 * base[i])
+            assert base[i] == pytest.approx(5.0)
+        else:
+            assert scaled[i] == pytest.approx(base[i])
+    # Plant table unchanged.
+    assert np.allclose(L.isaac_effort_limits(names), base)
+
+
 def test_control_grid_matches_resolved_decision():
     assert C.CONTROL_HZ == 50.0 and C.CONTROL_DT == 0.02
     assert C.PD_HZ == 250.0 and abs(C.PD_DT - 1 / 250) < 1e-15
@@ -137,3 +153,20 @@ def test_retime_degenerate_path_holds_pose():
     Q = np.zeros((4, 17))
     X, rate = retime_joint_path(Q, 10, C.CONTROL_DT)
     assert X.shape == (10, 17) and np.allclose(X, 0.0) and rate == 0.0
+
+
+def test_isaac_rl_pd_gains_match_trainer():
+    """isaac_rl / isaac_rl_ppo must not quietly ship a different Kd than pd_sim."""
+    from isaac_rl.env_cfg import DrumRLEnvCfg
+    from isaac_rl_ppo.cfg import EnvConfig
+    from isaac_rl_ppo.env_cfg import DrumRLEnvCfg as PpoDrumRLEnvCfg
+
+    want_kd = float(L.G1_PD_DAMPING_SCALE)
+    want_kp = float(L.G1_PD_STIFFNESS_SCALE)
+    assert DrumRLEnvCfg().pd_damping_scale == want_kd
+    assert DrumRLEnvCfg().pd_stiffness_scale == want_kp
+    assert PpoDrumRLEnvCfg().pd_damping_scale == want_kd
+    assert PpoDrumRLEnvCfg().pd_stiffness_scale == want_kp
+    assert EnvConfig().pd_damping_scale == want_kd
+    assert want_kd == 4.0
+    assert want_kp == 1.0

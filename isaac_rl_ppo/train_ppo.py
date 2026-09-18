@@ -48,9 +48,30 @@ def parse(argv=None) -> argparse.Namespace:
                    help="in-Isaac gate for the analytic FusedCost aux loss; "
                         "'auto' enables it when the pre-launch RNEA build "
                         "succeeded (see the Boost.Python note in README)")
-    p.add_argument("--lr", type=float, default=3e-5,
-                   help="3e-5 by default; at 1e-4 the adaptive controller "
-                        "railed at the floor 28x in a 20-iteration smoke")
+    p.add_argument("--no-orth", action="store_true",
+                   help="disable always-orth combine; fall back to the scalar "
+                        "sum surrogate + aux.weight * cost")
+    p.add_argument("--orth-scale", type=float, default=1.0,
+                   help="mix on the projected PPO leftover at waypoint 0, "
+                        "at PPO's native scale (default 1)")
+    p.add_argument("--cost-to-rl", type=float, default=1.0,
+                   help="scale the cost traj-grad so ||g_cost|| = this times "
+                        "||g_rl0|| per sample (default 1; unscaled cost "
+                        "railed KL then NaNed)")
+    p.add_argument("--traj-grad-scale", type=float, default=0.2,
+                   help="multiply the combined traj-grad after the cost/RL "
+                        "match (default 0.2; 1.0 spent the 17-dim KL budget "
+                        "on the first Adam step)")
+    p.add_argument("--orth-leak", type=float, default=0.0,
+                   help="fraction of the parallel PPO component at waypoint 0 "
+                        "that leaks through the cost nullspace (default 0 = "
+                        "hard orth; 0.1 is a small leak on the executed knot)")
+    p.add_argument("--lr", type=float, default=1e-5,
+                   help="1e-5 by default; 3e-5 still spent ~0.07 nats/step "
+                        "on the Isaac orth runs (target 0.015)")
+    p.add_argument("--lr-min", type=float, default=1e-6,
+                   help="adaptive-KL floor (default 1e-6; rsl_rl's 1e-5 "
+                        "pinned the Isaac orth runs while KL stayed ~0.07)")
     p.add_argument("--micro-batch", type=int, default=128)
     p.add_argument("--clips", type=int, default=4)
     p.add_argument("--rhythm-split", default="train")
@@ -78,6 +99,25 @@ def parse(argv=None) -> argparse.Namespace:
                    help="path to a lead JSON (default runs/rl1b/lead_isaac.json)")
     p.add_argument("--lead-key", default=None, help="default best_strike_s")
     p.add_argument("--no-lead", action="store_true", help="run with no lead at all")
+    p.add_argument(
+        "--freeze-wp", type=int, default=0,
+        help="waypoints of no-replan before a hit (default 0 = lead alone; "
+             "5 is the 7c probe that worked best). Copies the striking arm "
+             "(and waist) from the previous plan through contact.")
+    p.add_argument(
+        "--isaac-ready", action="store_true", default=False,
+        help="Keep the Unitree USD init_state (play_isaac --isaac_ready). "
+             "Default overwrites to amortized ready_joint_pos, the start "
+             "play_isaac and phase-2 use.")
+    p.add_argument(
+        "--first-hit-s", type=float, default=1.0,
+        help="Pad every clip so the first HAND hit is at this time (seconds). "
+             "1.0 matches play_isaac --first_hit_s 1.0 / idle-family training. "
+             "0 = native RCC times.")
+    p.add_argument(
+        "--clip-gap-s", type=float, default=1.0,
+        help="Idle after the last hit before chaining the next clip, holding "
+             "leftover q (default 1.0). 0 = chain as soon as the last hit fires.")
     return p.parse_args(argv)
 
 
@@ -91,10 +131,16 @@ def build_cfg(args) -> PpoRunConfig:
     cfg.actor.lora_rank = int(args.lora_rank)
     cfg.actor.noise_std_init = float(args.noise_std)
     cfg.ppo.learning_rate = float(args.lr)
+    cfg.ppo.lr_min = float(args.lr_min)
     cfg.ppo.num_steps_per_env = int(args.steps_per_env)
     cfg.ppo.micro_batch_size = int(args.micro_batch)
     cfg.aux.weight = float(args.aux_weight)
     cfg.aux.in_isaac = args.aux_gate
+    cfg.orth.enabled = not bool(args.no_orth)
+    cfg.orth.rl_to_cost_norm = float(args.orth_scale)
+    cfg.orth.cost_to_rl_norm = float(args.cost_to_rl)
+    cfg.orth.traj_grad_scale = float(args.traj_grad_scale)
+    cfg.orth.wp0_leak = float(args.orth_leak)
     cfg.max_iterations = int(args.iterations)
     cfg.save_interval = int(args.save_interval)
     cfg.resume = args.resume
@@ -107,6 +153,11 @@ def build_cfg(args) -> PpoRunConfig:
         cfg.env.lead_key = args.lead_key
     if args.no_lead:
         cfg.env.cmd_lead_s = 0.0
+    cfg.env.freeze_wp = int(args.freeze_wp)
+    cfg.actor.freeze_wp = int(args.freeze_wp)
+    cfg.env.isaac_ready = bool(args.isaac_ready)
+    cfg.env.first_hit_s = float(args.first_hit_s)
+    cfg.env.clip_gap_s = float(args.clip_gap_s)
     cfg.validate()
     return cfg
 
@@ -224,6 +275,15 @@ def main(argv=None) -> int:
     print(f"[env] {cfg.env.num_envs} envs built in {time.perf_counter() - t0:.1f}s "
           f"step_dt={float(env.step_dt):.5f}", flush=True)
 
+    from isaac_rl_ppo.start import (
+        describe_clip_pad, ensure_clip_gap, install_duration_done,
+        install_train_ready, make_leftover_on_done, pad_clip_pool,
+    )
+    if not cfg.env.isaac_ready:
+        install_train_ready(env)
+    else:
+        print("[ready] --isaac-ready: keeping env composed pose", flush=True)
+
     # ---- the pretrained backbone -------------------------------------------
     ck = torch.load(str(choice.path), map_location="cpu", weights_only=False)
     mcfg = A.model_config_from_checkpoint(ck)
@@ -247,10 +307,19 @@ def main(argv=None) -> int:
     kit = A.DrumKit.from_layout()
     clips = A.load_rcc_pool(A.default_rcc_dir(cfg.env.rhythm_split), kit)
     clips = clips[: max(int(args.clips), 1)]
+    clips, pad_stats = pad_clip_pool(clips, cfg.env.first_hit_s)
+    clips = ensure_clip_gap(clips, cfg.env.clip_gap_s)
+    print(describe_clip_pad(pad_stats), flush=True)
+    print(
+        f"[clip] gap after last hit {cfg.env.clip_gap_s:.2f}s "
+        f"({'done waits for duration' if cfg.env.clip_gap_s > 0 else 'chain on last hit'})",
+        flush=True,
+    )
     ScheduleConfig, BatchedSchedule = surface.ScheduleConfig, surface.BatchedSchedule
     scfg = ScheduleConfig(horizon=H, num_drums=mcfg.num_drums,
                           num_future=mcfg.num_future, hit_lead_s=cfg.env.hit_lead_s)
     sched = BatchedSchedule(cfg.env.num_envs, scfg, device=dev, dtype=dtype)
+    install_duration_done(sched, enabled=cfg.env.clip_gap_s > 0)
     rng = np.random.default_rng(args.seed)
 
     def _reset_sched(ids: torch.Tensor) -> None:
@@ -273,8 +342,15 @@ def main(argv=None) -> int:
         model, sched,
         MPCConfig(horizon=H, iterations=cfg.actor.iterations,
                   cmd_lead_s=lead_value, freeze_wp=cfg.env.freeze_wp,
+                  freeze_waist=cfg.actor.freeze_waist,
                   amp_dtype=None),          # fp32: the update must reproduce the mean
         device=dev, dtype=dtype, kit_names=tuple(kit.names))
+    print(f"[freeze] wp={cfg.env.freeze_wp} waist={cfg.actor.freeze_waist} "
+          f"({'ON: copy striking arm from previous plan when tth<=freeze_wp' if cfg.env.freeze_wp else 'OFF'})",
+          flush=True)
+    print(f"[orth] leak={cfg.orth.wp0_leak:g} traj_grad_scale={cfg.orth.traj_grad_scale:g} "
+          f"({'hard nullspace' if cfg.orth.wp0_leak == 0.0 else 'wp0 parallel leak ON'})",
+          flush=True)
 
     from amortized_opt.train_cost import phase2_cost_config
 
@@ -333,13 +409,7 @@ def main(argv=None) -> int:
     # ---- reset handling -----------------------------------------------------
     q, qd = env.read_state()
     mpc.reset(all_ids, q)
-
-    def on_done(ids, q, qd):
-        _reset_sched(ids)
-        env.reset_to(ids, q[ids].clone(), None)
-        q, qd = env.read_state()
-        mpc.reset(ids, q)
-        return q, qd
+    on_done = make_leftover_on_done(env, _reset_sched, mpc)
 
     driver = RolloutDriver(actor=actor, mpc=mpc, schedule=sched, reward=reward,
                            plant=env.plant, cfg=cfg, fk=fk, on_done=on_done,
@@ -403,6 +473,7 @@ def main(argv=None) -> int:
                   f"| kl {stats['kl']:.5f} lr {stats['learning_rate']:.2e} "
                   f"| surr {stats['surrogate']:+.4f} val {stats['value']:.4f} "
                   f"aux {stats['aux']:.3f} | sig {stats['noise_std_mean']:.3f} "
+                  f"| orth {stats.get('orth_cos', 0):+.2f} "
                   f"| {env_steps / max(t_collect, 1e-9):6.0f} env/s "
                   f"(col {t_collect:.1f}s upd {t_update:.1f}s)", flush=True)
         if stats["lr_floor_hits"] > 0:

@@ -50,6 +50,7 @@ def model_planner_factory(model, cfg, kit, library, dev, *, init, iterations, am
             buckets=tuple(cfg["buckets"]), num_drums=cfg["num_drums"],
             num_future=cfg["num_future"], iterations=iterations, init=init,
             amp_dtype=amp,
+            waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"),
         )
         return A.precomputed_planner(plans, wall / max(len(cases), 1)), plans, wall
 
@@ -155,7 +156,8 @@ def closed_loop(model, cfg, kit, dev, amp, *, clips, n_episodes=3, steps=250, se
         r = closed_loop_probe(
             model, kit=kit, scorer=scorer, clips=clips, device=dev,
             num_drums=cfg["num_drums"], num_future=cfg["num_future"],
-            horizon=cfg["buckets"][-1], steps=steps, seed=seed, amp_dtype=amp, **kw,
+            horizon=cfg["buckets"][-1], steps=steps, seed=seed, amp_dtype=amp,
+            waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"), **kw,
         )
         r.pop("_hits", None)
         out[label] = r
@@ -183,7 +185,8 @@ def latency(model, cases, cfg, kit, library, dev, amp) -> dict:
         for _ in range(2):  # warmup
             A.batched_model_plans(core, sub, device=str(dev), kit=kit, library=library,
                                   buckets=tuple(cfg["buckets"]), num_drums=cfg["num_drums"],
-                                  num_future=cfg["num_future"], amp_dtype=amp)
+                                  num_future=cfg["num_future"], amp_dtype=amp,
+                                  waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"))
         if torch.device(dev).type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -191,7 +194,8 @@ def latency(model, cases, cfg, kit, library, dev, amp) -> dict:
         for _ in range(reps):
             A.batched_model_plans(core, sub, device=str(dev), kit=kit, library=library,
                                   buckets=tuple(cfg["buckets"]), num_drums=cfg["num_drums"],
-                                  num_future=cfg["num_future"], amp_dtype=amp)
+                                  num_future=cfg["num_future"], amp_dtype=amp,
+                                  waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"))
         if torch.device(dev).type == "cuda":
             torch.cuda.synchronize()
         dt = (time.perf_counter() - t0) / reps
@@ -235,8 +239,14 @@ def main(argv=None) -> int:
     buckets = tuple(
         (ck.get("scenario_cfg") or {}).get("buckets", (25, 50, 100))
     )
-    cfg = {"buckets": buckets, "num_drums": mcfg.num_drums, "num_future": mcfg.num_future}
-    print(f"[ckpt] {args.ckpt} step={ck['step']} buckets={buckets}", flush=True)
+    # The seed convention follows the CHECKPOINT: a model trained on
+    # ease-to-upright seeds is evaluated on them, one trained on the old
+    # hold-the-lean data (no field stored) keeps holding.
+    ease_wp = (ck.get("scenario_cfg") or {}).get("waist_upright_ease_wp")
+    cfg = {"buckets": buckets, "num_drums": mcfg.num_drums,
+           "num_future": mcfg.num_future, "waist_upright_ease_wp": ease_wp}
+    print(f"[ckpt] {args.ckpt} step={ck['step']} buckets={buckets} "
+          f"waist_ease={ease_wp}", flush=True)
 
     out_dir = Path(args.out) if args.out else Path(args.ckpt).parent / "eval_final"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -247,6 +257,9 @@ def main(argv=None) -> int:
     grid_seed = args.seed if args.grid_seed is None else int(args.grid_seed)
     report: dict = {"ckpt": str(args.ckpt), "step": int(ck["step"]),
                     "grid_seed": grid_seed, "seed": int(args.seed), "grids": {}}
+    print("[eval] start filter: tip z >= snare/floor_tom; idle at ready; "
+          "no stick (tip/shaft/wrist) under any drum (cymbals included)",
+          flush=True)
 
     phase1 = None
     if args.phase1 and Path(args.phase1).exists():
@@ -254,13 +267,24 @@ def main(argv=None) -> int:
         phase1 = A.build_model(A.model_config_from_checkpoint(c1), dev)
         phase1.load_state_dict(c1["model"])
         phase1.eval()
+        # the comparison model is seeded on ITS OWN training convention
+        cfg1 = dict(cfg)
+        cfg1["waist_upright_ease_wp"] = (
+            (c1.get("scenario_cfg") or {}).get("waist_upright_ease_wp")
+        )
 
     for grid in ("standard", "near_drum"):
         cases = A.generate_grid(seed=grid_seed, grid=grid, scorer=scorer)
         print(f"[grid] {grid}: {len(cases)} cases", flush=True)
+        if grid == "standard":
+            print("[eval] start filter: idle at ready; no stick under any "
+                  "drum/cymbal; tip z >= snare/floor_tom", flush=True)
         block: dict = {}
 
-        rows, _ = A.run_eval(A.quintic_case_planner(library=library), cases, scorer=scorer)
+        rows, _ = A.run_eval(
+            A.quintic_case_planner(library=library,
+                                   waist_upright_ease_wp=cfg["waist_upright_ease_wp"]),
+            cases, scorer=scorer)
         block["quintic"] = summarize(rows, "quintic")
 
         for init in ("quintic", "hold"):
@@ -274,7 +298,7 @@ def main(argv=None) -> int:
                 block[tag]["batched_solve_s"] = wall
                 A.write_csv(out_dir / f"{grid}_{tag}_per_case.csv", rows)
         if phase1 is not None:
-            mk = model_planner_factory(phase1, cfg, kit, library, dev,
+            mk = model_planner_factory(phase1, cfg1, kit, library, dev,
                                        init="quintic", iterations=1, amp=amp)
             planner, _p, _w = mk(cases)
             rows, _ = A.run_eval(planner, cases, scorer=scorer)

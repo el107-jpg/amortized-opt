@@ -87,7 +87,7 @@ class DrumRLEnvCfg:                       # plain dataclass, Isaac-free
     freeze_legs: bool = True
     use_ideal_pd: bool = True
     pd_stiffness_scale: float = 1.0
-    pd_damping_scale: float = 2.0         # the runtime Kd is 2x the CLAUDE.md table
+    pd_damping_scale: float = 4.0         # G1_PD_DAMPING_SCALE; arms Kd 4, waist-yaw Kd 20
     episode_length_s: float = 12.0
     rhythm_split: str = "eval"            # "eval" | "train"
     rhythm_dir: str | None = None
@@ -204,7 +204,8 @@ class MPCConfig:
     cmd_slew_eta: float | None = 1.0
     clamp_cmd_to_box: bool = True
     freeze_wp: int = 0; freeze_waist: bool = True
-    encode_every_tick: bool = True              # see DECISION 2
+    encode_every_tick: bool = False             # see DECISION 2 (resolved)
+    enc_yaw_tol: float = 0.05                   # rad; re-encode on a yaw-BC move
     amp_dtype: torch.dtype | None = torch.bfloat16
     joint_names: tuple[str, ...] = G1_UPPER_BODY_JOINTS
     yaw_bins: int = 129

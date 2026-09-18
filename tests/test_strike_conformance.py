@@ -73,7 +73,10 @@ def test_contact_sigma_match(repo):
 def test_aim_and_disk_match(repo):
     worst_aim = worst_r = worst_off = worst_hp = 0.0
     for name, c, a, r in _cases():
-        p_m, R_m = S.strike_aim_on_head(c, a, r, name=name)
+        # Ours insets 10 mm by default; the repo still uses 5 mm.  Pin the
+        # comparison to the repo inset so this test stays a port check, not a
+        # default-value check.
+        p_m, R_m = S.strike_aim_on_head(c, a, r, name=name, surface_offset=0.005)
         p_r, R_r = repo.strike_aim_on_head(c, a, r, name=name)
         worst_aim = max(worst_aim, float(np.max(np.abs(p_m - p_r))))
         worst_r = max(worst_r, abs(float(R_m) - float(R_r)))

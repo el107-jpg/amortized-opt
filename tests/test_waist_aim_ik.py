@@ -185,6 +185,29 @@ def test_damped_pinv_matches_the_repo_helper():
     assert float((damped_pinv(J, 1e-3) - repo.damped_pinv(J, 1e-3)).abs().max()) == 0.0
 
 
+def test_tip_jacobian_under_inference_mode(kin):
+    """``play_isaac.run_episode`` wraps reset in inference_mode; J still needed."""
+    fk, _rnea, q, _M = kin
+    q = q[:4]
+    with torch.no_grad():
+        J_ref = tip_jacobian(fk, q, "right")
+    with torch.inference_mode():
+        J = tip_jacobian(fk, q, "right")
+    assert torch.allclose(J, J_ref, atol=1e-12)
+
+
+def test_tip_jacobian_fk_built_under_inference_mode():
+    """IsaacMPC first-builds ChainFK during inference_mode reset."""
+    from amortized_opt.fk import ChainFK
+
+    q = torch.zeros(2, N, dtype=torch.float32)
+    with torch.inference_mode():
+        fk = ChainFK(device="cpu", dtype=torch.float32)
+        J = tip_jacobian(fk, q, "right")
+    assert torch.isfinite(J).all()
+    assert J.shape == (2, 3, N)
+
+
 def test_inertia_pinv_rejects_ambiguous_arguments(kin):
     _fk, _rnea, _q, M = kin
     J = torch.zeros(2, 3, N, dtype=torch.float64)

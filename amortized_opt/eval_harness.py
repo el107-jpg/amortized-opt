@@ -37,17 +37,21 @@ Conventions
   by one index from ``bench_trajopt_offline``'s ``ops.d1``/``ops.d2`` pairing,
   which evaluates the torque at knot ``i`` using the *forward* difference there;
   the convention here uses the real start velocity instead of discarding it.
-* **Contact point.**  Position, speed and direction are scored at the strike's
-  ``contact_sigma`` point on the stick -- the bead on pads, the shoulder on
-  cymbals and the hi-hat -- not at the tip.  The tip is reported alongside so the
-  numbers stay comparable to the repo benches, which are tip-only.
+* **Contact point.**  Pads (snare, toms) are scored at the bead.  Cymbals and
+  the hi-hat use the playing-shaft capsule
+  (:func:`~amortized_opt.strike.shaft_hit_sigma_range`): membership is whether
+  any point of that segment sits in the legal hit cylinder, and speed / aim
+  error are taken at the closest such point.  The tip is reported alongside so
+  the numbers stay comparable to the repo benches, which are tip-only.
 * **Collision.**  Evaluated on the path interpolated at ``collision_substeps``
   samples per segment (waypoints included), so between-waypoint tunnelling is
-  caught the way ``opt.verify()`` catches it.  The striking hand's contact geoms
-  are exempted from the target drum (and its under-volume) over the last
+  caught the way ``opt.verify()`` catches it.  Each hand is a stick capsule
+  (butt→tip) plus a wrist sphere, scored against every drum body / under-volume
+  and against the torso capsule / head sphere.  The striking hand's stick
+  capsule is exempted from the target drum (and its under-volume) over the last
   ``strike_exempt_waypoints`` waypoints -- you cannot both avoid a drum and hit
-  it.  Shaft points are exempted only for a shaft contact, mirroring
-  ``robot.strike_ignore_pairs``.
+  it.  The wrist is never exempted.  Hit membership is independent: pads stay
+  tip-only, cymbals/hihat use the playing-shaft capsule.
 """
 
 from __future__ import annotations
@@ -67,6 +71,7 @@ from .constants import (
     G1_UPPER_BODY_JOINTS,
     N_DOF,
     default_layout_path,
+    ready_joint_pos,
 )
 from .fk import (
     ChainFK,
@@ -76,23 +81,32 @@ from .fk import (
     stick_tip_offset,
 )
 from .limits import (
+    available_torque_np,
     isaac_effort_limits,
+    isaac_runtime_damping,
     isaac_runtime_stiffness,
     isaac_velocity_limits,
+    scale_soft_wrist_effort,
     urdf_position_limits,
 )
 from .rnea import BatchedRNEA
 from .sdf import (
     DrumSceneSpec,
+    hit_region_dist,
     point_capsule_sdf,
     point_cylinder_sdf,
     point_sphere_sdf,
+    segment_cylinder_sdf,
+    segment_hit_region,
+    segment_segment_sdf,
 )
 from .strike import (
     StrikeSpec,
     shaft_hit_allowed,
+    shaft_hit_sigma_range,
     stick_elevation_from_surface,
     stick_elevation_ok,
+    strike_axial_limits,
     strike_elevation_required,
     strike_from_drum,
 )
@@ -289,6 +303,12 @@ class AcceptanceThresholds:
     3 m/s strike is not held to the same absolute error as a 1 m/s one.
     """
 
+    #: Extra metres allowed outside the legal hit cylinder for ``on_head`` /
+    #: ``ok_hit``.  2 cm is a stick-bead / MPC-cleanup slack: the 81-grid is a
+    #: long-horizon plan, and a few millimetres of axial overshoot or rim
+    #: grazing is the roller's job.  0 restores a hard cylinder (tests that
+    #: pin exact membership pass ``hit_margin_m=0``).
+    hit_margin_m: float = 0.02
     #: ``ok_hit_tight`` only.  The primary hit test is membership of the legal
     #: hit disk (``on_head``), because that is what the solver is *constrained*
     #: to and what the RL hit detector scores.  Measured on the trajopt
@@ -304,6 +324,16 @@ class AcceptanceThresholds:
     torque_tol_nm: float = 0.0
     velocity_tol_rads: float = 0.0
     position_tol_rad: float = 0.0
+    #: Score ``ok_collision`` on BOTH hands rather than the striking one alone.
+    #:
+    #: The striking-hand-only rule was inherited from the repo grid, and it
+    #: makes ``ok_collision`` describe half the robot: the idle arm is parked by
+    #: the idle-home terms and can sit inside a drum for the whole horizon
+    #: without the case ever failing.  The scale is recorded in
+    #: ``scripts/_run_19m_waist.sh``: 159 of 243 cases have A hand inside a drum
+    #: once the idle arm is counted.  True is the honest gate; False restores
+    #: the old numbers for comparison against runs scored before 2026-08-14.
+    collision_both_hands: bool = True
 
 
 # ================================================================ scoring ====
@@ -358,6 +388,14 @@ class CaseScore:
     coll_pen_max_all_m: float
     coll_pen_count_all: int
     self_coll_min_sdf_m: float
+    #: Closest approach of the two hands' geometry to each other -- stick vs
+    #: stick, wrist vs stick, wrist vs wrist -- over the fine-sampled path.
+    #: REPORT ONLY: no ``ok_*`` flag reads it, because no planner is asked to
+    #: avoid it yet (``CostConfig.w_stick_stick`` is 0 by default).
+    stick_stick_min_sdf_m: float
+    #: Min torso-frame ``tip_L.y - tip_R.y`` over the fine path (m). Positive =
+    #: left tip more leftward. REPORT ONLY -- does not gate ``accepted``.
+    tip_lateral_min_m: float
     # --- torque (RNEA + armature, vs the Isaac effort limits) ---------------
     tau_max_nm: float
     tau_excess_max_nm: float
@@ -381,7 +419,7 @@ class CaseScore:
     accel_integral: float
     tip_path_len_m: float
     # --- acceptance ----------------------------------------------------------
-    ok_hit: bool        # contact point inside the legal hit disk
+    ok_hit: bool        # contact point inside the legal hit cylinder (+ hit_margin_m)
     ok_hit_tight: bool  # ... and within contact_pos_tol_m of the AIM point
     ok_speed: bool
     ok_collision: bool
@@ -420,7 +458,38 @@ class TrajectoryScorer:
         under_depth: float = 0.08,
         under_clearance: float = 0.01,
         thresholds: AcceptanceThresholds | None = None,
+        track_torque: bool = False,
+        track_torque_eta: float = 1.0,
+        track_torque_derate: str = "none",
+        soft_wrist_effort_scale: float = 1.0,
     ):
+        #: SCORE THE TORQUE THE PD CONTROLLER DEMANDS, not the plan's RNEA.
+        #:
+        #: With this on, ``tau_max_nm`` / ``tau_excess_max_nm`` /
+        #: ``tau_excess_max_frac`` / ``tau_frac_over`` / ``tau_knots_over`` and
+        #: the ``ok_torque`` gate (hence ``accepted``) are computed from
+        #: ``tau_rnea + tau_fb`` -- the same estimator the cost's tracking term
+        #: prices, built from the same FIR bank -- against
+        #: ``available_torque``.  It REPLACES the RNEA computation rather than
+        #: joining it: there is one torque column family, and it means whichever
+        #: of the two quantities this scorer was built for.  Numbers from a
+        #: ``track_torque=True`` run are therefore NOT comparable with numbers
+        #: from an older one, which is the deliberate trade -- a gate on the
+        #: quantity the loss does not optimize is worse than a discontinuity.
+        #:
+        #: ``eta``/``derate`` default to the raw hardware RATING (eta 1.0, no
+        #: velocity derate), because that is what ``ok_torque`` has always
+        #: meant and what Isaac clamps at; the cost hinges at ``eta_torque``
+        #: (0.8) so training keeps a margin against this gate.
+        #:
+        #: ``soft_wrist_effort_scale`` multiplies the four soft wrist pitch/yaw
+        #: ratings in this gate only (and should match
+        #: ``CostConfig.soft_wrist_effort_scale``).  IdealPD still clamps at
+        #: the unscaled Isaac table.
+        self.track_torque = bool(track_torque)
+        self.track_torque_eta = float(track_torque_eta)
+        self.track_torque_derate = str(track_torque_derate)
+        self.soft_wrist_effort_scale = float(soft_wrist_effort_scale)
         self.device = torch.device(device)
         self.dtype = dtype
         self.collision_substeps = max(int(collision_substeps), 1)
@@ -490,17 +559,39 @@ class TrajectoryScorer:
         self._pt_radii = t(
             np.concatenate([[TIP_RADIUS], np.full(shaft_samples, STICK_RADIUS), [WRIST_RADIUS]])
         )
+        self._stick_r = float(max(TIP_RADIUS, STICK_RADIUS))
+        self._wrist_r = float(WRIST_RADIUS)
         a, b, r = TORSO_CAPSULE
         self._torso_a, self._torso_b, self._torso_r = t(a), t(b), float(r)
         hc, hr = HEAD_SPHERE
         self._head_c, self._head_r = t(hc), float(hr)
         self._stick_axis_local = {h: t(stick_axis_local(h)) for h in ("left", "right")}
 
-        self.tau_limit = isaac_effort_limits()
+        self.tau_limit = scale_soft_wrist_effort(
+            isaac_effort_limits(), scale=self.soft_wrist_effort_scale,
+        )
         self.v_limit = isaac_velocity_limits()
         self.kp = isaac_runtime_stiffness()
         self.q_lo_hard, self.q_hi_hard = urdf_position_limits(posture_limits=False)
         self.q_lo_post, self.q_hi_post = urdf_position_limits(posture_limits=True)
+
+        #: FIR bank for the tracking-torque gate, built only when it is on.
+        #: Same identification as ``FusedCost.build_torque_kernels`` -- nominal
+        #: runtime gains, frozen diagonal mobility at the ready pose -- so the
+        #: gate and the loss cannot be measuring different filters.
+        self._tau_kernel = None
+        if self.track_torque:
+            from .constants import PD_SUBSTEPS, ready_joint_pos
+            from .pd_sim import extract_torque_kernels, mass_matrix
+
+            kp_t = self._t(isaac_runtime_stiffness())
+            kd_t = self._t(isaac_runtime_damping())
+            with torch.no_grad():
+                M = mass_matrix(self.rnea, self._t(ready_joint_pos()).view(1, -1))
+                minv_diag = torch.diagonal(torch.linalg.inv(M)[0])
+            self._tau_kernel = extract_torque_kernels(
+                kp_t, kd_t, minv_diag, dt=CONTROL_DT, substeps=PD_SUBSTEPS,
+            )
 
     # ------------------------------------------------------------- helpers --
     def _t(self, a: np.ndarray) -> torch.Tensor:
@@ -544,28 +635,79 @@ class TrajectoryScorer:
         R, p = self.fk.frame(Qt, f"{hand}_wrist")
         return ChainFK.points_world(R, p, self._pts_local[hand])  # (B, P, 3)
 
-    def _drum_sdf(self, pts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """(B, P, D) signed distances to the drum bodies and under-volumes."""
-        x = pts.unsqueeze(2)
-        ax = self._axes.view(1, 1, -1, 3)
-        rad = self._radii.view(1, 1, -1)
+    def _stick_drum_sdf(
+        self, butt: torch.Tensor, tip: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, D) stick-capsule signed distances to drum bodies and under-volumes."""
+        cap_b = segment_cylinder_sdf(
+            butt.unsqueeze(1), tip.unsqueeze(1),
+            self._body_c.unsqueeze(0), self._axes.unsqueeze(0),
+            self._radii.unsqueeze(0), self._half_h.unsqueeze(0),
+            ra=self._stick_r,
+        )
+        cap_u = segment_cylinder_sdf(
+            butt.unsqueeze(1), tip.unsqueeze(1),
+            self._under_c.unsqueeze(0), self._axes.unsqueeze(0),
+            self._radii.unsqueeze(0), self._under_half.unsqueeze(0),
+            ra=self._stick_r,
+        )
+        return cap_b, cap_u
+
+    def _wrist_drum_sdf(self, wrist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """(B, D) wrist-sphere signed distances to drum bodies and under-volumes."""
+        x = wrist.unsqueeze(1)
+        ax = self._axes.view(1, -1, 3)
+        rad = self._radii.view(1, -1)
         body = point_cylinder_sdf(
-            x, self._body_c.view(1, 1, -1, 3), ax, rad, self._half_h.view(1, 1, -1)
+            x, self._body_c.view(1, -1, 3), ax, rad, self._half_h.view(1, -1)
         )
         under = point_cylinder_sdf(
-            x, self._under_c.view(1, 1, -1, 3), ax, rad, self._under_half.view(1, 1, -1)
+            x, self._under_c.view(1, -1, 3), ax, rad, self._under_half.view(1, -1)
         )
-        r = self._pt_radii.view(1, -1, 1)
-        return body - r, under - r
+        return body - self._wrist_r, under - self._wrist_r
 
     def _self_sdf(self, Qt: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
+        """(B, 2) stick-capsule and wrist vs torso capsule / head sphere."""
         Rt, pt = self.fk.frame(Qt, "torso")
         a = pt + (Rt @ self._torso_a.view(1, 3, 1)).squeeze(-1)
         b = pt + (Rt @ self._torso_b.view(1, 3, 1)).squeeze(-1)
         hc = pt + (Rt @ self._head_c.view(1, 3, 1)).squeeze(-1)
-        s_t = point_capsule_sdf(pts, a.unsqueeze(1), b.unsqueeze(1), self._torso_r)
-        s_h = point_sphere_sdf(pts, hc.unsqueeze(1), self._head_r)
-        return torch.minimum(s_t, s_h) - self._pt_radii.view(1, -1)
+        tip, butt, wrist = pts[:, 0], pts[:, 1], pts[:, -1]
+        s_t = segment_segment_sdf(butt, tip, a, b, self._stick_r, self._torso_r)
+        s_h = segment_segment_sdf(butt, tip, hc, hc, self._stick_r, self._head_r)
+        s_wt = point_capsule_sdf(wrist, a, b, self._torso_r) - self._wrist_r
+        s_wh = point_sphere_sdf(wrist, hc, self._head_r) - self._wrist_r
+        return torch.stack(
+            [torch.minimum(s_t, s_h), torch.minimum(s_wt, s_wh)], dim=-1
+        )
+
+    def _stick_stick_sdf(self, pl: torch.Tensor, pr: torch.Tensor) -> torch.Tensor:
+        """(B,) cross-hand clearance: the two sticks and the two wrists.
+
+        REPORT-ONLY -- it gates nothing.  ``_self_sdf`` above compares each
+        hand's stick capsule and wrist against the TORSO and the HEAD; the two
+        hands were never compared against each other, so a case whose sticks
+        cross scored clean.
+
+        Row 0 of the point cloud is the bead and row 1 is the first shaft
+        sample, which ``stick_shaft_offsets`` places at the butt, so
+        ``[row 1 -> row 0]`` is the whole stick and a capsule pair sees the
+        crossing the 4 shaft SAMPLES (spread over ~0.22 m) would miss.
+        """
+        rs = float(max(self._pt_radii[0].item(), self._pt_radii[1].item()))
+        rw = float(self._pt_radii[-1].item())
+        l_tip, l_butt, l_wr = pl[:, 0], pl[:, 1], pl[:, -1]
+        r_tip, r_butt, r_wr = pr[:, 0], pr[:, 1], pr[:, -1]
+        return torch.minimum(
+            torch.minimum(
+                segment_segment_sdf(l_butt, l_tip, r_butt, r_tip, rs, rs),
+                segment_segment_sdf(l_wr, l_wr, r_butt, r_tip, rw, rs),
+            ),
+            torch.minimum(
+                segment_segment_sdf(r_wr, r_wr, l_butt, l_tip, rw, rs),
+                segment_segment_sdf(l_wr, l_wr, r_wr, r_wr, rw, rw),
+            ),
+        )
 
     # -------------------------------------------------------------- score ---
     def score(
@@ -591,7 +733,7 @@ class TrajectoryScorer:
         N = int(case.N)
         hand = case.hand
         spec = case.strike
-        sigma = spec.resolved_contact_sigma()
+        sigma_spec = spec.resolved_contact_sigma()
         thr = self.thresholds
 
         # ---- rates ---------------------------------------------------------
@@ -608,37 +750,59 @@ class TrajectoryScorer:
 
         # ---- terminal strike geometry --------------------------------------
         k = int(np.clip(spec.waypoint(dt), 1, N))
-        p_c, p_tip, d_stick = self.contact_world(Q[k], hand, sigma)
-        Jc = self.tip_jacobian(Q[k], hand, sigma)
-        Jt = self.tip_jacobian(Q[k], hand, None)
-        v_c = Jc @ qd[k]
-        v_tip = Jt @ qd[k]
-
         p_star = np.asarray(spec.position, float)
         v_star = np.asarray(spec.velocity, float)
         n_in = _unit(v_star)          # into the head
         n_out = -n_in                 # head normal, outward
+        rng = shaft_hit_sigma_range(spec.drum)
+        if rng is None:
+            sigma_lo = sigma_hi = float(sigma_spec)
+        else:
+            sigma_lo, sigma_hi = (float(rng[0]), float(rng[1]))
+        a_c, _p_lo, d_stick = self.contact_world(Q[k], hand, sigma_lo)
+        b_c, p_tip, _ = self.contact_world(Q[k], hand, sigma_hi)
+        d_off = (
+            np.zeros(3) if spec.disk_center_offset is None
+            else np.asarray(spec.disk_center_offset, float)
+        )
+        hp_dir = (
+            np.zeros(3) if spec.half_plane_dir is None
+            else np.asarray(spec.half_plane_dir, float)
+        )
+        has_hp = 0.0 if spec.half_plane_dir is None else 1.0
+        hit_R = spec.resolved_hit_radius()
+        ax_lo, ax_hi = strike_axial_limits()
+        m = float(thr.hit_margin_m)
+        tt = lambda x: self._t(x)
+        _, s_t, p_c_t = segment_hit_region(
+            tt(a_c), tt(b_c), tt(p_star), tt(n_out), hit_R,
+            tt(d_off), tt(hp_dir), has_hp, ax_lo, ax_hi, margin=0.0,
+        )
+        dist_m, _, _ = segment_hit_region(
+            tt(a_c), tt(b_c), tt(p_star), tt(n_out), hit_R,
+            tt(d_off), tt(hp_dir), has_hp, ax_lo, ax_hi, margin=m,
+        )
+        p_c = p_c_t.detach().cpu().numpy()
+        sigma = float(sigma_lo + float(s_t.item()) * (sigma_hi - sigma_lo))
+        on_head = bool(float(dist_m.item()) <= 1e-9)
+        _d0, axial_t, d_in_t = hit_region_dist(
+            tt(p_c), tt(p_star), tt(n_out), hit_R,
+            tt(d_off), tt(hp_dir), has_hp, ax_lo, ax_hi, margin=0.0,
+        )
+        axial = float(axial_t.item())
+        d_in = d_in_t.detach().cpu().numpy()
+        inplane = float(np.linalg.norm(d_in))
+        hp_margin = float("inf") if spec.half_plane_dir is None else float(d_in @ hp_dir)
+
+        Jc = self.tip_jacobian(Q[k], hand, sigma)
+        Jt = self.tip_jacobian(Q[k], hand, None)
+        v_c = Jc @ qd[k]
+        v_tip = Jt @ qd[k]
         speed = float(np.linalg.norm(v_c))
         speed_tgt = float(np.linalg.norm(v_star))
         into = float(v_c @ n_in)
         tang = float(np.linalg.norm(v_c - into * n_in))
         approach_deg = float(np.degrees(np.arccos(np.clip(into / max(speed, 1e-9), -1.0, 1.0))))
-
-        # on-head test, in the head plane, with the aim's disk offset applied
-        e = p_c - p_star
-        axial = float(e @ n_out)
-        e_in = e - axial * n_out
-        d_off = (
-            np.zeros(3) if spec.disk_center_offset is None
-            else np.asarray(spec.disk_center_offset, float)
-        )
-        inplane = float(np.linalg.norm(e_in - d_off))
-        hit_R = spec.resolved_hit_radius()
-        hp_margin = (
-            float("inf") if spec.half_plane_dir is None
-            else float((e_in - d_off) @ np.asarray(spec.half_plane_dir, float))
-        )
-        on_head = bool(inplane <= hit_R and abs(axial) <= 0.02 and hp_margin >= -1e-9)
 
         elev = stick_elevation_from_surface(d_stick, n_out)
         elev_deg = float(np.degrees(elev))
@@ -668,27 +832,24 @@ class TrajectoryScorer:
         )
 
         stats = {}
+        pts_by_hand = {}
         for h in ("left", "right"):
             pts = self._points_world(Qt, h)
-            sdf_b, sdf_u = self._drum_sdf(pts)
+            pts_by_hand[h] = pts
+            tip_w, butt_w, wrist_w = pts[:, 0], pts[:, 1], pts[:, -1]
+            cap_b, cap_u = self._stick_drum_sdf(butt_w, tip_w)
+            wr_b, wr_u = self._wrist_drum_sdf(wrist_w)
             sdf_self = self._self_sdf(Qt, pts)
-            keep = torch.ones(n_fine, self.n_points, self.scene.num_drums,
-                              device=self.device, dtype=self.dtype)
+            D = self.scene.num_drums
+            keep_cap = torch.ones(n_fine, D, device=self.device, dtype=self.dtype)
             if h == hand and tgt >= 0:
-                rows = [self.tip_index]
-                if spec.is_shaft_contact():
-                    rows += self.shaft_indices
-                keep[first_exempt:, rows, tgt] = 0.0
+                keep_cap[first_exempt:, tgt] = 0.0
             if h == hand and src >= 0:
-                rows = [self.tip_index]
-                if shaft_hit_allowed(case.start_drum):
-                    rows += self.shaft_indices
-                keep[:last_start_exempt, rows, src] = 0.0
-            m = keep <= 0.5
-            sb = sdf_b.masked_fill(m, float("inf"))
-            su = sdf_u.masked_fill(m, float("inf"))
+                keep_cap[:last_start_exempt, src] = 0.0
+            cap_b = cap_b.masked_fill(keep_cap <= 0.5, float("inf"))
+            cap_u = cap_u.masked_fill(keep_cap <= 0.5, float("inf"))
             allsdf = torch.cat(
-                [sb.reshape(n_fine, -1), su.reshape(n_fine, -1), sdf_self], dim=1
+                [cap_b, cap_u, wr_b, wr_u, sdf_self], dim=1
             )
             finite = allsdf[torch.isfinite(allsdf)]
             stats[h] = dict(
@@ -704,17 +865,51 @@ class TrajectoryScorer:
         coll_pen_all = max(act["pen_max"], oth["pen_max"])
         coll_cnt_all = act["pen_count"] + oth["pen_count"]
         self_min = min(act["self_min"], oth["self_min"])
+        # Cross-hand clearance over the same fine-sampled path.  REPORT ONLY --
+        # it is deliberately not in the ``ok_*`` conjunction: the planners are
+        # not yet asked to avoid it (``CostConfig.w_stick_stick`` defaults to 0),
+        # so gating on it would fail cases for a constraint nothing optimizes.
+        stick_min = float(
+            self._stick_stick_sdf(pts_by_hand["left"], pts_by_hand["right"]).min().item()
+        )
+        # Tip lateral ordering over the same fine path. REPORT ONLY.
+        Rt, pt = self.fk.frame(Qt, "torso")
+        tip_l = pts_by_hand["left"][:, 0, :]
+        tip_r = pts_by_hand["right"][:, 0, :]
+        yl = torch.einsum("bij,bj->bi", Rt.transpose(1, 2), tip_l - pt)[:, 1]
+        yr = torch.einsum("bij,bj->bi", Rt.transpose(1, 2), tip_r - pt)[:, 1]
+        tip_lateral_min = float((yl - yr).min().item())
 
         # ---- torque ----------------------------------------------------------
+        # ``tau`` is the plan's own inverse dynamics.  With ``track_torque`` on
+        # it is REPLACED, for every torque column and the gate alike, by the
+        # torque the PD servo would demand while tracking this command series:
+        # the same ``tau_rnea + tau_fb`` estimate the cost prices.  See the
+        # constructor.
         with torch.no_grad():
             tau = self.rnea.rnea(self._t(Q), self._t(qd), self._t(qdd)).cpu().numpy()
             tau_ff = self.rnea.rnea(
                 self._t(Q), self._t(qd), torch.zeros_like(self._t(qdd))
             ).cpu().numpy()
-        tau_abs = np.abs(tau)
-        tau_ex = np.maximum(0.0, tau_abs - self.tau_limit[None, :])
-        tau_frac_matrix = tau_abs / np.maximum(self.tau_limit[None, :], 1e-9)
         pd_err = np.abs(tau - tau_ff) / np.maximum(self.kp[None, :], 1e-9)
+        if self.track_torque:
+            from .pd_sim import feedback_torque
+
+            with torch.no_grad():
+                fb = feedback_torque(
+                    self._t(Q).unsqueeze(0), self._tau_kernel
+                )[0].cpu().numpy()
+            tau = tau + fb
+            tau_cap = available_torque_np(
+                qd, eta=self.track_torque_eta, derate=self.track_torque_derate,
+                effort_limit=self.tau_limit,
+            )
+            tau_cap = np.broadcast_to(tau_cap, tau.shape)
+        else:
+            tau_cap = np.broadcast_to(self.tau_limit[None, :], tau.shape)
+        tau_abs = np.abs(tau)
+        tau_ex = np.maximum(0.0, tau_abs - tau_cap)
+        tau_frac_matrix = tau_abs / np.maximum(tau_cap, 1e-9)
 
         # ---- velocity / joint box --------------------------------------------
         v_ex = np.maximum(0.0, np.abs(qd) - self.v_limit[None, :])
@@ -754,7 +949,9 @@ class TrajectoryScorer:
         ok_hit = bool((not failed) and on_head)
         ok_hit_tight = bool(ok_hit and contact_err <= thr.contact_pos_tol_m)
         ok_speed = bool((not failed) and speed_err <= speed_band)
-        ok_coll = bool(act["pen_count"] == 0)
+        ok_coll = bool(
+            (coll_cnt_all if thr.collision_both_hands else act["pen_count"]) == 0
+        )
         ok_coll_margin = bool(act["margin_count"] == 0)
         ok_tau = bool(float(tau_ex.max(initial=0.0)) <= thr.torque_tol_nm)
         ok_vel = bool(float(v_ex.max(initial=0.0)) <= thr.velocity_tol_rads)
@@ -801,6 +998,8 @@ class TrajectoryScorer:
             coll_pen_max_all_m=coll_pen_all,
             coll_pen_count_all=coll_cnt_all,
             self_coll_min_sdf_m=self_min,
+            stick_stick_min_sdf_m=stick_min,
+            tip_lateral_min_m=tip_lateral_min,
             tau_max_nm=float(tau_abs.max()),
             tau_excess_max_nm=float(tau_ex.max(initial=0.0)),
             tau_excess_max_frac=float(tau_frac_matrix.max()),
@@ -828,8 +1027,17 @@ class TrajectoryScorer:
             ok_torque=ok_tau,
             ok_velocity=ok_vel,
             ok_joint_limits=ok_pos,
+            # ``elev_ok`` joined the conjunction on 2026-08-14.  It had been
+            # computed and reported since the port but gated nothing, so a
+            # strike arriving at a physically wrong angle -- an in-plane graze
+            # or a near-normal tunnel -- counted as accepted.  The cost has been
+            # paying for it the whole time (``w_terminal_elev = 5.0``), so this
+            # makes the objective and the test agree rather than adding a new
+            # requirement.  It is vacuously True on the cymbals, which
+            # ``strike_elevation_required`` now exempts.
             accepted=bool(
-                ok_hit and ok_speed and ok_coll and ok_tau and ok_vel and ok_pos
+                ok_hit and ok_speed and ok_coll and ok_tau and ok_vel
+                and ok_pos and elev_ok
             ),
         )
 
@@ -843,17 +1051,17 @@ def _sample_box_start(
     q_lo: np.ndarray,
     q_hi: np.ndarray,
     scale: float,
+    hold: np.ndarray | None = None,
 ) -> np.ndarray:
     """Mid-range +- ``scale`` * half-range on the waist and the striking arm.
 
-    Mirrors ``bench_trajopt_norrt._sample_q_start``, which samples the reduced
-    (waist + one arm) model.  The idle arm is left at URDF neutral -- the pose
-    the repo's reduced model locks it at -- so the two grids describe the same
-    physical scenario even though this one carries all 17 DoF.
+    Unused joints stay at ``hold`` (ready pose) when given, else URDF zero.
+    Zero was the reduced-model trajopt convention; it parks the idle tip
+    under neighboring drums for a large share of waist yaws.
     """
     mid = 0.5 * (q_lo + q_hi)
     half = 0.5 * (q_hi - q_lo)
-    q = np.zeros(N_DOF)
+    q = np.zeros(N_DOF) if hold is None else np.asarray(hold, float).copy()
     idx = _WAIST_IDX + _ARM_IDX[hand]
     q[idx] = mid[idx] + scale * half[idx] * rng.uniform(-1.0, 1.0, size=len(idx))
     return np.clip(q, q_lo, q_hi)
@@ -868,16 +1076,79 @@ def _sample_box_velocity(
     return v
 
 
-def _goal_pose_vector(poses: dict, hand: str, drum: str) -> np.ndarray | None:
-    """A 17-DoF pose from ``drum_goal_poses.json`` (idle arm at neutral)."""
+def _goal_pose_vector(
+    poses: dict, hand: str, drum: str, *, hold: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """A 17-DoF pose from ``drum_goal_poses.json``.
+
+    Unused joints stay at ``hold`` (ready pose) when given, else URDF zero.
+    Zero parks the idle tip under neighboring cymbals for a large share of
+    waist yaws -- the same trap as :func:`_sample_box_start`.
+    """
     d = poses.get("poses", {}).get(hand, {}).get(drum)
     if not d:
         return None
-    q = np.zeros(N_DOF)
+    q = np.zeros(N_DOF) if hold is None else np.asarray(hold, float).copy()
     for i, name in enumerate(G1_UPPER_BODY_JOINTS):
         if name in d:
             q[i] = float(d[name])
     return q
+
+
+def _start_z_floor_m(scene, drums: Sequence[str]) -> float | None:
+    """Max head-z (scorer frame) over ``drums``, or ``None`` if the list is empty."""
+    names = list(drums)
+    if not names:
+        return None
+    zs = []
+    for n in names:
+        if n not in scene.names:
+            raise ValueError(f"start_above_drums: unknown drum {n!r}")
+        zs.append(float(scene.head_centers[scene.names.index(n)][2]))
+    return max(zs)
+
+
+def _stick_under_any_drum(
+    sc: "TrajectoryScorer",
+    q: np.ndarray,
+    *,
+    exempt_drum: int | None = None,
+) -> bool:
+    """True if any stick sample (tip / shaft / wrist) sits under a drum head.
+
+    'Under' is along that drum's axis (tilted cymbals included), inside the
+    head disk inflated by the sample's own radius.  The finite 8 cm under-
+    volume SDF misses a hanging stick that has gone past that shell -- the
+    eval box sampler was emitting tips parked under cymbals that then
+    collided on the first lift.
+    """
+    Qt = sc._t(np.asarray(q, float).reshape(1, -1))
+    heads = np.asarray(sc.scene.head_centers, float)
+    axes = np.asarray(sc.scene.axes, float)
+    radii = np.asarray(sc.scene.radii, float)
+    skip = (
+        int(exempt_drum)
+        if exempt_drum is not None and int(exempt_drum) >= 0 else -1
+    )
+    pt_r = sc._pt_radii.detach().cpu().numpy()
+    for h in ("left", "right"):
+        pts = sc._points_world(Qt, h)[0].detach().cpu().numpy()
+        for k, p in enumerate(pts):
+            rel = p[None, :] - heads
+            axial = (rel * axes).sum(axis=-1)
+            inplane = rel - axial[:, None] * axes
+            rho = np.linalg.norm(inplane, axis=-1)
+            hit = (axial < 0.0) & (rho <= radii + float(pt_r[k]) + 1e-9)
+            if 0 <= skip < hit.size:
+                hit[skip] = False
+            if np.any(hit):
+                return True
+    return False
+
+
+def _tip_under_any_drum(sc: "TrajectoryScorer", q: np.ndarray) -> bool:
+    """Back-compat alias for :func:`_stick_under_any_drum` (bead + shaft + wrist)."""
+    return _stick_under_any_drum(sc, q)
 
 
 def generate_grid(
@@ -899,6 +1170,10 @@ def generate_grid(
     near_drum_speed_noise: float = 0.15,
     near_drum_jitter_rad: float = 0.06,
     start_id: int = 0,
+    start_above_drums: Sequence[str] = ("snare", "floor_tom"),
+    start_z_margin_m: float = 0.0,
+    start_not_under_drums: bool | None = True,
+    start_clearance_m: float | None = None,
 ) -> list[EvalCase]:
     """Build a reproducible list of :class:`EvalCase`.
 
@@ -918,6 +1193,30 @@ def generate_grid(
     the middle horizon and speed.
 
     ``grid="standard+near_drum"`` concatenates the two, renumbering ids.
+
+    ``start_above_drums`` (snare + floor_tom by default) rejects a start if
+    either stick tip is below the highest of those drums' head planes.
+    Snare and floor_tom sit at pelvis z = 0; this drops the box-sampler's
+    hanging-below-the-kit poses that the rolling 81-grid was scoring as
+    collisions on arrival.  Pass ``()`` to disable the z-floor.
+
+    A z-floor is not enough: the idle arm at URDF zero sits under hi-hat /
+    cymbal *columns* even when snare z is cleared, and the finite 8 cm
+    under-volume SDF misses a stick that has gone past that shell.  By
+    default (``start_not_under_drums=True``) the sampler parks unused joints
+    at the ready pose and rejects any start whose tip, shaft, or wrist sits
+    under any drum head (axis-aligned disk, inflated by the sample radius).
+    Pass ``start_not_under_drums=False`` with an empty ``start_above_drums``
+    to recover the historical hanging 162-case grid.
+
+    ``start_clearance_m`` (2 cm by default whenever the modern start
+    screen is on) is the SDF floor at ``q_start``.  ``collision_free``
+    used to be ``min_sdf > 0``, so a 0.2 mm gap was a legal start and
+    the first knot clipped the neighbor.  ``None`` follows the other
+    screens: 2 cm with ``start_not_under_drums``, 0 with the historical
+    hanging flags.  Pass ``0`` explicitly to restore kissing starts on
+    an otherwise modern grid.  The source drum of a ``near_drum`` start
+    is exempted, same as the under-disk screen.
 
     Determinism: everything is drawn from ``np.random.default_rng(seed)`` in a
     fixed order, so the same seed gives byte-identical cases.  Rejection
@@ -939,6 +1238,10 @@ def generate_grid(
                 near_drum_speed_noise=near_drum_speed_noise,
                 near_drum_jitter_rad=near_drum_jitter_rad,
                 start_id=nid,
+                start_above_drums=start_above_drums,
+                start_z_margin_m=start_z_margin_m,
+                start_not_under_drums=start_not_under_drums,
+                start_clearance_m=start_clearance_m,
             )
             out.extend(sub)
             nid += len(sub)
@@ -960,15 +1263,47 @@ def generate_grid(
             )
     names = [n for n in scene.names if n in hand_of]
 
-    def collision_free(q: np.ndarray) -> bool:
+    z_floor = _start_z_floor_m(scene, start_above_drums)
+    if z_floor is not None:
+        z_floor = z_floor + float(start_z_margin_m)
+    not_under = (
+        bool(start_above_drums) if start_not_under_drums is None
+        else bool(start_not_under_drums)
+    )
+    if start_clearance_m is None:
+        start_clearance_m = 0.02 if not_under else 0.0
+    else:
+        start_clearance_m = float(start_clearance_m)
+    hold = np.clip(ready_joint_pos(), q_lo, q_hi) if not_under else None
+
+    def collision_free(q: np.ndarray, *, exempt_drum: int | None = None) -> bool:
         Qt = sc._t(q.reshape(1, N_DOF))
         worst = float("inf")
+        skip = (
+            int(exempt_drum)
+            if exempt_drum is not None and int(exempt_drum) >= 0 else -1
+        )
         for h in ("left", "right"):
             pts = sc._points_world(Qt, h)
-            b, u = sc._drum_sdf(pts)
+            cap_b, cap_u = sc._stick_drum_sdf(pts[:, 1], pts[:, 0])
+            wr_b, wr_u = sc._wrist_drum_sdf(pts[:, -1])
+            if skip >= 0:
+                cap_b = cap_b.clone()
+                cap_u = cap_u.clone()
+                cap_b[:, skip] = float("inf")
+                cap_u[:, skip] = float("inf")
             s = sc._self_sdf(Qt, pts)
-            worst = min(worst, float(b.min()), float(u.min()), float(s.min()))
-        return worst > 0.0
+            worst = min(
+                worst,
+                float(cap_b.min()), float(cap_u.min()),
+                float(wr_b.min()), float(wr_u.min()),
+                float(s.min()),
+            )
+            if z_floor is not None and float(pts[0, 0, 2]) < z_floor:
+                return False
+        if not_under and _stick_under_any_drum(sc, q, exempt_drum=exempt_drum):
+            return False
+        return worst > float(start_clearance_m)
 
     cases: list[EvalCase] = []
     cid = int(start_id)
@@ -981,23 +1316,48 @@ def generate_grid(
             for horizon in horizons:
                 for speed in speeds:
                     base = None
-                    for _ in range(48):
-                        cand = _sample_box_start(rng, hand, q_lo, q_hi, start_q_scale)
+                    n_try = 256 if not_under else (128 if z_floor is not None else 48)
+                    for _ in range(n_try):
+                        cand = _sample_box_start(
+                            rng, hand, q_lo, q_hi, start_q_scale, hold=hold,
+                        )
                         if collision_free(cand):
                             base = cand
                             break
                     if base is None:
-                        base = np.clip(
-                            _sample_box_start(rng, hand, q_lo, q_hi, start_q_scale), q_lo, q_hi
-                        )
+                        # Last resort: full ready pose (waist included) sits
+                        # above the kit; a box draw can still park a tip in a
+                        # neighboring drum's column after the torso yaws.
+                        # Kissing ready (sdf below the clearance floor) is
+                        # still rejected -- jitter around ready instead of
+                        # emitting a 0.2 mm start.
+                        ready = np.clip(ready_joint_pos(), q_lo, q_hi)
+                        if collision_free(ready):
+                            base = ready
+                        else:
+                            idx = _WAIST_IDX + _ARM_IDX[hand]
+                            for _ in range(n_try):
+                                j = np.zeros(N_DOF)
+                                j[idx] = rng.uniform(-jitter_rad, jitter_rad, size=len(idx))
+                                cand = np.clip(ready + j, q_lo, q_hi)
+                                if collision_free(cand):
+                                    base = cand
+                                    break
+                            if base is None:
+                                base = ready
                     N = max(int(round(float(horizon) / dt)), 4)
                     for rep in range(int(repeats)):
                         q0 = base
                         if rep:
-                            j = np.zeros(N_DOF)
                             idx = _WAIST_IDX + _ARM_IDX[hand]
-                            j[idx] = rng.uniform(-jitter_rad, jitter_rad, size=len(idx))
-                            q0 = np.clip(base + j, q_lo, q_hi)
+                            q0 = base
+                            for _ in range(48 if not_under else 24):
+                                j = np.zeros(N_DOF)
+                                j[idx] = rng.uniform(-jitter_rad, jitter_rad, size=len(idx))
+                                cand = np.clip(base + j, q_lo, q_hi)
+                                if collision_free(cand):
+                                    q0 = cand
+                                    break
                         v0 = (
                             np.zeros(N_DOF) if start_v_scale <= 0.0
                             else _sample_box_velocity(rng, hand, v_limit, start_v_scale)
@@ -1038,17 +1398,25 @@ def generate_grid(
             for src in names:
                 if src == name:
                     continue
-                q_src = _goal_pose_vector(poses, hand, src)
+                q_src = _goal_pose_vector(poses, hand, src, hold=hold)
                 if q_src is None:
                     continue
                 j_src = scene.names.index(src)
                 out_n = _unit(np.asarray(scene.axes[j_src], float))
                 for rep in range(int(near_drum_repeats)):
-                    jit = np.zeros(N_DOF)
-                    idx = _WAIST_IDX + _ARM_IDX[hand]
-                    jit[idx] = rng.uniform(-near_drum_jitter_rad, near_drum_jitter_rad,
-                                           size=len(idx))
-                    q0 = np.clip(q_src + jit, q_lo, q_hi)
+                    q0 = None
+                    n_try = 48 if not_under else 1
+                    for _ in range(n_try):
+                        jit = np.zeros(N_DOF)
+                        idx = _WAIST_IDX + _ARM_IDX[hand]
+                        jit[idx] = rng.uniform(-near_drum_jitter_rad, near_drum_jitter_rad,
+                                               size=len(idx))
+                        cand = np.clip(q_src + jit, q_lo, q_hi)
+                        if not not_under or collision_free(cand, exempt_drum=j_src):
+                            q0 = cand
+                            break
+                    if q0 is None:
+                        continue
                     # departure tip velocity: off the source head, noised
                     d = out_n + near_drum_speed_noise * rng.normal(size=3)
                     v_tip = float(
@@ -1144,6 +1512,7 @@ _SUMMARY_METRICS: tuple[tuple[str, str, float], ...] = (
     ("coll_min_sdf_m", "min clearance, active (mm)", 1000.0),
     ("coll_pen_max_m", "max penetration, active (mm)", 1000.0),
     ("coll_pen_max_all_m", "max penetration, both (mm)", 1000.0),
+    ("tip_lateral_min_m", "tip lateral min L.y-R.y (mm)", 1000.0),
     ("tau_excess_max_nm", "torque excess (N.m)", 1.0),
     ("tau_excess_max_frac", "peak torque / limit", 1.0),
     ("vel_excess_max_rads", "velocity excess (rad/s)", 1.0),
@@ -1185,7 +1554,7 @@ def aggregate(rows: Sequence[CaseScore]) -> dict:
         out["metrics"][attr] = dict(
             label=label,
             mean=float(np.mean(fin)) if fin else float("nan"),
-            p50=_p(v, 50), p90=_p(v, 90),
+            p10=_p(v, 10), p50=_p(v, 50), p90=_p(v, 90),
             max=float(np.max(fin)) if fin else float("nan"),
             min=float(np.min(fin)) if fin else float("nan"),
         )

@@ -21,8 +21,10 @@ import pytest
 import torch
 
 import amortized_opt as A
-from amortized_opt.constants import ready_joint_pos
+from amortized_opt.constants import PELVIS_IN_ENV, ready_joint_pos
 from amortized_opt.cost import CostConfig, FusedCost, StrikeContext, drum_heads_from_context
+from amortized_opt.fk import ChainFK
+from amortized_opt.ik import correct_tip
 from amortized_opt.limits import isaac_velocity_limits, urdf_position_limits
 from amortized_opt.mpc_gen import MPCGenConfig, MPCGenerator
 
@@ -195,11 +197,32 @@ def cost_and_case():
 
 
 def _batch_from_case(cost, case, planner):
+    """A batch whose plan actually AIMS AT the nominal head.
+
+    ``quintic_case_planner`` takes its terminal from ``GoalPoseLibrary``, which
+    is keyed on (hand, drum, waist_yaw) and stores a JOINT pose -- so it is
+    blind to the fitted stick, and a change to ``constants.py``'s stick geometry
+    leaves the terminal missing the head by ~18 cm.  That silently destroys the
+    PREMISE of the shift test below: with an 18 cm baseline miss, moving the
+    drum 5 cm can move the target TOWARD where the tip actually is, and
+    ``contact_pos_err`` goes DOWN.  The test then fails while measuring nothing.
+    Re-aim the terminal first (:func:`~amortized_opt.ik.correct_tip`) so the
+    baseline really is "on the nominal head", which is what the assertions read.
+    """
     res = planner(case)
     Q = np.asarray(res.Q if hasattr(res, "Q") else res, float)
+    fk = ChainFK(device=cost.device, dtype=torch.float64)
+    aim = np.asarray(case.strike.position, float) + PELVIS_IN_ENV
+    Q[-1] = correct_tip(
+        fk,
+        torch.as_tensor(Q[-1][None, :], dtype=torch.float64),
+        torch.as_tensor(aim[None, :], dtype=torch.float64),
+        case.hand, steps=4, q_bounds=urdf_position_limits(),
+    )[0].numpy()
     H = cost.max_horizon
     wp = np.repeat(Q[-1][None, :], H, axis=0)
     wp[: Q.shape[0] - 1] = Q[1:]
+    wp[Q.shape[0] - 2 :] = Q[-1]          # hold the corrected terminal
     ctx = A.strike_context_from_cases([case], drum_index=cost.drum_index,
                                       device=cost.device, dtype=cost.dtype)
     t = lambda a: torch.as_tensor(np.asarray(a, float), device=cost.device, dtype=cost.dtype)

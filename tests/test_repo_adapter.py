@@ -176,9 +176,9 @@ def test_embedding_preserves_solution_and_freezes_idle_arm(planner, adapter, sco
     idx = adapter.ARM_INDEX[c.hand]
     idle = [i for i in range(N_DOF) if i not in idx]
     assert len(idle) == 7
-    # idle arm: constant, and equal to the case's start value (URDF neutral)
+    # idle arm: constant, and equal to the case's start value (ready pose;
+    # generate_grid no longer parks unused joints at URDF zero)
     assert np.allclose(Q[:, idle], c.q_start[None, idle], atol=0)
-    assert np.allclose(c.q_start[idle], 0.0, atol=0)
     # start pose is pinned
     np.testing.assert_allclose(Q[0], c.q_start, atol=1e-9)
     # the solved columns actually move

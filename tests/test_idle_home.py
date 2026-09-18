@@ -26,6 +26,10 @@ from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits, urdf_posit
 from amortized_opt.sdf import DrumSceneSpec, SdfPenalty
 from amortized_opt.warmstart import GoalPoseLibrary, arm_slice, warmstart_trajectory
 
+pytestmark = pytest.mark.skip(
+    reason="superseded by test_idle_cylinder.py joint-home full replace"
+)
+
 _N_ARM = 7
 _HANDS = ("left", "right")
 
@@ -400,7 +404,7 @@ def _roller_bits():
     H = 25
     kit = A.DrumKit.from_layout()
     clips = A.load_rcc_pool(A.default_rcc_dir("train"), kit)
-    cfg = Phase2ScenarioConfig(horizon=H, buckets=(H,), apex_init_frac=0.0)
+    cfg = Phase2ScenarioConfig(horizon=H, buckets=(H,))
     raw = generate_cost_scenarios(200, clips, seed=3, cfg=cfg)
     pool = Phase2Pool(raw["buckets"], cfg=cfg, device="cpu")
     torch.manual_seed(0)

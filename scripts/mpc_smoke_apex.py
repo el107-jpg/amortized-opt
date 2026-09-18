@@ -26,8 +26,14 @@ import amortized_opt as A  # noqa: E402
 from amortized_opt.rhythm import build_context_inputs  # noqa: E402
 
 
-def model_planner(model, device, *, num_drums=8, num_future=3, amp_dtype=None):
-    """``(PlanRequest) -> (H, 17)``: one refinement pass from the request's init."""
+def model_planner(model, device, *, num_drums=8, num_future=3, amp_dtype=None,
+                  waist_cfg=None):
+    """``(PlanRequest) -> (H, 17)``: one refinement pass from the request's init.
+
+    ``waist_cfg`` is the ``WaistAimConfig`` the context's ``aim_yaw`` is
+    computed with -- pass the one the checkpoint was trained against (every
+    pool builder passes ``cfg.waist_cfg``).  ``None`` keeps the default.
+    """
     dev = torch.device(device)
     core = model.module if hasattr(model, "module") else model
     core.eval()
@@ -37,6 +43,10 @@ def model_planner(model, device, *, num_drums=8, num_future=3, amp_dtype=None):
         ctx = build_context_inputs(
             req.kit, req.snapshot, num_drums=num_drums, num_future=num_future,
             frame="env", device=dev, dtype=torch.float32,
+            yaw_now=np.asarray(req.q, float)[
+                A.G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
+            ],
+            waist_cfg=waist_cfg,
         )
         t = lambda a: torch.as_tensor(  # noqa: E731
             np.asarray(a, float), device=dev, dtype=torch.float32

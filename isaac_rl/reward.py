@@ -65,6 +65,12 @@ import torch
 from amortized_opt.constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, PELVIS_IN_ENV
 from amortized_opt.cost import CostTerms, FusedCost, StrikeContext
 from amortized_opt.fk import ChainFK, stick_axis_local, stick_mount_transform, stick_tip_offset
+from amortized_opt.sdf import segment_hit_region
+from amortized_opt.strike import (
+    CYMBAL_CONTACT_SIGMA_FALLBACK,
+    STICK_TIP_SIGMA,
+    strike_axial_limits,
+)
 from amortized_opt.train_cost import group_lengths
 
 __all__ = [
@@ -205,13 +211,12 @@ class ExecutedStrikeScorer:
     Two geometry details are the reason this cannot be a naive tip-vs-disk test
     and are ported rather than re-derived:
 
-    * the contact point is ``tip + sigma * u`` along the stick, where ``sigma``
-      is ``strike.default_contact_sigma`` -- on a cymbal or hi-hat the legal
-      contact runs up to ~15 cm from the tip along the SHAFT, and the impact
-      speed requirement applies at the contact point, not at the tip;
-    * the legal region is a disk about ``disk_center`` (which is offset from
-      the head centre on cymbals and toms) intersected with a half-plane
-      (``has_half_plane``), which is what keeps a tom strike on the near side.
+    * pads are scored at the bead; cymbals and the hi-hat use the playing-shaft
+      capsule (``shaft_hit_sigma_range``), the same primitive as
+      ``FusedCost._terminal`` / ``probe.head_frame_error``;
+    * the legal region is a disk about ``disk_center`` (offset from the head
+      centre on cymbals and toms) intersected with a half-plane
+      (``has_half_plane``).
     """
 
     def __init__(self, *, fk: ChainFK, dt: float = CONTROL_DT, device=None,
@@ -246,6 +251,31 @@ class ExecutedStrikeScorer:
             pts.append(base + sigma[:, hi:hi + 1] * u)
             dirs.append(u)
         return torch.stack(pts, dim=1), torch.stack(dirs, dim=1)
+
+    def _sigma_span(self, ctx: StrikeContext):
+        spec = ctx.contact_sigma
+        fb = spec.new_full(spec.shape, float(CYMBAL_CONTACT_SIGMA_FALLBACK))
+        if ctx.stick_tip_sigma is None:
+            tip = spec.new_full(spec.shape, float(STICK_TIP_SIGMA))
+        else:
+            tip = ctx.stick_tip_sigma.to(dtype=spec.dtype)
+        shaft = ctx.shaft_allowed
+        lo = torch.where(shaft > 0.5, fb, spec)
+        hi = torch.where(shaft > 0.5, tip, spec)
+        return torch.minimum(lo, hi), torch.maximum(lo, hi)
+
+    def best_contact(self, q: torch.Tensor, ctx: StrikeContext):
+        """Playing-shaft (or bead) closest point to each hand's legal region."""
+        lo, hi = self._sigma_span(ctx)
+        a, _u = self.contact_points(q, lo)
+        b, _ = self.contact_points(q, hi)
+        ax_lo, ax_hi = strike_axial_limits()
+        dist, s, p = segment_hit_region(
+            a, b, ctx.p_star, ctx.n_out, ctx.hit_radius,
+            ctx.disk_offset, ctx.half_plane_dir, ctx.has_half_plane,
+            ax_lo, ax_hi,
+        )
+        return dist, s, p
 
     def head_frame(self, pts: torch.Tensor, ctx: StrikeContext):
         """``(axial, inplane)`` of ``(B, 2, 3)`` points in each hand's head frame.
@@ -282,15 +312,14 @@ class ExecutedStrikeScorer:
         test and the impact speed are evaluated at the interpolated pose rather
         than at the nearer knot.
         """
-        sigma = ctx.contact_sigma
-        p0, _u0 = self.contact_points(q0, sigma)
-        p1, _u1 = self.contact_points(q1, sigma)
+        _dist0, _s0, p0 = self.best_contact(q0, ctx)
+        _dist1, _s1, p1 = self.best_contact(q1, ctx)
         a0, _i0 = self.head_frame(p0, ctx)
         a1, _i1 = self.head_frame(p1, ctx)
         crossed = (a0 > 0.0) & (a1 <= 0.0) & (ctx.active > 0.5)
         u = (a0 / (a0 - a1).clamp_min(1e-12)).clamp(0.0, 1.0)
         qc = q0 + u.max(dim=1).values.unsqueeze(-1) * (q1 - q0)
-        pc, _uc = self.contact_points(qc, sigma)
+        _dc, _sc, pc = self.best_contact(qc, ctx)
         ac, ic = self.head_frame(pc, ctx)
         speed = (p1 - p0).norm(dim=-1) / self.dt
         return ContactScore(
@@ -307,20 +336,41 @@ class ExecutedStrikeScorer:
     def any_drum_contact(self, q0: torch.Tensor, q1: torch.Tensor,
                          heads: torch.Tensor, axes: torch.Tensor,
                          radii: torch.Tensor, valid: torch.Tensor,
-                         sigma: torch.Tensor) -> torch.Tensor:
-        """``(B, 2, D)`` bool: which drum heads the contact point crossed.
+                         sigma: torch.Tensor,
+                         shaft_allowed: torch.Tensor | None = None) -> torch.Tensor:
+        """``(B, 2, D)`` bool: which drum heads the contact geometry crossed.
 
-        The stray-hit detector.  Cheap: one FK pass per endpoint (shared with
-        :meth:`score` by the caller) and a broadcast against the ``D`` heads.
+        Pads: the bead.  When ``shaft_allowed`` is set, that hand uses the
+        playing-shaft capsule against every head (a shaft graze on a neighbouring
+        cymbal still counts).
         """
-        p0, _ = self.contact_points(q0, sigma)
-        p1, _ = self.contact_points(q1, sigma)
-        h = heads.unsqueeze(1)                                    # (B,1,D,3)
+        if shaft_allowed is None:
+            lo = hi = sigma
+        else:
+            fb = sigma.new_full(sigma.shape, float(CYMBAL_CONTACT_SIGMA_FALLBACK))
+            tip = sigma.new_full(sigma.shape, float(STICK_TIP_SIGMA))
+            lo = torch.where(shaft_allowed > 0.5, fb, sigma)
+            hi = torch.where(shaft_allowed > 0.5, tip, sigma)
+        a0, _ = self.contact_points(q0, lo)
+        b0, _ = self.contact_points(q0, hi)
+        a1, _ = self.contact_points(q1, lo)
+        b1, _ = self.contact_points(q1, hi)
+        h = heads.unsqueeze(1)
         n = axes.unsqueeze(1)
-        d0 = ((p0.unsqueeze(2) - h) * n).sum(-1)                  # (B,2,D)
-        d1 = ((p1.unsqueeze(2) - h) * n).sum(-1)
+        zoff = h.new_zeros(h.shape)
+        hp = h.new_zeros(h.shape)
+        dist0, _s0, p0 = segment_hit_region(
+            a0.unsqueeze(2), b0.unsqueeze(2), h, n, radii.unsqueeze(1),
+            zoff, hp, 0.0, -1.0e3, 1.0e3,
+        )
+        dist1, _s1, p1 = segment_hit_region(
+            a1.unsqueeze(2), b1.unsqueeze(2), h, n, radii.unsqueeze(1),
+            zoff, hp, 0.0, -1.0e3, 1.0e3,
+        )
+        d0 = ((p0 - h) * n).sum(-1)
+        d1 = ((p1 - h) * n).sum(-1)
         u = (d0 / (d0 - d1).clamp_min(1e-12)).clamp(0.0, 1.0).unsqueeze(-1)
-        pc = p0.unsqueeze(2) + u * (p1.unsqueeze(2) - p0.unsqueeze(2))
+        pc = p0 + u * (p1 - p0)
         rad = pc - h
         rad = rad - ((rad * n).sum(-1, keepdim=True)) * n
         inside = rad.norm(dim=-1) <= radii.unsqueeze(1)
@@ -463,7 +513,7 @@ class ExecutedReward:
         if drum_heads is not None:
             hits_any = self.scorer.any_drum_contact(
                 q_before, q_after, drum_heads, drum_axes, drum_radii, drum_valid,
-                ctx.contact_sigma,
+                ctx.contact_sigma, ctx.shaft_allowed,
             )                                                     # (B, 2, D)
             goal_oh = torch.nn.functional.one_hot(
                 ctx.target_drum.clamp_min(0), hits_any.shape[2]

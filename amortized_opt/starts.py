@@ -21,6 +21,16 @@ So a sample is one of two kinds:
   the model never sees a perfectly axial rebound.
 * **neutral** (the rest): the drummer ready pose plus joint-space Gaussian
   noise and a small random velocity.
+* **cold** (off by default, see :attr:`StartConfig.cold_fraction`): a neutral
+  pose whose waist yaw is redrawn UNIFORMLY over the aim law's policy range
+  instead of from the library's yaw grid. The point is not the pose but the
+  *independence*: every other family puts the torso somewhere the goals would
+  have put it, which leaves ``yaw_now`` and the analytic aim collinear on the
+  training distribution and the waist set-point head unable to tell which of
+  the two it is being paid to follow (2026-08-14 waist-yaw runaway). Only the
+  neutral family can carry it -- a drum-departure pose is the library's IK
+  solution AT its yaw, so overriding the yaw underneath it would describe a
+  robot that is not the one the arms were solved for.
 
 Both hands are placed independently (the plan's "training will include training
 data where both arms are hitting different things"), sharing one waist yaw
@@ -53,6 +63,7 @@ from .limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from .pd_sim import mass_matrix
 from .rhythm import HANDS, DrumKit
 from .sdf import DrumSceneSpec, SdfPenalty
+from .waist_aim import _DEFAULT_YAW_LIMIT
 from .warmstart import GoalPoseLibrary, arm_slice
 
 __all__ = ["StartConfig", "StartBatch", "StartSampler"]
@@ -60,6 +71,7 @@ __all__ = ["StartConfig", "StartBatch", "StartSampler"]
 #: Sample "kind" codes stored on :class:`StartBatch`.
 KIND_DRUM = 0
 KIND_NEUTRAL = 1
+KIND_COLD = 2
 
 
 @dataclass
@@ -74,6 +86,16 @@ class StartConfig:
     neutral_q_jitter: float = 0.18
     #: Waist jitter (rad, sd) on top of the drawn grid yaw.
     waist_jitter: float = 0.05
+    #: Fraction of samples drawn COLD -- neutral pose, waist yaw uniform over
+    #: +/- ``cold_yaw_limit`` and independent of everything else. 0.0 (the
+    #: default) reproduces the two-family sampler exactly, including its RNG
+    #: stream; the phase-2 generator turns it on per call.
+    cold_fraction: float = 0.0
+    #: Half-range of the cold yaw draw (rad), clipped to the URDF box. The aim
+    #: law's own policy limit (``waist_aim._DEFAULT_YAW_LIMIT``, 100 deg): a
+    #: torso parked outside the range the aimer is ever allowed to command is a
+    #: state the closed loop cannot reach, so it would only spend samples.
+    cold_yaw_limit: float = _DEFAULT_YAW_LIMIT
     #: Departure tip-speed range (m/s) -- a rebound, not a strike.
     departure_speed: tuple[float, float] = (0.3, 2.0)
     #: Gaussian sd of the departure-direction cone half-angle (rad).
@@ -236,6 +258,17 @@ class StartSampler:
             return np.clip(q, self.q_lower, self.q_upper), v_tip, drums, KIND_DRUM
 
         q = self.ready + rng.normal(0.0, cfg.neutral_q_jitter, size=self.n)
+        if kind == KIND_COLD:
+            # The yaw is drawn LAST and overwrites the jitter rather than adding
+            # to it: the whole point of a cold start is that this number carries
+            # no information about where the goals are, and a jitter around the
+            # ready pose's yaw would leak the ready pose back in.
+            lim = min(
+                float(cfg.cold_yaw_limit),
+                float(min(-self.q_lower[self._yaw_idx], self.q_upper[self._yaw_idx])),
+            )
+            q[self._yaw_idx] = float(rng.uniform(-lim, lim))
+            return np.clip(q, self.q_lower, self.q_upper), v_tip, drums, KIND_COLD
         return np.clip(q, self.q_lower, self.q_upper), v_tip, drums, KIND_NEUTRAL
 
     # -------------------------------------------------------- velocity IK --
@@ -264,6 +297,7 @@ class StartSampler:
         seed: int | None = None,
         rng: np.random.Generator | None = None,
         kit: DrumKit | None = None,
+        cold_fraction: float | None = None,
     ) -> StartBatch:
         """``batch`` accepted start states. ``seed`` pins the batch exactly.
 
@@ -273,6 +307,14 @@ class StartSampler:
         the same geometry the cost and the goal tokens will use; with the
         nominal kit the screen accepts poses that are inside a shifted drum and
         rejects poses that are not.
+
+        ``cold_fraction`` overrides :attr:`StartConfig.cold_fraction` for THIS
+        call, which is how a caller that decides cold-ness per scenario (the
+        phase-2 generator) draws an all-cold chunk from the same sampler.  Cold
+        slots that exhaust their rejection budget fall back to the ready pose
+        and are reported as ``KIND_NEUTRAL``, not ``KIND_COLD``: the fallback
+        sits at yaw 0, which is exactly the correlation a cold start exists to
+        break, so it must not be mislabelled as one.
         """
         if rng is None:
             rng = np.random.default_rng(seed)
@@ -282,6 +324,14 @@ class StartSampler:
         heads_env = (
             None if kit is self.kit
             else self._t(kit.positions_in("env")).unsqueeze(0)   # (1, D, 3)
+        )
+        # RADII travel with the centres: ``KitRandomization.per_drum_radius``
+        # resizes the collision cylinder, so screening a shifted kit against
+        # nominal radii reintroduces exactly the disagreement ``heads_env``
+        # removes, one drum dimension over.
+        radii_env = (
+            None if heads_env is None
+            else self._t(kit.radii).unsqueeze(0)                  # (1, D)
         )
 
         q_out = np.empty((B, self.n))
@@ -296,6 +346,12 @@ class StartSampler:
         kinds = np.where(
             rng.uniform(size=B) < cfg.drum_fraction, KIND_DRUM, KIND_NEUTRAL
         ).astype(np.int64)
+        cold_f = float(cfg.cold_fraction if cold_fraction is None else cold_fraction)
+        if cold_f > 0.0:
+            # Drawn only when asked for, so the default sampler's RNG stream --
+            # and therefore every pool generated before cold starts existed --
+            # is unchanged bit for bit.
+            kinds = np.where(rng.uniform(size=B) < cold_f, KIND_COLD, kinds)
 
         pending = list(range(B))
         # Candidates are proposed and screened in waves so the collision check
@@ -316,13 +372,17 @@ class StartSampler:
             dt_r = torch.as_tensor(cand_d[:, 1], device=self.device)
             with torch.no_grad():
                 # A hand resting on the drum it has just struck is not "in
-                # collision" with that drum -- suspend its tip row, exactly as
-                # the trajectory cost does over the last waypoints of a strike.
+                # collision" with that drum -- exempt the stick capsule, exactly
+                # as the trajectory cost does over the last waypoints of a strike.
                 _, det = self.sdf.forward(
                     qt, target_drum_left=dt_l, target_drum_right=dt_r,
                     drum_head_centers=(
                         None if heads_env is None
                         else heads_env.expand(qt.shape[0], -1, -1)
+                    ),
+                    drum_radii=(
+                        None if radii_env is None
+                        else radii_env.expand(qt.shape[0], -1)
                     ),
                     return_details=True,
                 )
@@ -360,8 +420,9 @@ class StartSampler:
         active = drum >= 0
         qd = self.departure_velocity(q, v_tip, active)
 
-        # Neutral starts get a small random joint velocity instead.
-        neutral = torch.as_tensor(kind_out == KIND_NEUTRAL, device=self.device)
+        # Starts that are not departing a drum get a small random joint velocity
+        # instead -- neutral and cold alike, since neither has a tip task.
+        neutral = torch.as_tensor(kind_out != KIND_DRUM, device=self.device)
         if bool(neutral.any()):
             noise = self._t(
                 cfg.neutral_v_scale * self.v_limit[None, :] * rng.normal(size=(B, self.n))
