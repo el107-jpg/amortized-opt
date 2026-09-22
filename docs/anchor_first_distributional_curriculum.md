@@ -22,19 +22,24 @@ critic together from the ordinary Phase-1 initialization.
    - calibration can find a finite risk threshold meeting `risk_min_precision`.
 6. Once open, physical tasks are grouped before timing expansion.  At batch
    512, 40 independently sampled `(q, qdot, drum goals)` tasks each generate
-   two conservative directional Pareto-frontier timings and four random
+   one permanent `(1 s, 1 s)` anchor, one conservative directional
+   Pareto-frontier timing, and four random
    component-wise-looser timings inside the rectangle from that frontier point
-   to `(1 s, 1 s)`.  This produces 80 boundary and 160 interior rows.
+   to `(1 s, 1 s)`.  This produces 40 anchor, 40 boundary, and 160 interior
+   rows.
 7. The remaining 272 primary rows come from the exact-confirmed shifted-plan
    generation produced by the preceding outer step.  The generation is fully
    replaced every step, rather than accumulated in an unbounded replay.  If it
    is empty, its slots use distinct 1-second anchors.  MPC ingress permits a
    terminal miss up to 40 mm and collision SDF down to -10 mm; joint and torque
    retain the configured normalized close-feasibility threshold.
-8. Every proposed boundary/interior row receives a no-gradient actor/physics
-   evaluation.  Only rows within the configured normalized violation range
-   replace their anchor rows in actor training; accepted and rejected
-   evaluations both train the critic.
+8. Critic-selected boundary/interior rows enter the ordinary actor batch
+   directly; there is no separate actor/physics pre-admission pass.  The normal
+   actor cost pass produces exact labels for every admitted row and updates the
+   critic once.  Reported `accepted` counts are therefore post-selection
+   feasibility telemetry, not an admission gate.  If the critic rejects even
+   the anchor, the boundary proposal still takes one step off the permanent
+   anchor to prevent an uncertain critic from creating a permanent blind spot.
 9. Suffix-Bellman parents are drawn proportionally from every primary stratum,
    not only MPC rows.  Their exact child diagnostics train the same critic with
    the same per-example loss.  Temporal-consistency child solves are disabled
@@ -57,19 +62,22 @@ during anchor training; this is separate from the anchor proficiency EMA.
 --timing-anchor-min-samples 2048
 --timing-anchor-min-close-rate 0.50
 --timing-acceptable-normalized-violation 0.2
---timing-risk-min-precision 0.50
+--timing-risk-min-precision 0.70
 --timing-critic-assist-frac 0.05
 --timing-global-ood-fraction 4.0
 --timing-global-ood-weight 0.0025
 --timing-primary-base-tasks-per-512 40
---timing-primary-boundary-per-task 2
+--timing-primary-anchor-per-task 1
+--timing-primary-boundary-per-task 1
 --timing-primary-interior-per-task 4
 --timing-primary-mpc-terminal-limit 0.040
 --timing-primary-mpc-collision-sdf-limit -0.010
 ```
 
-The small assist fraction makes expansion gradual.  The exact verification
-barrier, rather than critic calibration alone, controls actor admission.
+The small assist fraction makes expansion gradual.  Critic risk and uncertainty
+control timing selection; permanent 1-second anchors preserve the easy end of
+the curriculum, while the ordinary actor pass supplies the corrective labels
+for bad selections.
 
 ## CPU smoke results
 
@@ -79,10 +87,10 @@ All active TTH values were exactly 1 second, anchor close-feasibility EMA was
 zero, calibration produced no finite threshold, and the curriculum correctly
 remained closed.
 
-A separate intentionally permissive smoke (`acceptable_normalized_violation =
-10`) forced the transition for plumbing validation.  Step 1 opened the
-curriculum; step 2 proposed and exact-evaluated 32 shortened rows, committed all
-32 under the artificial range, stored shortened labels down to one knot, and
-checkpointed the open state.  This run is not a quality result—the permissive
-range caused the actor loss to jump—and exists only to verify the complete
-closed-to-open execution path.
+A 50-step GPU smoke forked from the calibrated 0.70-precision checkpoint and
+ran the direct-admission path at batch 512.  It preserved 40 anchors, generated
+40 boundary and 160 interior rows, and used 272 previous-step MPC rows per
+step.  Mean throughput was about 0.59 step/s, the actor loss fell from roughly
+168 to 148, and exact labels from the normal pass showed 12–16 manageable
+advanced boundary rows and 50–60 manageable advanced interior rows per logged
+window.  The run is at `runs/timing_direct_admission_smoke_20260918`.

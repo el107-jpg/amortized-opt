@@ -12,6 +12,8 @@ import torch
 
 from amortized_opt.constants import G1_UPPER_BODY_JOINTS
 from amortized_opt.impedance import (
+    ContactAwareStrikeImpedance,
+    ContactAwareStrikeImpedanceConfig,
     StrikeImpedance,
     StrikeImpedanceConfig,
     distal_joint_masks,
@@ -119,3 +121,93 @@ def test_pd_sim_step_gain_scale_equals_prescaled_gains():
     qa3, _, _ = sim.step(prev, cmd, q0, v0)
     qa4, _, _ = sim.step(prev, cmd, q0, v0, kp=kp, kd=kd)
     assert torch.equal(qa3, qa4)
+
+
+def test_contact_policy_follows_through_then_recovers_smoothly():
+    cfg = ContactAwareStrikeImpedanceConfig(
+        kp_scale=0.5, kd_scale=0.7, before_wp=0,
+        followthrough_wp=1, contact_hold_wp=3, recovery_wp=3,
+    )
+    imp = ContactAwareStrikeImpedance(cfg, batch=1)
+    idle = _idle()
+    hit_now = torch.tensor([[0.0, -1.0]])
+    j = LEFT_DISTAL[0]
+
+    # Scheduled strike tick is fully soft.
+    kp, kd = imp.scales(hit_now)
+    assert float(kp[0, j]) == 0.5
+    assert torch.isclose(kd[0, j], torch.tensor(0.7))
+
+    # Exactly one complete post-schedule tick remains fully soft without contact.
+    imp.observe(torch.tensor([[True, False]]), torch.tensor([[False, False]]))
+    kp, _ = imp.scales(idle)
+    assert float(kp[0, j]) == 0.5
+
+    # It then ramps toward nominal rather than snapping back.
+    seen = []
+    for _ in range(4):
+        imp.observe(torch.zeros(1, 2, dtype=torch.bool),
+                    torch.zeros(1, 2, dtype=torch.bool))
+        kp, _ = imp.scales(idle)
+        seen.append(float(kp[0, j]))
+    assert 0.5 < seen[0] < 1.0
+    assert all(a <= b + 1e-6 for a, b in zip(seen, seen[1:]))
+    assert seen[-1] == 1.0
+
+
+def test_contact_policy_default_keeps_incoming_strike_at_nominal_gain():
+    imp = ContactAwareStrikeImpedance(
+        ContactAwareStrikeImpedanceConfig(
+            kp_scale=0.5, kd_scale=0.7, followthrough_wp=1,
+        ),
+        batch=1,
+    )
+    j = LEFT_DISTAL[0]
+    # The strike lands during this tick, but incoming authority is untouched.
+    kp, kd = imp.scales(torch.tensor([[0.0, -1.0]]))
+    assert float(kp[0, j]) == 1.0
+    assert float(kd[0, j]) == 1.0
+    # The next tick is the 20 ms compliant follow-through.
+    imp.observe(torch.tensor([[True, False]]), torch.zeros(1, 2, dtype=torch.bool))
+    kp, kd = imp.scales(_idle())
+    assert float(kp[0, j]) == 0.5
+    assert torch.isclose(kd[0, j], torch.tensor(0.7))
+
+
+def test_contact_policy_holds_while_touching_then_absorbs_rebound():
+    cfg = ContactAwareStrikeImpedanceConfig(
+        kp_scale=0.5, kd_scale=0.8, before_wp=0,
+        followthrough_wp=1, contact_hold_wp=2, recovery_wp=2,
+    )
+    imp = ContactAwareStrikeImpedance(cfg, batch=1)
+    idle = _idle()
+    fired = torch.zeros(1, 2, dtype=torch.bool)
+    left_contact = torch.tensor([[True, False]])
+
+    # Sustained real contact refreshes full compliance.
+    for _ in range(3):
+        imp.observe(fired, left_contact)
+        kp, _ = imp.scales(idle)
+        assert float(kp[0, LEFT_DISTAL[0]]) == 0.5
+        assert float(kp[0, RIGHT_DISTAL[0]]) == 1.0
+
+    # After separation: hold for the configured rebound interval, then ramp.
+    no_contact = torch.zeros(1, 2, dtype=torch.bool)
+    imp.observe(fired, no_contact)
+    kp, _ = imp.scales(idle)
+    assert float(kp[0, LEFT_DISTAL[0]]) == 0.5
+    imp.observe(fired, no_contact)
+    kp, _ = imp.scales(idle)
+    assert 0.5 < float(kp[0, LEFT_DISTAL[0]]) < 1.0
+
+
+def test_contact_policy_rejects_wrong_observation_shape():
+    imp = ContactAwareStrikeImpedance(ContactAwareStrikeImpedanceConfig(), batch=2)
+    with torch.no_grad():
+        try:
+            imp.observe(torch.zeros(2, 2, dtype=torch.bool),
+                        torch.zeros(2, dtype=torch.bool))
+        except ValueError as exc:
+            assert "contact must have shape" in str(exc)
+        else:
+            raise AssertionError("bad contact shape was accepted")

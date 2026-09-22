@@ -88,6 +88,10 @@ class LineSearchConfig:
     violation_ratio_trigger: float = 2.0
     grad_norm_ratio_trigger: float = 3.0
     grad_norm_ref_floor: float = 1.0e-12
+    #: Permit gradient/violation spikes to force a search before the scheduled
+    #: interval. Throughput-oriented runs can disable this while retaining
+    #: scheduled and pending/nonfinite recovery searches.
+    search_on_early_triggers: bool = True
     true_gradient_mode: str = "plain_total_backward"
     curriculum_history_policy: str = "approximate_gradual"
     legacy_resume_seed: float | None = None

@@ -12,6 +12,7 @@ from amortized_opt.adamw_ls import build_adamw_like_train_cost
 from amortized_opt.line_search import LineSearchConfig
 from amortized_opt.line_search_step import (
     init_line_search_runtime,
+    needs_line_search_direction,
     resolve_known_search,
     run_search_or_ordinary,
     snapshot_g_preclip,
@@ -89,6 +90,110 @@ def test_init_runtime_forces_grad_balance_empty():
     opt = build_adamw_like_train_cost(m.named_parameters(), lr=cfg.lr)
     rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
     assert rt.cfg.grad_balance == ""
+
+
+def test_fixed_interval_ordinary_update_skips_transactional_direction():
+    model = _Tiny()
+    cfg = Phase2Config(line_search=True, lr=1e-3, grad_balance="")
+    cfg.line_search_cfg = LineSearchConfig(
+        epsilon_seed=1e-3,
+        warmup_updates=0,
+        search_interval_mode="fixed",
+        initial_interval=3,
+        search_on_early_triggers=False,
+        strict_actual_update=False,
+        actual_update_diagnostic_every=0,
+    )
+    opt = build_adamw_like_train_cost(model.named_parameters(), lr=cfg.lr)
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
+    # Model a successful first searched update. The immediately following
+    # update is a pure AdamW step and needs neither parameter nor gradient
+    # snapshots; the third update is the next scheduled search.
+    rt.ctrl.pending_search = False
+    rt.ctrl.successful_update_count = 1
+    rt.ctrl.last_search_update = 1
+    rt.ctrl.K = 3
+    assert not needs_line_search_direction(rt, known_search=False, j=2)
+    assert needs_line_search_direction(rt, known_search=True, j=3)
+
+    x = torch.randn(2)
+    opt.zero_grad(set_to_none=True)
+    loss = model(x)
+    loss.backward()
+    result = run_search_or_ordinary(
+        rt,
+        j=2,
+        run_search=False,
+        search_reasons=[],
+        F0=float(loss.detach()),
+        g_preclip=None,
+        g_objective=None,
+        probe_F=lambda: float(model(x).detach()),
+    )
+    assert result.executed and not result.searched
+    assert result.log["ls_fast_ordinary"] == 1.0
+
+
+def test_fast_ordinary_update_is_bit_exact_native_adamw():
+    torch.manual_seed(91)
+    fast = _Tiny()
+    native = copy.deepcopy(fast)
+    cfg = Phase2Config(line_search=True, lr=2e-3, grad_balance="")
+    cfg.line_search_cfg = LineSearchConfig(
+        epsilon_seed=2e-3,
+        warmup_updates=0,
+        search_interval_mode="fixed",
+        initial_interval=3,
+        search_on_early_triggers=False,
+        actual_update_diagnostic_every=0,
+    )
+    opt_fast = build_adamw_like_train_cost(
+        fast.named_parameters(), lr=cfg.lr, weight_decay=0.01,
+    )
+    opt_native = build_adamw_like_train_cost(
+        native.named_parameters(), lr=cfg.lr, weight_decay=0.01,
+    )
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt_fast)
+    rt.ctrl.pending_search = False
+    rt.ctrl.successful_update_count = 1
+    rt.ctrl.last_search_update = 1
+    rt.ctrl.K = 3
+
+    x = torch.randn(2)
+    for model, optimizer in ((fast, opt_fast), (native, opt_native)):
+        optimizer.zero_grad(set_to_none=True)
+        loss = model(x)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    result = run_search_or_ordinary(
+        rt,
+        j=2,
+        run_search=False,
+        search_reasons=[],
+        F0=float(fast(x).detach()),
+        g_preclip=None,
+        g_objective=None,
+        probe_F=lambda: float(fast(x).detach()),
+    )
+    opt_native.step()
+    assert result.log["ls_fast_ordinary"] == 1.0
+    for fast_parameter, native_parameter in zip(
+        fast.parameters(), native.parameters(), strict=True,
+    ):
+        torch.testing.assert_close(
+            fast_parameter, native_parameter, rtol=0.0, atol=0.0,
+        )
+        fast_state = opt_fast.state[fast_parameter]
+        native_state = opt_native.state[native_parameter]
+        assert fast_state.keys() == native_state.keys()
+        for key in fast_state:
+            if torch.is_tensor(fast_state[key]):
+                torch.testing.assert_close(
+                    fast_state[key], native_state[key], rtol=0.0, atol=0.0,
+                )
+            else:
+                assert fast_state[key] == native_state[key]
 
 
 def test_phase2_cli_exposes_line_search_safety_policies():

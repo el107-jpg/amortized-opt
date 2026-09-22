@@ -78,6 +78,8 @@ from .model import (
     param_counts,
 )
 from .impedance import (
+    ContactAwareStrikeImpedance,
+    ContactAwareStrikeImpedanceConfig,
     StrikeImpedance,
     StrikeImpedanceConfig,
     distal_joint_masks,
@@ -496,6 +498,8 @@ __all__ = [
     "StartSampler",
     "StrikeImpedance",
     "StrikeImpedanceConfig",
+    "ContactAwareStrikeImpedance",
+    "ContactAwareStrikeImpedanceConfig",
     "distal_joint_masks",
     "WaistAimConfig",
     "WaistYawController",

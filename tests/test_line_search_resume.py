@@ -46,6 +46,8 @@ def _phase2_stub(
         lr=1e-4,
         optimizer="adamw",
         torque_grad_cap=0.2,
+        torque_grad_cap_refresh=1,
+        torque_grad_cap_scale_ema=0.8,
         grad_clip=1.0,
         cost=SimpleNamespace(torque_physics=torque_physics),
         line_search_cfg=ls_cfg or LineSearchConfig(),
@@ -319,6 +321,37 @@ def test_resume_same_fingerprint_preserves_acceptance_history():
     assert resumed.ctrl.K == 5
 
 
+def test_curvature_lookahead_changes_direction_fingerprint_only_when_enabled():
+    phase = _phase2_stub()
+    legacy = build_objective_direction_fingerprint(phase)
+    assert "terminal_lookahead_mode" not in legacy
+    phase.terminal_lookahead_mode = "curvature"
+    phase.curvature_damping = 1.0
+    phase.curvature_position_weight = 40.0
+    phase.curvature_velocity_weight = 20.0
+    phase.curvature_max_step_rad = 0.15
+    enabled = build_objective_direction_fingerprint(phase)
+    assert enabled != legacy
+    phase.curvature_damping = 2.0
+    assert build_objective_direction_fingerprint(phase) != enabled
+
+
+def test_direct_curvature_changes_direction_fingerprint_without_changing_legacy():
+    phase = _phase2_stub()
+    legacy = build_objective_direction_fingerprint(phase)
+    phase.curvature_direct_frac = 0.0
+    assert build_objective_direction_fingerprint(phase) == legacy
+    phase.curvature_direct_frac = 0.25
+    phase.curvature_direct_mix = 1.0
+    phase.curvature_damping = 1.0
+    phase.curvature_position_weight = 40.0
+    phase.curvature_velocity_weight = 20.0
+    enabled = build_objective_direction_fingerprint(phase)
+    assert enabled != legacy
+    phase.curvature_direct_mix = 0.5
+    assert build_objective_direction_fingerprint(phase) != enabled
+
+
 @pytest.mark.parametrize("change", ["torque_physics", "al", "stage_a"])
 def test_resume_objective_fingerprint_change_resets_selector(change):
     old_phase = _phase2_stub(torque_physics="static")
@@ -398,6 +431,41 @@ def test_resume_current_safety_config_overrides_checkpoint_and_resets():
     assert resumed.cfg.reseed_epsilon_on_objective_change
     assert resumed.accept.A_prev == 0.0
     assert resumed.ctrl.K == 1 and resumed.ctrl.pending_search
+
+
+def test_resume_current_fixed_three_step_cadence_overrides_checkpoint():
+    old_phase = _phase2_stub(ls_cfg=LineSearchConfig(
+        search_interval_mode="adaptive",
+        initial_interval=1,
+        min_interval=1,
+        max_interval=10,
+        warmup_updates=10,
+        search_on_early_triggers=True,
+    ))
+    old_rt = init_line_search_runtime(
+        phase2_cfg=old_phase, optimizer=_tiny_adam(),
+    )
+    blob = runtime_state_dict(old_rt)
+
+    current_phase = _phase2_stub(ls_cfg=LineSearchConfig(
+        search_interval_mode="fixed",
+        initial_interval=3,
+        min_interval=3,
+        max_interval=3,
+        warmup_updates=0,
+        search_on_early_triggers=False,
+    ))
+    resumed = init_line_search_runtime(
+        phase2_cfg=current_phase,
+        optimizer=_tiny_adam(),
+        line_search_state=blob,
+    )
+    assert resumed.cfg.search_interval_mode == "fixed"
+    assert resumed.cfg.initial_interval == 3
+    assert resumed.cfg.min_interval == 3
+    assert resumed.cfg.max_interval == 3
+    assert resumed.cfg.warmup_updates == 0
+    assert not resumed.cfg.search_on_early_triggers
 
 
 def test_resume_legacy_selector_without_fingerprint_resets_safely():

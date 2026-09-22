@@ -102,14 +102,18 @@ if [[ "$TIMING_CRITIC_MODE" == "assist" || "$TIMING_CRITIC_MODE" == "control" ]]
   TIMING_CRITIC_FLAGS+=(
     --timing-critic-representation distributional
     --timing-critic-heads "${TIMING_CRITIC_HEADS:-3}"
+    --timing-critic-updates "${TIMING_CRITIC_UPDATES:-1}"
     --timing-critic-ema-decay "${TIMING_CRITIC_EMA_DECAY:-0.95}"
     --timing-anchor-curriculum
     --timing-anchor-min-samples "${TIMING_ANCHOR_MIN_SAMPLES:-2048}"
     --timing-anchor-min-close-rate "${TIMING_ANCHOR_MIN_CLOSE_RATE:-0.50}"
     --timing-acceptable-normalized-violation "${TIMING_ACCEPTABLE_NORMALIZED_VIOLATION:-0.2}"
-    --timing-risk-min-precision "${TIMING_RISK_MIN_PRECISION:-0.50}"
+    # Online fork sweep (2026-09-18): 0.70 gave the highest exact-verified
+    # shorter-row yield while removing nearly all catastrophic selections.
+    --timing-risk-min-precision "${TIMING_RISK_MIN_PRECISION:-0.70}"
     --timing-primary-base-tasks-per-512 "${TIMING_PRIMARY_BASE_TASKS_PER_512:-40}"
-    --timing-primary-boundary-per-task "${TIMING_PRIMARY_BOUNDARY_PER_TASK:-2}"
+    --timing-primary-anchor-per-task "${TIMING_PRIMARY_ANCHOR_PER_TASK:-1}"
+    --timing-primary-boundary-per-task "${TIMING_PRIMARY_BOUNDARY_PER_TASK:-1}"
     --timing-primary-interior-per-task "${TIMING_PRIMARY_INTERIOR_PER_TASK:-4}"
     --timing-primary-mpc-terminal-limit "${TIMING_PRIMARY_MPC_TERMINAL_LIMIT:-0.040}"
     --timing-primary-mpc-collision-sdf-limit "${TIMING_PRIMARY_MPC_COLLISION_SDF_LIMIT:--0.010}"
@@ -167,15 +171,15 @@ if [[ -z "${BATCH+x}" ]]; then
 fi
 D_MODEL="${D_MODEL:-384}"
 DEC_LAYERS="${DEC_LAYERS:-6}"
-# Compile transformer solves only when requested.  LS probe replay mutates live
-# params between compiled forwards.  CPU gradient balancing also uses retained
-# output-space VJPs, which conflict with TorchInductor's donated buffers, so
-# both paths default to eager execution.
+# Compilation remains opt-in with SaLSa: candidate parameter writes work, but
+# the current fixed-shape graph did not improve steady-state outer-step time.
+# CPU retained output-space VJPs also remain eager.
 if [[ "$LINE_SEARCH" == "1" || "$DEV" == "cpu" ]]; then
   COMPILE_MODEL="${COMPILE_MODEL:-0}"
 else
   COMPILE_MODEL="${COMPILE_MODEL:-1}"
 fi
+COMPILE_MODE="${COMPILE_MODE:-default}"
 COMPILE_FLAG=()
 if [[ "$COMPILE_MODEL" != "1" ]]; then
   COMPILE_FLAG=(--no-compile)
@@ -201,6 +205,9 @@ GRAD_BALANCE_NORM_EMA="${GRAD_BALANCE_NORM_EMA:-0.9}"
 TORQUE_GRAD_SCALE="${TORQUE_GRAD_SCALE:-1.0}"
 # Cap ||g_torque||/||g|| after total.backward(); works with LINE_SEARCH=1.
 TORQUE_GRAD_CAP="${TORQUE_GRAD_CAP:-0.7}"
+TORQUE_GRAD_CAP_REFRESH="${TORQUE_GRAD_CAP_REFRESH:-8}"
+TORQUE_GRAD_CAP_SCALE_EMA="${TORQUE_GRAD_CAP_SCALE_EMA:-0.8}"
+PHASE_TIMING_EVERY="${PHASE_TIMING_EVERY:-50}"
 # Replay sampling beta for high-torque-violation harvest rows (no loss scaling).
 # A 5% uniform mixture keeps every eligible recovery row sampleable instead of
 # letting exp(-beta*score) numerically censor the long-age tail.
@@ -222,12 +229,20 @@ if [[ "$REPLAY_PROFICIENCY" != "0" ]]; then
 fi
 # AL dual step on terminal region miss (default recipe 10; 30 = 3x faster λ).
 RHO_TERMINAL="${RHO_TERMINAL:-30}"
+# Once a contact is legal, keep a modest task-space gradient toward its exact
+# aim instead of allowing the actor to trade all of the 20 mm MPC collar for
+# easier torque/posture.  Both remain overrideable for ablations.
+W_TERMINAL_AIM="${W_TERMINAL_AIM:-40}"
+TERMINAL_AIM_DEADBAND_M="${TERMINAL_AIM_DEADBAND_M:-0.005}"
 GRAD_TERM_EVERY="${GRAD_TERM_EVERY:-250}"
 TORQUE_CURVATURE_ROWS="${TORQUE_CURVATURE_ROWS:-8}"
 LINE_SEARCH_C1="${LINE_SEARCH_C1:-0.5}"
 LINE_SEARCH_BETA="${LINE_SEARCH_BETA:-0.99}"
 LINE_SEARCH_MAX_TRIALS="${LINE_SEARCH_MAX_TRIALS:-6}"
-LINE_SEARCH_INTERVAL="${LINE_SEARCH_INTERVAL:-adaptive}"
+LINE_SEARCH_INTERVAL="${LINE_SEARCH_INTERVAL:-fixed}"
+LINE_SEARCH_INITIAL_INTERVAL="${LINE_SEARCH_INITIAL_INTERVAL:-3}"
+LINE_SEARCH_WARMUP_UPDATES="${LINE_SEARCH_WARMUP_UPDATES:-0}"
+LINE_SEARCH_EARLY_TRIGGERS="${LINE_SEARCH_EARLY_TRIGGERS:-0}"
 LINE_SEARCH_MODE="${LINE_SEARCH_MODE:-salsa_transfer}"
 LINE_SEARCH_MOMENT_ON="${LINE_SEARCH_MOMENT_ON:-gradient}"
 # Initial SaLSa ε (below --lr); selector expands on stable success, shrinks on reject.
@@ -334,11 +349,16 @@ if [[ "$LINE_SEARCH" == "1" ]]; then
     --line-search-beta "$LINE_SEARCH_BETA"
     --line-search-max-trials "$LINE_SEARCH_MAX_TRIALS"
     --line-search-interval "$LINE_SEARCH_INTERVAL"
+    --line-search-initial-interval "$LINE_SEARCH_INITIAL_INTERVAL"
+    --line-search-warmup-updates "$LINE_SEARCH_WARMUP_UPDATES"
     --line-search-mode "$LINE_SEARCH_MODE"
     --line-search-moment-on "$LINE_SEARCH_MOMENT_ON"
     --line-search-epsilon-seed "$LINE_SEARCH_EPSILON_SEED"
     --line-search-actual-diagnostic-every "$LINE_SEARCH_ACTUAL_DIAGNOSTIC_EVERY"
   )
+  if [[ "$LINE_SEARCH_EARLY_TRIGGERS" != "1" ]]; then
+    LINE_SEARCH_FLAGS+=(--line-search-disable-early-triggers)
+  fi
   if [[ -n "$LINE_SEARCH_EPSILON_MIN" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-epsilon-min "$LINE_SEARCH_EPSILON_MIN")
   fi
@@ -486,8 +506,38 @@ WAIST_PR_BOX="${WAIST_PR_BOX:-0.2}"
 # itself.
 W_MPC_INIT_TIE="${W_MPC_INIT_TIE:-50}"
 TC_FRAC="${TC_FRAC:-0.05}"
+# One-step terminal IK lookahead on a quarter of actor rows.  The actor still
+# emits the deployed trajectory directly; this is a training-only teacher and
+# full-physics lookahead, with a bounded local step and smooth approach warp.
+DLS_TERMINAL_FRAC="${DLS_TERMINAL_FRAC:-0.25}"
+W_DLS_TERMINAL_COST="${W_DLS_TERMINAL_COST:-0.25}"
+W_DLS_TERMINAL_TIE="${W_DLS_TERMINAL_TIE:-10}"
+DLS_TERMINAL_STEPS="${DLS_TERMINAL_STEPS:-1}"
+DLS_TERMINAL_WINDOW="${DLS_TERMINAL_WINDOW:-16}"
+DLS_TERMINAL_DAMPING="${DLS_TERMINAL_DAMPING:-0.05}"
+DLS_TERMINAL_MAX_STEP_RAD="${DLS_TERMINAL_MAX_STEP_RAD:-0.35}"
+TERMINAL_LOOKAHEAD_MODE="${TERMINAL_LOOKAHEAD_MODE:-dls}"
+CURVATURE_DAMPING="${CURVATURE_DAMPING:-1.0}"
+CURVATURE_POSITION_WEIGHT="${CURVATURE_POSITION_WEIGHT:-40.0}"
+CURVATURE_VELOCITY_WEIGHT="${CURVATURE_VELOCITY_WEIGHT:-20.0}"
+CURVATURE_MAX_STEP_RAD="${CURVATURE_MAX_STEP_RAD:-0.15}"
+CURVATURE_DIRECT_FRAC="${CURVATURE_DIRECT_FRAC:-0}"
+CURVATURE_DIRECT_MIX="${CURVATURE_DIRECT_MIX:-1.0}"
 # Plain tip lateral-ordering hinge (non-AL); discourages crossed tips.
 W_TIP_CROSSOVER="${W_TIP_CROSSOVER:-50}"
+# Active-arm centre-of-mass proxy. Keep the calibrated phase-2 defaults
+# explicit in the launcher so long-run metadata and shell reproductions do not
+# silently depend on Python-side recipe defaults.
+W_ARM_COMPACT="${W_ARM_COMPACT:-15}"
+ARM_COMPACT_MODE="${ARM_COMPACT_MODE:-linear}"
+ARM_COMPACT_HEIGHT_MAX="${ARM_COMPACT_HEIGHT_MAX:-0.28}"
+ARM_COMPACT_RADIUS_MAX="${ARM_COMPACT_RADIUS_MAX:-0.28}"
+ARM_COMPACT_FLAGS=(
+  --w-arm-compact "$W_ARM_COMPACT"
+  --arm-compact-mode "$ARM_COMPACT_MODE"
+  --arm-compact-height-max "$ARM_COMPACT_HEIGHT_MAX"
+  --arm-compact-radius-max "$ARM_COMPACT_RADIUS_MAX"
+)
 # 1 = snap suffix_warmup to 1.0 from step 0 (continuation only; cost weights
 # are already full by default via WeightSchedule.snap_full).
 FULL_WEIGHTS="${FULL_WEIGHTS:-0}"
@@ -729,6 +779,9 @@ echo "[run] kit DR: tilt=${TILT_DEG}deg radius_frac=${RADIUS_FRAC} " \
      "jit_t=${JIT_T}s jit_v=${JIT_V} rare_boost=${RARE_BOOST} tau=${AIM_TAU}" >&2
 echo "[run] soft_wrist_effort_scale=${SOFT_WRIST_SCALE} w_idle_cylinder=${W_IDLE_CYLINDER} " \
      "w_tip_crossover=${W_TIP_CROSSOVER}" >&2
+echo "[run] active-arm COM: mode=${ARM_COMPACT_MODE} weight=${W_ARM_COMPACT} " \
+     "height_max=${ARM_COMPACT_HEIGHT_MAX}m radius_max=${ARM_COMPACT_RADIUS_MAX}m " \
+     "(max values are hinge_sq-only)" >&2
 echo "[run] torque gate: knot RNEA  w_track_torque=${W_TRACK_TORQUE} " \
      "w_track_torque_peak=${W_TRACK_TORQUE_PEAK}" >&2
 echo "[run] velocity limits: w_velocity=${W_VELOCITY} w_velocity_peak=${W_VELOCITY_PEAK}" >&2
@@ -747,7 +800,7 @@ fi
 echo "[run] lam_torque_max=${LAM_TORQUE_MAX} lam_torque_waist_max=${LAM_TORQUE_WAIST_MAX:-(same)} " \
      "waist_upright_ease_wp=${WAIST_UPRIGHT_EASE_WP}" >&2
 echo "[run] full_weights=${FULL_WEIGHTS} dec_rope=${DEC_ROPE} " \
-     "dec_plant_feats=${DEC_PLANT_FEATS} traj_head_fp32=${TRAJ_HEAD_FP32} compile_model=${COMPILE_MODEL} compile_cost=${COMPILE_COST} grad_balance=${GRAD_BALANCE:-(off)} refresh=${GRAD_BALANCE_REFRESH} norm_ema=${GRAD_BALANCE_NORM_EMA} torque_grad_scale=${TORQUE_GRAD_SCALE} torque_grad_cap=${TORQUE_GRAD_CAP} replay_viol_sampling_beta=${REPLAY_VIOL_DOWNWEIGHT} replay_viol_uniform_mix=${REPLAY_VIOL_UNIFORM_MIX} replay_prof=${REPLAY_PROFICIENCY} replay_frac_prof=${REPLAY_FRAC_PROF} replay_frac_new=${REPLAY_FRAC_NEW} prof_viol_cap=${PROFICIENCY_VIOL_CAP} rho_terminal=${RHO_TERMINAL} grad_term_every=${GRAD_TERM_EVERY} torque_curve_rows=${TORQUE_CURVATURE_ROWS} line_search=${LINE_SEARCH} waist_pr_sp=${WAIST_PR_SP} " \
+     "dec_plant_feats=${DEC_PLANT_FEATS} traj_head_fp32=${TRAJ_HEAD_FP32} compile_model=${COMPILE_MODEL} compile_mode=${COMPILE_MODE} compile_cost=${COMPILE_COST} grad_balance=${GRAD_BALANCE:-(off)} refresh=${GRAD_BALANCE_REFRESH} norm_ema=${GRAD_BALANCE_NORM_EMA} torque_grad_scale=${TORQUE_GRAD_SCALE} torque_grad_cap=${TORQUE_GRAD_CAP} torque_grad_refresh=${TORQUE_GRAD_CAP_REFRESH} phase_timing_every=${PHASE_TIMING_EVERY} replay_viol_sampling_beta=${REPLAY_VIOL_DOWNWEIGHT} replay_viol_uniform_mix=${REPLAY_VIOL_UNIFORM_MIX} replay_prof=${REPLAY_PROFICIENCY} replay_frac_prof=${REPLAY_FRAC_PROF} replay_frac_new=${REPLAY_FRAC_NEW} prof_viol_cap=${PROFICIENCY_VIOL_CAP} rho_terminal=${RHO_TERMINAL} w_terminal_aim=${W_TERMINAL_AIM} terminal_aim_deadband_m=${TERMINAL_AIM_DEADBAND_M} grad_term_every=${GRAD_TERM_EVERY} torque_curve_rows=${TORQUE_CURVATURE_ROWS} line_search=${LINE_SEARCH} waist_pr_sp=${WAIST_PR_SP} " \
      "waist_pr_ema=${WAIST_PR_EMA} freeze_waist_pr=${FREEZE_WAIST_PR} " \
      "w_waist_pr_terminal=${W_WAIST_PR_TERMINAL} " \
      "w_waist_pr_band=${W_WAIST_PR_BAND:-default} waist_pr_band_rad=${WAIST_PR_BAND_RAD:-0.15} " \
@@ -755,6 +808,7 @@ echo "[run] full_weights=${FULL_WEIGHTS} dec_rope=${DEC_ROPE} " \
      "w_waist_yaw_vel=${W_WAIST_YAW_VEL} " \
      "w_waist_pr_vel=${W_WAIST_PR_VEL} " \
      "w_mpc_init_tie=${W_MPC_INIT_TIE} tc_frac=${TC_FRAC} " \
+     "dls_terminal=${DLS_TERMINAL_FRAC}/${W_DLS_TERMINAL_COST}/${W_DLS_TERMINAL_TIE} lookahead_mode=${TERMINAL_LOOKAHEAD_MODE} curvature_direct=${CURVATURE_DIRECT_FRAC}/${CURVATURE_DIRECT_MIX} " \
      "w_waist_pr_distill=${W_WAIST_PR_DISTILL:-0} " \
      "w_waist_pr_hold_band=${W_WAIST_PR_HOLD_BAND:-default} " \
      "frontier=${FRONTIER} timing_critic=${TIMING_CRITIC_MODE} steps=$STEPS lr=$LR lr_horizon=$LR_HORIZON " \
@@ -866,6 +920,7 @@ python scripts/train_phase2.py \
     --drum-tilt-deg "$TILT_DEG" \
     --drum-radius-frac "$RADIUS_FRAC" \
     "${COMPILE_FLAG[@]}" \
+    --compile-mode "$COMPILE_MODE" \
     "${COMPILE_COST_FLAG[@]}" \
     --clamp-traj-to-box \
     "${GRAD_BALANCE_FLAG[@]}" \
@@ -875,10 +930,15 @@ python scripts/train_phase2.py \
     --grad-balance-waist-floor 2.0 \
     --torque-grad-scale "$TORQUE_GRAD_SCALE" \
     --torque-grad-cap "$TORQUE_GRAD_CAP" \
+    --torque-grad-cap-refresh "$TORQUE_GRAD_CAP_REFRESH" \
+    --torque-grad-cap-scale-ema "$TORQUE_GRAD_CAP_SCALE_EMA" \
+    --phase-timing-every "$PHASE_TIMING_EVERY" \
     --replay-viol-downweight "$REPLAY_VIOL_DOWNWEIGHT" \
     --replay-viol-uniform-mix "$REPLAY_VIOL_UNIFORM_MIX" \
     "${REPLAY_PROFICIENCY_FLAGS[@]}" \
     --rho-terminal "$RHO_TERMINAL" \
+    --w-terminal-aim "$W_TERMINAL_AIM" \
+    --terminal-aim-deadband-m "$TERMINAL_AIM_DEADBAND_M" \
     --grad-term-every "$GRAD_TERM_EVERY" \
     --torque-curvature-rows "$TORQUE_CURVATURE_ROWS" \
     "${LINE_SEARCH_FLAGS[@]}" \
@@ -897,7 +957,22 @@ python scripts/train_phase2.py \
     --w-joint-box-peak 40 \
     --w-stick-stick 100 \
     --w-tip-crossover "$W_TIP_CROSSOVER" \
+    "${ARM_COMPACT_FLAGS[@]}" \
     --w-mpc-init-tie "$W_MPC_INIT_TIE" --tc-frac "$TC_FRAC" \
+    --dls-terminal-frac "$DLS_TERMINAL_FRAC" \
+    --w-dls-terminal-cost "$W_DLS_TERMINAL_COST" \
+    --w-dls-terminal-tie "$W_DLS_TERMINAL_TIE" \
+    --dls-terminal-steps "$DLS_TERMINAL_STEPS" \
+    --dls-terminal-window "$DLS_TERMINAL_WINDOW" \
+    --dls-terminal-damping "$DLS_TERMINAL_DAMPING" \
+    --dls-terminal-max-step-rad "$DLS_TERMINAL_MAX_STEP_RAD" \
+    --terminal-lookahead-mode "$TERMINAL_LOOKAHEAD_MODE" \
+    --curvature-damping "$CURVATURE_DAMPING" \
+    --curvature-position-weight "$CURVATURE_POSITION_WEIGHT" \
+    --curvature-velocity-weight "$CURVATURE_VELOCITY_WEIGHT" \
+    --curvature-max-step-rad "$CURVATURE_MAX_STEP_RAD" \
+    --curvature-direct-frac "$CURVATURE_DIRECT_FRAC" \
+    --curvature-direct-mix "$CURVATURE_DIRECT_MIX" \
     --suffix-frac 0.25 \
     --w-suffix-cost 1.0 --w-suffix-tie 50.0 --suffix-warmup 1000 \
     --w-waist-aim 0 \

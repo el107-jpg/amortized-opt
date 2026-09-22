@@ -61,6 +61,7 @@ Examples:
 
 import argparse
 import datetime
+import json
 import os
 import sys
 import time
@@ -212,6 +213,41 @@ parser.add_argument(
          "Default 4 (arms Kd 4), matching the analytic trainer / G1_PD_DAMPING_SCALE.",
 )
 parser.add_argument(
+    "--contact_compliance", action="store_true", default=False,
+    help="Enable the real-contact strike impedance policy: keep nominal gains "
+         "through the incoming strike, soften distal joints for one following "
+         "control tick, hold compliance through measured PhysX contact, then ramp back.",
+)
+parser.add_argument(
+    "--strike_kp_scale", type=float, default=0.5,
+    help="Distal Kp multiplier during strike compliance (default 0.5).",
+)
+parser.add_argument(
+    "--strike_kd_scale", type=float, default=0.7,
+    help="Distal Kd multiplier during strike compliance (default 0.7).",
+)
+parser.add_argument(
+    "--followthrough_ms", type=float, default=20.0,
+    help="Maximum scheduled-hit follow-through before recovery if no contact arrives.",
+)
+parser.add_argument(
+    "--contact_hold_ms", type=float, default=60.0,
+    help="Full-compliance interval after the most recent measured contact.",
+)
+parser.add_argument(
+    "--contact_recovery_ms", type=float, default=60.0,
+    help="Linear gain-restoration interval after follow-through/contact hold.",
+)
+parser.add_argument(
+    "--compliance_force_n", type=float, default=1.0,
+    help="Per-hand PhysX drum-contact threshold in newtons (default 1.0).",
+)
+parser.add_argument(
+    "--hit_diagnostics", nargs="?", const="auto", default=None,
+    help="Record per-hit planner/command/plant diagnostics as JSON. With no "
+         "path, writes under runs/diagnostics/.",
+)
+parser.add_argument(
     "--repo_ff", action="store_true", default=False,
     help="Keep the original G1DrummerEnv extras: foh_vel_target_ema=0.5 and "
          "distal inertial feedforward. Default is aligned to pd_sim / isaac_rl "
@@ -273,13 +309,46 @@ from amortized_opt.lead import LEAD_PRESETS, resolve_lead  # noqa: E402
 from amortized_opt.pd_sim import mass_matrix  # noqa: E402
 from amortized_opt.limits import (  # noqa: E402
     G1_PD_DAMPING_SCALE,
-    isaac_effort_limits, isaac_runtime_stiffness, urdf_position_limits,
+    isaac_effort_limits, isaac_runtime_stiffness, isaac_velocity_limits,
+    urdf_position_limits,
 )
+from amortized_opt.probe import head_frame_error  # noqa: E402
 from amortized_opt.constants import G1_UPPER_BODY_JOINTS, ready_joint_pos  # noqa: E402
 
 # --- the Isaac-facing MPC driver -----------------------------------------------
 from isaac_rl.mpc import IsaacMPC, MPCConfig  # noqa: E402
 from isaac_rl.schedule import BatchedSchedule, ScheduleConfig  # noqa: E402
+
+
+class _HitGeometryScorer:
+    """The FK-only subset of TrajectoryScorer needed by head_frame_error.
+
+    Isaac Sim's bundled Pinocchio cannot expose ``model.parents``, so building
+    the full offline scorer (and its unused RNEA) fails inside Kit.  The MPC
+    already owns the same vendored ChainFK, which is all this diagnostic uses.
+    """
+
+    def __init__(self, fk, *, device, dtype=torch.float32):
+        self.fk = fk
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self._stick_axis_local = {
+            h: self._t(A.stick_axis_local(h)) for h in ("left", "right")
+        }
+
+    def _t(self, value) -> torch.Tensor:
+        return torch.as_tensor(np.asarray(value, float), device=self.device, dtype=self.dtype)
+
+    def contact_world(self, q, hand: str, sigma: float):
+        Q = self._t(np.asarray(q, float).reshape(1, -1))
+        R, p = self.fk.frame(Q, f"{hand}_wrist")
+        loc = self._t(A.stick_contact_offset(hand, sigma)).view(1, 3, 1)
+        tip = self._t(A.stick_tip_offset(hand)).view(1, 3, 1)
+        axis = self._stick_axis_local[hand].view(1, 3, 1)
+        contact = (p + (R @ loc).squeeze(-1))[0].detach().cpu().numpy()
+        tip_world = (p + (R @ tip).squeeze(-1))[0].detach().cpu().numpy()
+        direction = (R @ axis).squeeze(-1)[0].detach().cpu().numpy()
+        return contact, tip_world, direction
 
 
 def _play_horizon_steps(args) -> int:
@@ -582,6 +651,9 @@ class AmortizedMPCAgent:
         self._q_hi = torch.as_tensor(hi, dtype=torch.float32)
         tau_lim = isaac_effort_limits(self._joint_names)
         self._tau_lim = torch.as_tensor(tau_lim, dtype=torch.float32)
+        self._v_lim = torch.as_tensor(
+            isaac_velocity_limits(self._joint_names), dtype=torch.float32,
+        )
 
         self._rnea = None
         self._vcmd_prev = torch.zeros(len(self._joint_names), dtype=torch.float32)
@@ -692,6 +764,69 @@ class AmortizedMPCAgent:
             kit_names=kit.names,
         )
 
+        # --- real-contact strike compliance ---------------------------------
+        self._contact_compliance = None
+        self._compliance_gain_map = []
+        self._contact_step = torch.zeros((1, 2), device=u.device, dtype=torch.bool)
+        self._contact_hand_ticks = 0
+        if bool(getattr(args, "contact_compliance", False)):
+            def _ms_ticks(value: float) -> int:
+                return max(0, int(round(float(value) * 1.0e-3 / self.dt)))
+
+            ccfg = A.ContactAwareStrikeImpedanceConfig(
+                kp_scale=float(args.strike_kp_scale),
+                kd_scale=float(args.strike_kd_scale),
+                before_wp=-1,
+                followthrough_wp=_ms_ticks(args.followthrough_ms),
+                contact_hold_wp=_ms_ticks(args.contact_hold_ms),
+                recovery_wp=_ms_ticks(args.contact_recovery_ms),
+            )
+            self._contact_compliance = A.ContactAwareStrikeImpedance(
+                ccfg, batch=1, device=u.device,
+                joint_names=self._joint_names,
+            )
+            jid_to_col = {int(j): c for c, j in enumerate(self._joint_ids)}
+            for act in u.robot.actuators.values():
+                stiffness = getattr(act, "stiffness", None)
+                damping = getattr(act, "damping", None)
+                if stiffness is None or damping is None:
+                    continue
+                indices = act.joint_indices
+                if isinstance(indices, slice):
+                    indices = range(*indices.indices(u.robot.num_joints))
+                pairs = [(p, jid_to_col[int(j)]) for p, j in enumerate(indices)
+                         if int(j) in jid_to_col]
+                if not pairs:
+                    continue
+                if not type(act).__name__.startswith("IdealPD"):
+                    raise RuntimeError(
+                        "--contact_compliance currently requires IdealPD actuators; "
+                        f"{type(act).__name__} does not read runtime gain buffers"
+                    )
+                self._compliance_gain_map.append((
+                    act,
+                    torch.tensor([p for p, _ in pairs], device=stiffness.device),
+                    torch.tensor([c for _, c in pairs], device=stiffness.device),
+                    stiffness.clone(), damping.clone(),
+                ))
+            if not self._compliance_gain_map:
+                raise RuntimeError(
+                    "--contact_compliance found no mutable IdealPD actuator gains"
+                )
+            if not getattr(u, "contact_sensors", None):
+                raise RuntimeError(
+                    "--contact_compliance needs the env's PhysX drum contact sensors"
+                )
+            print(
+                "[agent] contact compliance ON: "
+                f"Kp x{ccfg.kp_scale:g}, Kd x{ccfg.kd_scale:g}, "
+                f"follow-through={ccfg.followthrough_wp} tick(s), "
+                f"contact hold={ccfg.contact_hold_wp} tick(s), "
+                f"recovery={ccfg.recovery_wp} tick(s), "
+                f"force>{float(args.compliance_force_n):g}N",
+                flush=True,
+            )
+
         # --- install direct-target hook (bypass RL action clip) -----------
         self._q_des = self._ready_q.clone()
         self._install_direct_target_hook()
@@ -740,6 +875,43 @@ class AmortizedMPCAgent:
         self._last_track_cmd_rms = 0.0
         self._last_track_plan_rms = 0.0
 
+        # Optional per-hit model-vs-controller isolation.  The trace retains
+        # only the final 20 replans for each scheduled hand event, so a long
+        # song stays tiny while still showing whether the terminal proposal
+        # deteriorated as the deadline approached.  Twenty ticks also retain
+        # a state about 0.35 s before impact for env-side DAgger feasibility
+        # probes (the expert must not be queried after the opportunity passed).
+        self._hit_diag_enabled = getattr(args, "hit_diagnostics", None) is not None
+        self._hit_diag_scorer = (
+            _HitGeometryScorer(self.mpc._chain_fk(), device=self.device)
+            if self._hit_diag_enabled else None
+        )
+        self._hit_diag_trace: dict[tuple[int, int], list[dict]] = {}
+        self._hit_diag_pending: list[dict] = []
+        self._hit_diag_events: list[dict] = []
+
+    def _apply_compliance_gains(self, ticks_to_hit: torch.Tensor) -> None:
+        """Write this tick's contact-policy multipliers into IdealPD buffers."""
+        if self._contact_compliance is None:
+            return
+        kp_mul, kd_mul = self._contact_compliance.scales(ticks_to_hit)
+        kp_mul = kp_mul[0]
+        kd_mul = kd_mul[0]
+        for act, local, cols, kp0, kd0 in self._compliance_gain_map:
+            p = kp_mul.to(device=kp0.device, dtype=kp0.dtype).index_select(0, cols)
+            d = kd_mul.to(device=kd0.device, dtype=kd0.dtype).index_select(0, cols)
+            act.stiffness[:, local] = kp0[:, local] * p.unsqueeze(0)
+            act.damping[:, local] = kd0[:, local] * d.unsqueeze(0)
+
+    def _accumulate_compliance_contact(self) -> None:
+        """Latch any drum contact seen during the current physics substeps."""
+        if self._contact_compliance is None:
+            return
+        forces = self.u._read_contact_forces()
+        touching = torch.linalg.vector_norm(forces, dim=-1).amax(dim=-1)
+        touching = touching > float(self.args.compliance_force_n)
+        self._contact_step |= touching[:1].to(self._contact_step.device)
+
     def _install_direct_target_hook(self) -> None:
         """After the env decodes actions, overwrite PD targets with planned q*."""
         u = self.u
@@ -769,30 +941,33 @@ class AmortizedMPCAgent:
                 u.joint_pos_target[:, u._waist_lean_ids] = u._waist_lean_pos
 
         u._pre_physics_step = _pre_physics_step_direct
-        if self._waist_ff:
+        if self._waist_ff or self._contact_compliance is not None:
             orig_apply = u._apply_action
 
-            def _apply_action_waist_ff() -> None:
+            def _apply_action_with_runtime_control() -> None:
                 orig_apply()
-                if self._waist_tau is None:
-                    return
-                ids = self._joint_ids
-                grav = getattr(u, "_grav_tau", None)
-                if grav is not None:
-                    tau = grav.clone()
-                else:
-                    tau = torch.zeros(
-                        1, len(ids), device=u.device,
-                        dtype=u.robot.data.joint_pos.dtype,
-                    )
-                add = self._waist_tau.to(device=tau.device, dtype=tau.dtype)
-                wi = self._waist_i
-                tau[:, wi] = tau[:, wi] + add
-                lim = self._tau_lim.to(device=tau.device, dtype=tau.dtype)
-                u.robot.set_joint_effort_target(
-                    torch.clamp(tau, -lim, lim), joint_ids=ids)
+                # Read contact after the preceding PhysX substep and OR it into
+                # a control-tick latch.  Sampling only in post_step would miss a
+                # short impact that starts and ends inside this 20 ms interval.
+                self._accumulate_compliance_contact()
+                if self._waist_tau is not None:
+                    ids = self._joint_ids
+                    grav = getattr(u, "_grav_tau", None)
+                    if grav is not None:
+                        tau = grav.clone()
+                    else:
+                        tau = torch.zeros(
+                            1, len(ids), device=u.device,
+                            dtype=u.robot.data.joint_pos.dtype,
+                        )
+                    add = self._waist_tau.to(device=tau.device, dtype=tau.dtype)
+                    wi = self._waist_i
+                    tau[:, wi] = tau[:, wi] + add
+                    lim = self._tau_lim.to(device=tau.device, dtype=tau.dtype)
+                    u.robot.set_joint_effort_target(
+                        torch.clamp(tau, -lim, lim), joint_ids=ids)
 
-            u._apply_action = _apply_action_waist_ff
+            u._apply_action = _apply_action_with_runtime_control
         u._amortized_direct_hook = True
 
     def _update_waist_reaction(self, q: torch.Tensor, cmd: torch.Tensor) -> None:
@@ -842,6 +1017,12 @@ class AmortizedMPCAgent:
         self._integral.zero_()
         self._vcmd_prev.zero_()
         self._waist_tau = None
+        self._contact_step.zero_()
+        self._contact_hand_ticks = 0
+        if self._contact_compliance is not None:
+            self._contact_compliance.reset()
+            idle = torch.full((1, 2), -1.0, device=self.u.device)
+            self._apply_compliance_gains(idle)
         self._step = 0
         self._n_hits = 0
         self._initialized = True
@@ -857,6 +1038,9 @@ class AmortizedMPCAgent:
         self._track_n = 0
         self._last_track_cmd_rms = 0.0
         self._last_track_plan_rms = 0.0
+        self._hit_diag_trace.clear()
+        self._hit_diag_pending.clear()
+        self._hit_diag_events.clear()
         # Waist travel bookkeeping: the whole point of unpinning is that these
         # stop reading zero.
         self._waist_lo = q[self._waist_i].clone()
@@ -865,12 +1049,12 @@ class AmortizedMPCAgent:
     def act(self, now: float) -> torch.Tensor:
         """One control tick: plan → command → write target. Returns zero action
         (the hook overwrites the target anyway)."""
-        del now
         u = self.u
         dev = self.device
 
         q = u.robot.data.joint_pos[0, self._joint_ids].to(torch.float32)
         qd = u.robot.data.joint_vel[0, self._joint_ids].to(torch.float32)
+        self._contact_step.zero_()
 
         # Run the MPC
         result = self.mpc.plan(
@@ -952,6 +1136,15 @@ class AmortizedMPCAgent:
 
         self._q_des = cmd.clone()
 
+        if self._hit_diag_enabled:
+            self._record_hit_plan(float(now), result, q, qd)
+
+        if self._contact_compliance is not None:
+            # hit_index==1 means the strike lands at the end of the tick about
+            # to execute, hence the scheduler's ticks-to-hit convention is k-1.
+            ticks_to_hit = self.schedule.hit_index().to(self.u.device) - 1
+            self._apply_compliance_gains(ticks_to_hit)
+
         # Count hits from the schedule (hit_index dropped from k to 0)
         hi = self.schedule.hit_index()
         for h in (0, 1):
@@ -968,6 +1161,12 @@ class AmortizedMPCAgent:
 
         u = self.u
         dev = self.device
+
+        # _apply_action samples the contact produced by the preceding physics
+        # substep.  This final read captures contact produced by the LAST
+        # substep of env.step(), which otherwise has no following _apply_action
+        # call inside the same control interval.
+        self._accumulate_compliance_contact()
 
         # Read the state the plant actually reached
         q = u.robot.data.joint_pos[0, self._joint_ids].to(torch.float32)
@@ -995,6 +1194,26 @@ class AmortizedMPCAgent:
         n = max(self._track_n, 1)
         self._last_track_cmd_rms = (self._track_cmd_sse / n) ** 0.5
         self._last_track_plan_rms = (self._track_plan_sse / n) ** 0.5
+
+        if self._hit_diag_enabled and self._hit_diag_pending:
+            ct = getattr(u.robot.data, "computed_torque", None)
+            tau_ratio = 0.0
+            if ct is not None:
+                tau = ct[0, self._joint_ids].detach().cpu().float()
+                tau_ratio = float((tau.abs() / self._tau_lim).max().item())
+            for event in self._hit_diag_pending:
+                hand = event["hand"]
+                drum = int(event["drum_id"])
+                event["measured"] = self._hit_geometry(q, hand, drum)
+                event["tracking_rms_mrad"] = float(
+                    ((q.detach().cpu() - self._q_des).square().mean().sqrt() * 1e3).item()
+                )
+                event["contact_on_tick"] = bool(
+                    self._contact_step[0, 0 if hand == "left" else 1].item()
+                )
+                event["plant_peak_torque_ratio"] = tau_ratio
+                self._hit_diag_events.append(event)
+            self._hit_diag_pending.clear()
 
         # --- violation tracking --------------------------------------------
         # Joint limit: is any joint outside the URDF box?
@@ -1028,6 +1247,10 @@ class AmortizedMPCAgent:
 
         # Advance the schedule clock → fired mask
         fired = self.schedule.advance()
+        if self._contact_compliance is not None:
+            contact = self._contact_step.to(self.device)
+            self._contact_compliance.observe(fired, contact)
+            self._contact_hand_ticks += int(contact.sum().item())
 
         # Count hits + reset PID integral per fired hand
         for h in (0, 1):
@@ -1044,6 +1267,170 @@ class AmortizedMPCAgent:
             q.unsqueeze(0).to(dev),
             fired,
         )
+
+    def _hit_geometry(self, q: torch.Tensor, hand: str, drum: int) -> dict:
+        """Head-frame terminal error for one proposed or measured pose."""
+        sigma = A.default_contact_sigma(self.kit.names[int(drum)])
+        axial, lateral, inside = head_frame_error(
+            self._hit_diag_scorer,
+            q.detach().cpu().double().numpy(),
+            hand,
+            self.kit,
+            int(drum),
+            sigma,
+        )
+        return {
+            "axial_mm": float(axial * 1e3),
+            "lateral_beyond_mm": float(lateral * 1e3),
+            "in_hit_region": bool(inside),
+        }
+
+    def _plan_constraint_stats(self, result, q: torch.Tensor) -> dict:
+        traj = result.traj[0].detach().cpu().float()
+        mask = result.elem_mask[0].detach().cpu().bool()
+        lo = self._q_lo.view(1, -1)
+        hi = self._q_hi.view(1, -1)
+        q_exc = torch.maximum((traj - hi).clamp_min(0), (lo - traj).clamp_min(0))
+        q_exc = torch.where(mask, q_exc, torch.zeros_like(q_exc))
+        prev = torch.cat((q.detach().cpu().float().view(1, -1), traj[:-1]), dim=0)
+        vel = (traj - prev) / self.dt
+        v_ratio = vel.abs() / self._v_lim.view(1, -1).clamp_min(1e-6)
+        v_ratio = torch.where(mask, v_ratio, torch.zeros_like(v_ratio))
+        torque_ratio = None
+        torque = result.aux.get("torque")
+        if isinstance(torque, torch.Tensor) and torque.ndim == 3:
+            tr = torque[0].detach().cpu().float().abs() / self._tau_lim.view(1, -1)
+            tr = torch.where(mask, tr, torch.zeros_like(tr))
+            torque_ratio = float(tr.max().item())
+        return {
+            "finite": bool(torch.isfinite(traj[mask]).all().item()),
+            "joint_box_excess_deg": float(q_exc.max().item() * 180.0 / np.pi),
+            "velocity_ratio": float(v_ratio.max().item()),
+            "predicted_torque_ratio": torque_ratio,
+        }
+
+    def _record_hit_plan(
+        self, now: float, result, q: torch.Tensor, qd: torch.Tensor,
+    ) -> None:
+        stats = self._plan_constraint_stats(result, q)
+        _tth, drum_ids, goal_pos, goal_vel, _valid, _active = self.schedule.goal()
+        for h, hand in enumerate(("left", "right")):
+            k = int(result.hit_index[0, h].item())
+            if k < 1 or k > 20:
+                continue
+            cursor = int(self.schedule.cursor[0, h].item())
+            key = (h, cursor)
+            endpoint = result.traj[0, k - 1].detach().clone()
+            if k == 1:
+                # TickResult.traj[0] contains the led/clamped command.  At the
+                # terminal tick retain the network's un-led proposal instead.
+                endpoint = self.mpc.last_ref0[0].detach().clone()
+            drum = int(drum_ids[0, h].item())
+            row = {
+                "ticks_to_hit": k,
+                "time_s": now,
+                "terminal": self._hit_geometry(endpoint, hand, drum),
+                "constraints": dict(stats),
+                "q": q.detach().cpu().float().tolist(),
+                "qd": qd.detach().cpu().float().tolist(),
+                "goal_pos_env": goal_pos[0, h].detach().cpu().float().tolist(),
+                "goal_velocity_env": goal_vel[0, h].detach().cpu().float().tolist(),
+            }
+            trace = self._hit_diag_trace.setdefault(key, [])
+            trace.append(row)
+            if len(trace) > 20:
+                del trace[:-20]
+            if k == 1:
+                event = {
+                    "scheduled_time_s": float(now + self.dt),
+                    "hand": hand,
+                    "drum_id": drum,
+                    "drum": self.kit.names[drum],
+                    "cursor": cursor,
+                    "approach": list(trace),
+                    "proposed": row["terminal"],
+                    "commanded": self._hit_geometry(self._q_des, hand, drum),
+                    "constraints": dict(stats),
+                }
+                self._hit_diag_pending.append(event)
+                self._hit_diag_trace.pop(key, None)
+
+    def hit_diagnostics(self) -> dict:
+        """Attach final env credit to each model/plant event and summarize."""
+        if not self._hit_diag_enabled:
+            return {}
+        u = self.u
+        valid = u.beat_valid[0].detach().cpu().bool()
+        bt = u.beat_time[0].detach().cpu().float()
+        bh = u.beat_hand[0].detach().cpu().long()
+        bd = u.beat_drum_id[0].detach().cpu().long()
+        done = u.beat_done[0].detach().cpu().bool()
+        credit = u.beat_credit[0].detach().cpu().float()
+        touch = u.beat_touch_credit[0].detach().cpu().float()
+        abs_dt = u.beat_best_abs_dt[0].detach().cpu().float()
+        speed = u.beat_best_speed_ratio[0].detach().cpu().float()
+        for event in self._hit_diag_events:
+            hi = 0 if event["hand"] == "left" else 1
+            eligible = valid & (bh == hi) & (bd == int(event["drum_id"]))
+            delta = (bt - float(event["scheduled_time_s"])).abs()
+            delta = torch.where(eligible, delta, torch.full_like(delta, float("inf")))
+            i = int(delta.argmin().item())
+            event["beat_match_error_ms"] = float(delta[i].item() * 1e3)
+            event["outcome"] = {
+                "credited": bool(done[i].item()),
+                "credit": float(credit[i].item()),
+                "touch_credit": float(touch[i].item()),
+                "best_abs_timing_ms": float(abs_dt[i].item() * 1e3),
+                "best_speed_ratio": float(speed[i].item()),
+            }
+
+        groups = {}
+        for label, want in (("credited", True), ("missed", False)):
+            rows = [e for e in self._hit_diag_events if e.get("outcome", {}).get("credited") is want]
+            def frac(pred):
+                return sum(bool(pred(e)) for e in rows) / max(len(rows), 1)
+            def median(fn):
+                return float(np.median([fn(e) for e in rows])) if rows else None
+            groups[label] = {
+                "count": len(rows),
+                "proposed_in_region_frac": frac(lambda e: e["proposed"]["in_hit_region"]),
+                "commanded_in_region_frac": frac(lambda e: e["commanded"]["in_hit_region"]),
+                "measured_in_region_frac": frac(lambda e: e["measured"]["in_hit_region"]),
+                "median_proposed_abs_axial_mm": median(lambda e: abs(e["proposed"]["axial_mm"])),
+                "median_proposed_lateral_beyond_mm": median(lambda e: e["proposed"]["lateral_beyond_mm"]),
+                "median_measured_abs_axial_mm": median(lambda e: abs(e["measured"]["axial_mm"])),
+                "median_measured_lateral_beyond_mm": median(lambda e: e["measured"]["lateral_beyond_mm"]),
+                "median_tracking_rms_mrad": median(lambda e: e["tracking_rms_mrad"]),
+                "contact_on_tick_frac": frac(lambda e: e["contact_on_tick"]),
+                "median_best_abs_timing_ms": median(lambda e: e["outcome"]["best_abs_timing_ms"]),
+                "median_best_speed_ratio": median(lambda e: e["outcome"]["best_speed_ratio"]),
+                "nonfinite_plan_frac": frac(lambda e: not e["constraints"]["finite"]),
+                "joint_box_plan_violation_frac": frac(
+                    lambda e: e["constraints"]["joint_box_excess_deg"] > 1e-5
+                ),
+                "velocity_plan_violation_frac": frac(
+                    lambda e: e["constraints"]["velocity_ratio"] > 1.0
+                ),
+            }
+        return {"summary": groups, "events": self._hit_diag_events}
+
+    def write_hit_diagnostics(self) -> Path | None:
+        if not self._hit_diag_enabled:
+            return None
+        payload = self.hit_diagnostics()
+        requested = str(self.args.hit_diagnostics)
+        if requested == "auto":
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            path = Path(__file__).resolve().parent.parent / "runs" / "diagnostics" / f"isaac_hits_{stamp}.json"
+        else:
+            path = Path(requested)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"  [hit-diagnostics] {json.dumps(payload['summary'], sort_keys=True)}", flush=True)
+        print(f"[INFO] Wrote hit diagnostics to {path}", flush=True)
+        return path
 
     def status_line(self, now: float) -> str:
         hi = self.schedule.hit_index()
@@ -1064,6 +1451,13 @@ class AmortizedMPCAgent:
         if self._pid_active:
             i_peak = self._integral.abs().max().item()
             pid_str = f" | PID ki={self._ki:.1f} int_peak={i_peak*1e3:.1f}mrad·s"
+        compliance_str = ""
+        if self._contact_compliance is not None:
+            active = self._contact_step[0].tolist()
+            compliance_str = (
+                f" | compliance contact=L{int(active[0])}/R{int(active[1])} "
+                f"hand_ticks={self._contact_hand_ticks}"
+            )
         return (
             f"[t={now:5.2f}s] amortized MPC | "
             f"tth L={tth0}wp R={tth1}wp | "
@@ -1072,12 +1466,16 @@ class AmortizedMPCAgent:
             f"plan={self._last_track_plan_rms*1e3:.0f}mrad | "
             f"waist cmd y/p/r={cmd_w[0]:+.0f}/{cmd_w[1]:+.0f}/{cmd_w[2]:+.0f}deg "
             f"meas p2p={p2p[0]:.0f}/{p2p[1]:.0f}/{p2p[2]:.0f}deg | "
-            f"lead={lead_tag}{off_str}{pid_str}"
+            f"lead={lead_tag}{off_str}{pid_str}{compliance_str}"
         )
 
     def violation_summary(self) -> dict:
         """Return a dict of violation statistics for the completed episode."""
         n = max(len(self._viol_joint), 1)
+        u = self.u
+        episode_correct = getattr(u, "episode_correct", None)
+        episode_touched = getattr(u, "episode_touched", None)
+        beat_done = getattr(u, "beat_done", None)
         return {
             "steps": n,
             "joint_limit_steps": sum(self._viol_joint),
@@ -1089,6 +1487,16 @@ class AmortizedMPCAgent:
             "max_torque_over": self._max_torque_over,
             "collision_steps": sum(self._viol_collision),
             "collision_frac": sum(self._viol_collision) / n,
+            "contact_hand_ticks": self._contact_hand_ticks,
+            "credited_hits": (
+                int(episode_correct[0].item()) if episode_correct is not None else -1
+            ),
+            "physical_touches": (
+                int(episode_touched[0].item()) if episode_touched is not None else -1
+            ),
+            "completed_beats": (
+                int(beat_done[0].sum().item()) if beat_done is not None else -1
+            ),
             "track_cmd_rms_mrad": self._last_track_cmd_rms * 1e3,
             "track_plan_rms_mrad": self._last_track_plan_rms * 1e3,
             "track_wrist_cmd_rms_mrad": (
@@ -1101,6 +1509,12 @@ class AmortizedMPCAgent:
 
 
 def _print_episode_stats(vs: dict) -> None:
+    print(
+        f"  [hits] credited={vs['credited_hits']} "
+        f"physical_touches={vs['physical_touches']} "
+        f"completed_beats={vs['completed_beats']}",
+        flush=True,
+    )
     print(
         f"  [violations] joint_limit: {vs['joint_limit_steps']}/{vs['steps']} "
         f"({vs['joint_limit_frac']*100:.1f}%) "
@@ -1170,6 +1584,7 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
                   flush=True)
             vs = agent.violation_summary()
             _print_episode_stats(vs)
+            agent.write_hit_diagnostics()
             return {}
         if k % 50 == 0:
             print(f"  step {k}/{steps} {agent.status_line(now)}", flush=True)
@@ -1177,6 +1592,7 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
     vs = agent.violation_summary()
     if vs["steps"] > 0:
         _print_episode_stats(vs)
+    agent.write_hit_diagnostics()
     return {}
 
 
@@ -1268,6 +1684,14 @@ def main():
     # plays --rhythm_path, so the banner is a different song.
     clip_path, play_clip = resolve_play_clip(args_cli)
     enable_hit_telemetry(env_cfg)
+    if args_cli.contact_compliance:
+        if not hasattr(env_cfg, "hit_detection_mode"):
+            raise RuntimeError(
+                "--contact_compliance requires an env with PhysX drum contact sensors"
+            )
+        env_cfg.hit_detection_mode = "contact"
+        if hasattr(env_cfg, "contact_force_threshold"):
+            env_cfg.contact_force_threshold = float(args_cli.compliance_force_n)
     if hasattr(env_cfg, "rhythm_file"):
         env_cfg.rhythm_file = str(clip_path)
         env_cfg.rhythm_pool = None

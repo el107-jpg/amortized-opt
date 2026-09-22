@@ -181,6 +181,7 @@ from .line_search_step import (
     build_objective_direction_fingerprint,
     init_line_search_runtime,
     resolve_known_search,
+    needs_line_search_direction,
     run_search_or_ordinary,
     snapshot_g_preclip,
 )
@@ -612,6 +613,17 @@ def phase2_cost_config(**kw) -> CostConfig:
         w_smooth_acc=1.0e-4, w_smooth_jerk=1.0e-4,
         # posture: a real preference rather than a rounding error
         w_posture_mid=0.1, w_elbow_down=10.0,
+        # Continuous compact active-arm mass proxy.  Unlike the original
+        # squared-ReLU form, every active pose gets a gentle downward/inward
+        # gradient.  Its much larger raw gradient requires a correspondingly
+        # smaller outer weight.  On the step-13,500 actor, unit weight has
+        # parameter-gradient norm 6.74 vs 5,527 for the rest of the objective;
+        # 15 therefore allocates about 1.8% of the gradient budget.  Start
+        # gentle and raise it only if the logged mean height/radius stay flat.
+        w_arm_compact=15.0,
+        arm_compact_mode="linear",
+        arm_compact_height_max=0.28,
+        arm_compact_radius_max=0.28,
         # IDLE ARM.  Both are EXACTLY zero -- no term, no gradient -- until a
         # cylinder is installed with ``FusedCost.set_idle_cylinder``, so carrying
         # them in the training config costs nothing on a run that does not use
@@ -623,10 +635,14 @@ def phase2_cost_config(**kw) -> CostConfig:
             else {"w_idle_home": 1.0}
         ),
         w_idle_vel=0.02,
-        # Weak in-plane pull toward the AIM (2 cm deadband, not AL-scaled) so
-        # the region hinge does not settle on the rim.  CostConfig default is
-        # still 0; this is training-only.
-        w_terminal_aim=10.0,
+        # Moderate in-plane pull toward the AIM (5 mm deadband, not AL-scaled)
+        # so the legal-region hinge cannot improve torque/posture by parking on
+        # the rim.  This remains far below the terminal AL term on an actual
+        # miss, but supplies a useful precision gradient after entering the
+        # 20 mm MPC acceptance collar.  CostConfig default remains OFF;
+        # this is training-only.
+        w_terminal_aim=40.0,
+        terminal_aim_deadband_m=0.005,
         # Decoder P/R vs stopgrad(encoder SP).  CostConfig default is 0 so
         # validation stays bit-identical; training prices the AL group (λ is
         # then the price).  CLI --w-waist-pr-band 0 for A/B.
@@ -841,6 +857,11 @@ class Phase2Config:
     #: After ``total.backward()``, cap ``||g_torque|| / ||g||`` (0=off, 1=no-op).
     #: Uses ``terms['torque']`` (hinge + AL + PHR).  Works with line search.
     torque_grad_cap: float = 0.0
+    #: Re-measure the exact torque-gradient decomposition every N outer steps.
+    #: Intervening steps apply an EMA-cached scalar in the loss and avoid the
+    #: second parameter VJP. One preserves the exact legacy path.
+    torque_grad_cap_refresh: int = 1
+    torque_grad_cap_scale_ema: float = 0.8
 
     #: SaLSa-style line search (``docs/parameter_line_search_plan``).  When
     #: True, ``grad_balance`` is forced empty (true ``total.backward()``);
@@ -912,6 +933,40 @@ class Phase2Config:
     #: on the identity ties two garbage plans, which is coupling paid for
     #: nothing until the cost loss has shaped the output.
     suffix_warmup: int = 1_000
+
+    #: TERMINAL DLS LOOKAHEAD.  On a deterministic subset of rows, take a
+    #: detached damped-least-squares step at each active hand's strike knot,
+    #: spread that arm-only correction backward through the final approach,
+    #: and evaluate the ordinary full physics cost on the corrected path.  A
+    #: straight-through view sends that better terminal gradient back into the
+    #: actor; the Huber tie makes the uncorrected actor learn to internalize the
+    #: correction.  This is deliberately not an inference-time projector.
+    #:
+    #: ``dls_terminal_frac=0`` is an exact off switch.  Rows are evenly spaced
+    #: rather than randomly drawn so a line-search probe replays precisely the
+    #: same scalar objective without another RNG payload.
+    dls_terminal_frac: float = 0.0
+    w_dls_terminal_cost: float = 0.0
+    w_dls_terminal_tie: float = 0.0
+    dls_terminal_steps: int = 1
+    dls_terminal_window: int = 16
+    dls_terminal_damping: float = 0.05
+    dls_terminal_max_step_rad: float = 0.35
+    #: Alternative to the arm-only DLS teacher.  The curvature teacher takes
+    #: the gradient of the *full* FusedCost in waypoint space, then solves a
+    #: positive-definite model made from the exact spline smoothness Hessian
+    #: and contact position/velocity Gauss--Newton blocks.  The ordinary actor
+    #: Adam/SaLSa update and the full-cost lookahead remain unchanged.
+    terminal_lookahead_mode: str = "dls"  # "dls" | "curvature"
+    curvature_damping: float = 1.0
+    curvature_position_weight: float = 40.0
+    curvature_velocity_weight: float = 20.0
+    curvature_max_step_rad: float = 0.15
+    #: Replace the trajectory VJP on this deterministic fraction of rows with
+    #: a norm-matched analytic-curvature direction. Unlike the lookahead
+    #: teacher, this changes the backward direction but not the scalar loss.
+    curvature_direct_frac: float = 0.0
+    curvature_direct_mix: float = 1.0
 
     #: Std-dev, rad, of Gaussian jitter added to the ``yaw_now`` conditioning
     #: token at batch time (the stored ``aim_yaw`` token is left alone).  The
@@ -1289,6 +1344,9 @@ class Phase2Config:
     #: ``probe/`` prefixes).  Requires ``tensorboard`` (``pip install -e
     #: '.[monitoring]'``).
     tensorboard: bool = True
+    #: Sample one outer step with CUDA-event phase markers every N steps.
+    #: Zero disables profiling; only sampled steps synchronize for reporting.
+    phase_timing_every: int = 0
     ckpt_every: int = 2_000
     #: ``last.pt`` cadence between full ``ckpt_every`` bundles (frontier plot,
     #: ``frontier.pt``).  0 = only save on ``ckpt_every`` and shutdown.
@@ -1314,6 +1372,44 @@ class Phase2Config:
             raise ValueError(
                 f"replay_viol_uniform_mix must be in [0, 1], got {gamma}"
             )
+        if int(self.torque_grad_cap_refresh) < 1:
+            raise ValueError("torque_grad_cap_refresh must be positive")
+        if not 0.0 <= float(self.torque_grad_cap_scale_ema) < 1.0:
+            raise ValueError("torque_grad_cap_scale_ema must be in [0, 1)")
+        if int(self.phase_timing_every) < 0:
+            raise ValueError("phase_timing_every must be nonnegative")
+        if not 0.0 <= float(self.dls_terminal_frac) <= 1.0:
+            raise ValueError("dls_terminal_frac must be in [0, 1]")
+        if float(self.w_dls_terminal_cost) < 0.0:
+            raise ValueError("w_dls_terminal_cost must be nonnegative")
+        if float(self.w_dls_terminal_tie) < 0.0:
+            raise ValueError("w_dls_terminal_tie must be nonnegative")
+        if int(self.dls_terminal_steps) < 1:
+            raise ValueError("dls_terminal_steps must be positive")
+        if int(self.dls_terminal_window) < 1:
+            raise ValueError("dls_terminal_window must be positive")
+        if float(self.dls_terminal_damping) <= 0.0:
+            raise ValueError("dls_terminal_damping must be positive")
+        if float(self.dls_terminal_max_step_rad) <= 0.0:
+            raise ValueError("dls_terminal_max_step_rad must be positive")
+        if self.terminal_lookahead_mode not in ("dls", "curvature"):
+            raise ValueError("terminal_lookahead_mode must be 'dls' or 'curvature'")
+        if float(self.curvature_damping) <= 0.0:
+            raise ValueError("curvature_damping must be positive")
+        if float(self.curvature_position_weight) < 0.0:
+            raise ValueError("curvature_position_weight must be nonnegative")
+        if float(self.curvature_velocity_weight) < 0.0:
+            raise ValueError("curvature_velocity_weight must be nonnegative")
+        if float(self.curvature_max_step_rad) <= 0.0:
+            raise ValueError("curvature_max_step_rad must be positive")
+        if not 0.0 <= float(self.curvature_direct_frac) <= 1.0:
+            raise ValueError("curvature_direct_frac must be in [0, 1]")
+        if not 0.0 <= float(self.curvature_direct_mix) <= 1.0:
+            raise ValueError("curvature_direct_mix must be in [0, 1]")
+        if self.curvature_direct_frac > 0.0 and self.dls_terminal_frac > 0.0:
+            raise ValueError("direct curvature and terminal lookahead cannot both be active")
+        if self.curvature_direct_frac > 0.0 and self.grad_balance:
+            raise ValueError("direct curvature requires grad_balance='' ")
         if self.voxel_pool:
             # Voxel training deliberately gives the torso to the trajectory
             # decoder.  Keeping one of the legacy encoder set-point losses on
@@ -3862,6 +3958,12 @@ DIAG_KEYS: tuple[str, ...] = (
     # P/R at the nearer active hit (the V_f coordinate).  Appended so a
     # run with ``w_waist_pr_terminal = 0`` still has a baseline.
     "waist_pr_N",
+    # Active-arm mass-proxy geometry in the torso frame.  Logged even when the
+    # compactness weight is zero so thresholds/weight can be calibrated on an
+    # existing policy before changing its objective.
+    "arm_com_height_max", "arm_com_radius_max",
+    "arm_com_height_mean", "arm_com_radius_mean",
+    "arm_com_height_excess_max", "arm_com_radius_excess_max",
 )
 #: Short log names for :data:`DIAG_KEYS`, positionally.  The term / violation
 #: names are derived from their key tuples so the two can never drift apart.
@@ -3877,6 +3979,8 @@ DIAG_NAMES: tuple[str, ...] = (
     "d_tip_lat", "d_tip_cross",
     "d_tau_track", "d_tau_track_max", "d_tau_track_peak",
     "d_waist_pr_N",
+    "d_arm_com_z", "d_arm_com_r", "d_arm_com_z_mean", "d_arm_com_r_mean",
+    "d_arm_com_z_ex", "d_arm_com_r_ex",
 )
 assert len(DIAG_NAMES) == len(DIAG_KEYS)
 assert set(VIOL_KEYS) == set(CONSTRAINT_GROUPS), (VIOL_KEYS, CONSTRAINT_GROUPS)
@@ -4218,7 +4322,10 @@ def make_cost_step(module, cost: FusedCost, scales: LossScales, cfg: Phase2Confi
         if cfg.compile_aux and want_aux:
             _aux_huber = torch.compile(_aux_huber, mode=compile_mode, dynamic=False)
 
-    def fn(init, state, q0, v0, enc, masks, strike, lengths, weights, _unused):
+    def fn(
+        init, state, q0, v0, enc, masks, strike, lengths, weights,
+        torque_scale_delta,
+    ):
         out = _model(init, state, enc, masks)
         em = masks.elem_mask.to(out.traj.dtype)
         pm = masks.point_mask.to(out.traj.dtype)
@@ -4263,6 +4370,15 @@ def make_cost_step(module, cost: FusedCost, scales: LossScales, cfg: Phase2Confi
             loss_aux = out.traj.new_zeros(())
         loss_cost = total.mean()
         loss = cfg.w_cost * loss_cost + cfg.w_aux * loss_aux
+        if cfg.torque_grad_cap > 0.0:
+            # On cached-cap steps this turns
+            #   g_rest + g_torque -> g_rest + scale * g_torque
+            # in the single ordinary backward.  A zero delta is the exact
+            # legacy objective used on refresh steps.
+            loss = loss + (
+                torque_scale_delta.to(loss.dtype)
+                * float(cfg.w_cost) * terms[TORQUE_TERM_IDX]
+            )
         zero = torch.zeros((), device=loss.device, dtype=loss.dtype)
         metrics = torch.cat([
             torch.stack([loss.detach(), loss_cost.detach(), loss_aux.detach(),
@@ -7677,6 +7793,645 @@ def _index_batch_weights(weights: dict, idx: torch.Tensor, batch_size: int) -> d
     return out
 
 
+def _dls_rows(
+    batch_size: int,
+    frac: float,
+    device: torch.device,
+    eligible: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Deterministic, evenly-spaced row subset used by terminal DLS.
+
+    Determinism is part of the objective contract: candidate optimizer steps
+    in SaLSa must replay the same rows as the baseline objective.
+    """
+    base = (
+        torch.arange(int(batch_size), device=device, dtype=torch.long)
+        if eligible is None else
+        torch.nonzero(eligible.to(device=device).bool(), as_tuple=False).flatten()
+    )
+    if base.numel() == 0:
+        return base
+    n = min(
+        max(int(math.ceil(float(frac) * int(batch_size))), 1),
+        int(base.numel()),
+    )
+    take = torch.div(
+        torch.arange(n, device=device, dtype=torch.long) * int(base.numel()),
+        n,
+        rounding_mode="floor",
+    )
+    return base.index_select(0, take)
+
+
+def _dls_contact_local(
+    cost: FusedCost,
+    strike: StrikeContext,
+    hand_index: int,
+) -> torch.Tensor:
+    """Requested contact point in each row's wrist frame.
+
+    Recover the mount from the randomized tip when necessary.  This keeps the
+    DLS teacher on exactly the same stick geometry as ``FusedCost._terminal``.
+    """
+    hand = HANDS[int(hand_index)]
+    sigma = strike.contact_sigma[:, hand_index].float().unsqueeze(-1)
+    if strike.stick_axis_local is None:
+        axis = cost.c_mount_axis[hand].float().view(1, 3).expand(strike.batch, -1)
+    else:
+        axis = strike.stick_axis_local[:, hand_index].float()
+    if strike.stick_points_local is None:
+        mount = cost.c_mount_p[hand].float().view(1, 3).expand(strike.batch, -1)
+    else:
+        tip = strike.stick_points_local[:, hand_index, 0].float()
+        if strike.stick_tip_sigma is None:
+            tip_sigma = sigma.new_full((strike.batch, 1), float(STICK_TIP_SIGMA))
+        else:
+            tip_sigma = strike.stick_tip_sigma[:, hand_index].float().unsqueeze(-1)
+        mount = tip - tip_sigma * axis
+    return mount + sigma * axis
+
+
+def _dls_contact_position(
+    fk: ChainFK,
+    q: torch.Tensor,
+    hand: str,
+    local: torch.Tensor,
+) -> torch.Tensor:
+    dev_type = "cuda" if q.device.type == "cuda" else "cpu"
+    with torch.autocast(device_type=dev_type, enabled=False):
+        R, p = fk.frame(q.float(), f"{hand}_wrist")
+        return p + torch.einsum("bij,bj->bi", R, local.float())
+
+
+def _dls_contact_position_jacobian(
+    fk: ChainFK,
+    q: torch.Tensor,
+    hand: str,
+    local: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Contact position and exact positional Jacobian, both detached."""
+    dev_type = "cuda" if q.device.type == "cuda" else "cpu"
+    with (
+        torch.inference_mode(False), torch.enable_grad(),
+        torch.autocast(device_type=dev_type, enabled=False),
+    ):
+        qg = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+        qg.copy_(q.detach().float())
+        qg.requires_grad_(True)
+        pos = _dls_contact_position(fk, qg, hand, local.float())
+        rows = []
+        for axis in range(3):
+            (grad,) = torch.autograd.grad(
+                pos[:, axis].sum(), qg,
+                retain_graph=axis < 2, create_graph=False,
+            )
+            rows.append(grad)
+    return pos.detach(), torch.stack(rows, dim=1).detach()
+
+
+def dls_terminal_teacher(
+    traj: torch.Tensor,
+    strike: StrikeContext,
+    cost: FusedCost,
+    *,
+    steps: int = 1,
+    window: int = 16,
+    damping: float = 0.05,
+    max_step_rad: float = 0.35,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Build a detached arm-only DLS terminal teacher and approach mask.
+
+    Each hand is solved independently with the waist frozen.  Its terminal
+    delta is propagated through the last ``window`` knots with a rest-to-rest
+    quintic blend, avoiding a discontinuity one knot before contact.
+    """
+    if traj.ndim != 3:
+        raise ValueError(f"traj must be (B, H, D), got {tuple(traj.shape)}")
+    B, H, D = traj.shape
+    teacher = traj.detach().float().clone()
+    tie_mask = teacher.new_zeros(B, H, D)
+    before_sum = teacher.new_zeros(())
+    after_sum = teacher.new_zeros(())
+    active_count = teacher.new_zeros(())
+    delta_sum = teacher.new_zeros(())
+    delta_count = teacher.new_zeros(())
+    knot = torch.arange(1, H + 1, device=traj.device, dtype=torch.float32).view(1, H)
+
+    for hi, hand in enumerate(HANDS):
+        active_rows = torch.nonzero(
+            strike.active[:, hi] > 0.5, as_tuple=False,
+        ).flatten()
+        if active_rows.numel() == 0:
+            continue
+        hit_all = strike.hit_index[:, hi].clamp(1, H)
+        hit = hit_all.index_select(0, active_rows)
+        gather = (hit - 1).view(-1, 1, 1).expand(-1, 1, D)
+        q_hit = teacher.index_select(0, active_rows).gather(1, gather).squeeze(1)
+        aim = strike.p_star[:, hi].index_select(0, active_rows).detach().float()
+        local = _dls_contact_local(cost, strike, hi).index_select(0, active_rows)
+        cols = torch.as_tensor(
+            [i for i, name in enumerate(cost.joint_names) if name.startswith(f"{hand}_")],
+            device=traj.device, dtype=torch.long,
+        )
+        q_start = q_hit.clone()
+        pos0 = _dls_contact_position(cost.fk, q_hit, hand, local)
+        before_sum = before_sum + (aim - pos0).norm(dim=-1).sum()
+        active_count = active_count + float(active_rows.numel())
+        eye = torch.eye(3, device=traj.device, dtype=torch.float32).expand(
+            active_rows.numel(), -1, -1,
+        )
+        for _ in range(int(steps)):
+            pos, jac = _dls_contact_position_jacobian(
+                cost.fk, q_hit, hand, local,
+            )
+            jac = jac.index_select(2, cols)
+            jt = jac.transpose(1, 2)
+            rhs = (aim - pos).unsqueeze(-1)
+            dq = (jt @ torch.linalg.solve(
+                jac @ jt + float(damping) ** 2 * eye, rhs,
+            )).squeeze(-1)
+            dq = dq.clamp(-float(max_step_rad), float(max_step_rad))
+            q_arm = q_hit.index_select(1, cols) + dq
+            q_arm = torch.maximum(
+                torch.minimum(
+                    q_arm, cost.q_hi_hard.index_select(0, cols).float(),
+                ),
+                cost.q_lo_hard.index_select(0, cols).float(),
+            )
+            q_hit = q_hit.index_copy(1, cols, q_arm)
+        pos1 = _dls_contact_position(cost.fk, q_hit, hand, local)
+        after_sum = after_sum + (aim - pos1).norm(dim=-1).sum()
+        delta = q_hit.index_select(1, cols) - q_start.index_select(1, cols)
+        delta_sum = delta_sum + delta.abs().sum()
+        delta_count = delta_count + float(delta.numel())
+
+        # A quintic alpha is zero at the beginning of the approach and one at
+        # the strike.  Knots after the hit are intentionally untouched.
+        start = (hit - int(window)).clamp_min(0).float().unsqueeze(1)
+        denom = (hit.float().unsqueeze(1) - start).clamp_min(1.0)
+        u = ((knot - start) / denom).clamp(0.0, 1.0)
+        alpha = u.pow(3) * (10.0 - 15.0 * u + 6.0 * u.pow(2))
+        alpha = alpha * (knot <= hit.unsqueeze(1)).float()
+        add = teacher.new_zeros(active_rows.numel(), H, D)
+        add[:, :, cols] = alpha.unsqueeze(-1) * delta.unsqueeze(1)
+        current = teacher.index_select(0, active_rows) + add
+        teacher.index_copy_(0, active_rows, current)
+        hand_mask = teacher.new_zeros(active_rows.numel(), H, D)
+        hand_mask[:, :, cols] = (alpha > 0.0).float().unsqueeze(-1)
+        tie_mask.index_copy_(
+            0, active_rows,
+            torch.maximum(tie_mask.index_select(0, active_rows), hand_mask),
+        )
+
+    denom = active_count.clamp_min(1.0)
+    stats = {
+        "dls_terminal_rows": traj.new_tensor(float(B)),
+        "dls_terminal_active_hands": active_count,
+        "dls_terminal_err_before_m": before_sum / denom,
+        "dls_terminal_err_after_m": after_sum / denom,
+        "dls_terminal_delta_abs_rad": delta_sum / delta_count.clamp_min(1.0),
+    }
+    return teacher.to(traj.dtype), tie_mask.to(traj.dtype), stats
+
+
+def _spline_smoothness_hessians(cost: FusedCost) -> torch.Tensor:
+    """Exact per-joint waypoint Hessians of this cost's spline smoothness.
+
+    The spline gain table maps waypoints linearly to Hermite endpoint slopes.
+    Thus the closed-form acceleration/jerk integrals are quadratic in the
+    waypoints.  Cache their Hessians for every possible group horizon; the
+    row-dependent valid-element denominator is applied in the solve below.
+    The measured initial position/velocity are constants, not variables.
+    """
+    builder = cost.spline
+    key = (
+        float(cost.cfg.w_smooth_acc), float(cost.cfg.w_smooth_jerk),
+        str(cost.device), str(cost.dtype),
+    )
+    cache = getattr(builder, "_curvature_smooth_hessians", None)
+    if cache is None:
+        cache = {}
+        builder._curvature_smooth_hessians = cache
+    if key in cache:
+        return cache[key]
+
+    H, dt = builder.max_segments, float(builder.dt)
+    basis = np.zeros((H + 1, H), dtype=np.float64)
+    for j in range(H):
+        basis[j + 1, j] = 1.0
+    hess = np.zeros((H + 1, H, H), dtype=np.float64)
+    wa, wj = float(cost.cfg.w_smooth_acc), float(cost.cfg.w_smooth_jerk)
+    for length in range(1, H + 1):
+        x = basis.copy()
+        x[length + 1:] = 0.0
+        slopes = builder._Gx_np[length] @ x
+        a2 = 3.0 * (x[1:length + 1] - x[:length]) / dt**2 \
+            - (2.0 * slopes[:length] + slopes[1:length + 1]) / dt
+        a3 = 2.0 * (x[:length] - x[1:length + 1]) / dt**3 \
+            + (slopes[:length] + slopes[1:length + 1]) / dt**2
+        qa = (
+            4.0 * dt * (a2.T @ a2)
+            + 6.0 * dt**2 * (a2.T @ a3 + a3.T @ a2)
+            + 12.0 * dt**3 * (a3.T @ a3)
+        )
+        qj = 36.0 * dt * (a3.T @ a3)
+        hess[length] = 2.0 * (wa * qa + wj * qj)
+    out = torch.as_tensor(hess, device=cost.device, dtype=torch.float32)
+    cache[key] = out
+    return out
+
+
+def curvature_terminal_teacher(
+    traj: torch.Tensor,
+    q0: torch.Tensor,
+    v0: torch.Tensor,
+    strike: StrikeContext,
+    lengths: torch.Tensor,
+    weights: dict,
+    cost: FusedCost,
+    cfg: Phase2Config,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """One full-cost trajectory step in an analytic, positive curvature metric.
+
+    A0 is the exact spline acceleration/jerk Hessian plus damping, separately
+    for every joint's actual horizon.  Position and finite-difference impact
+    velocity Jacobians add low-rank Gauss--Newton blocks for both hands, with
+    shared waist columns.  Woodbury reduces the coupled solve to banded-sized
+    per-joint solves and a <=12 by 12 contact system.  The original FusedCost
+    must decrease for a row's detached teacher to be admitted.
+    """
+    B, H, D = traj.shape
+    device = traj.device
+    with torch.enable_grad():
+        probe = traj.detach().float().requires_grad_(True)
+        before = cost.forward(q0.float(), probe, v0.float(), strike,
+                              lengths=lengths, weights=weights)
+        grad = torch.autograd.grad(before.total.sum(), probe)[0].detach()
+    with torch.no_grad():
+        group = torch.as_tensor(cost.spline._group_np, device=device)
+        per_len = lengths.clamp(1, H).index_select(1, group)
+        valid = (
+            torch.arange(H, device=device).view(1, H, 1)
+            < per_len.unsqueeze(1)
+        ).to(grad.dtype)
+        grad = grad * valid
+        n_valid = per_len.sum(dim=1).clamp_min(1).to(grad.dtype)
+        if cost.cfg.reduction != "mean":
+            n_valid = torch.ones_like(n_valid)
+        stiffness = _spline_smoothness_hessians(cost).index_select(
+            0, per_len.reshape(-1)
+        ).reshape(B, D, H, H)
+        smooth_weight = weights.get("smooth", 1.0)
+        stiffness = stiffness * torch.as_tensor(
+            smooth_weight, device=device, dtype=grad.dtype,
+        ).reshape(-1, 1, 1, 1) / n_valid.view(B, 1, 1, 1)
+        eye_h = torch.eye(H, device=device, dtype=grad.dtype)
+        base = stiffness + float(cfg.curvature_damping) * eye_h
+        chol = torch.linalg.cholesky(base.reshape(B * D, H, H))
+
+        # Residual rows: (left position xyz, left velocity xyz, right ...).
+        jac = grad.new_zeros(B, 12, D, H)
+        root_w = grad.new_zeros(B, 12)
+        hit_positions = []
+        for hi, hand in enumerate(HANDS):
+            hit = strike.hit_index[:, hi].clamp(1, H)
+            active = (strike.active[:, hi] > 0.5).to(grad.dtype)
+            at_hit = probe.detach().gather(
+                1, (hit - 1).view(B, 1, 1).expand(B, 1, D),
+            ).squeeze(1)
+            prev_all = torch.cat([q0.float().unsqueeze(1), probe.detach()[:, :-1]], dim=1)
+            at_prev = prev_all.gather(
+                1, (hit - 1).view(B, 1, 1).expand(B, 1, D),
+            ).squeeze(1)
+            local = _dls_contact_local(cost, strike, hi)
+            pos_hit, j_hit = _dls_contact_position_jacobian(
+                cost.fk, at_hit, hand, local,
+            )
+            _pos_prev, j_prev = _dls_contact_position_jacobian(
+                cost.fk, at_prev, hand, local,
+            )
+            hit_positions.append(pos_hit)
+            j_hit = j_hit * active.view(B, 1, 1)
+            j_prev = j_prev * (active * (hit > 1).to(grad.dtype)).view(B, 1, 1)
+            hidx = (hit - 1).view(B, 1, 1, 1).expand(B, 3, D, 1)
+            pidx = (hit - 2).clamp_min(0).view(B, 1, 1, 1).expand(B, 3, D, 1)
+            jpos = jac[:, hi * 6:hi * 6 + 3]
+            jvel = jac[:, hi * 6 + 3:hi * 6 + 6]
+            jpos.scatter_add_(3, hidx, j_hit.unsqueeze(-1))
+            jvel.scatter_add_(3, hidx, (j_hit / cost.dt).unsqueeze(-1))
+            jvel.scatter_add_(3, pidx, (-j_prev / cost.dt).unsqueeze(-1))
+            root_w[:, hi * 6:hi * 6 + 3] = (
+                float(cfg.curvature_position_weight) ** 0.5 * active.unsqueeze(1)
+            )
+            root_w[:, hi * 6 + 3:hi * 6 + 6] = (
+                float(cfg.curvature_velocity_weight) ** 0.5 * active.unsqueeze(1)
+            )
+
+        rhs = torch.cat([
+            grad.permute(0, 2, 1).unsqueeze(-1),
+            jac.permute(0, 2, 3, 1),
+        ], dim=-1).reshape(B * D, H, 13)
+        solved = torch.cholesky_solve(rhs, chol).reshape(B, D, H, 13)
+        u0, u_j = solved[..., 0], solved[..., 1:]
+        ju0 = torch.einsum("brdh,bdh->br", jac, u0)
+        juj = torch.einsum("brdh,bdhs->brs", jac, u_j)
+        small = (
+            torch.eye(12, device=device, dtype=grad.dtype).unsqueeze(0)
+            + root_w.unsqueeze(2) * juj * root_w.unsqueeze(1)
+        )
+        small_rhs = (root_w * ju0).unsqueeze(-1)
+        correction = torch.linalg.solve(small, small_rhs).squeeze(-1) * root_w
+        direction = -(u0 - torch.einsum("bdhs,bs->bdh", u_j, correction))
+        direction = direction.permute(0, 2, 1) * valid
+        max_abs = direction.abs().amax(dim=(1, 2)).clamp_min(1e-12)
+        step = (float(cfg.curvature_max_step_rad) / max_abs).clamp(max=1.0)
+        accepted = torch.zeros(B, device=device, dtype=torch.bool)
+        teacher = probe.detach().clone()
+        improvement = grad.new_zeros(B)
+        # The full cost is nonconvex and includes changing max-active sets;
+        # shrink the analytic descent direction until the *actual* cost falls.
+        for shrink in (1.0, 0.5, 0.25, 0.125, 0.0625):
+            if bool(accepted.all()):
+                break
+            candidate = probe.detach() + direction * (step * shrink).view(B, 1, 1)
+            after = cost.forward(q0.float(), candidate, v0.float(), strike,
+                                 lengths=lengths, weights=weights)
+            delta_cost = before.total.detach() - after.total
+            better = (~accepted) & torch.isfinite(after.total) & (delta_cost > 1e-6)
+            teacher = torch.where(better.view(B, 1, 1), candidate, teacher)
+            improvement = torch.where(better, delta_cost, improvement)
+            accepted |= better
+        tie_mask = valid * (teacher - probe.detach()).abs().gt(1e-9).to(grad.dtype)
+        miss_before = grad.new_zeros(())
+        miss_after = grad.new_zeros(())
+        active_count = grad.new_zeros(())
+        for hi, hand in enumerate(HANDS):
+            hit = strike.hit_index[:, hi].clamp(1, H)
+            q_after = teacher.gather(
+                1, (hit - 1).view(B, 1, 1).expand(B, 1, D),
+            ).squeeze(1)
+            local = _dls_contact_local(cost, strike, hi)
+            p_after = _dls_contact_position(cost.fk, q_after, hand, local)
+            act = (strike.active[:, hi] > 0.5).to(grad.dtype)
+            aim = strike.p_star[:, hi].float()
+            miss_before += (hit_positions[hi] - aim).norm(dim=1).mul(act).sum()
+            miss_after += (p_after - aim).norm(dim=1).mul(act).sum()
+            active_count += act.sum()
+        stats = {
+            "dls_terminal_rows": grad.new_tensor(float(B)),
+            "dls_terminal_active_hands": active_count,
+            "dls_terminal_err_before_m": miss_before / active_count.clamp_min(1.0),
+            "dls_terminal_err_after_m": miss_after / active_count.clamp_min(1.0),
+            "dls_terminal_delta_abs_rad": (teacher - probe.detach()).abs().mean(),
+            "curvature_teacher_accept_frac": accepted.float().mean(),
+            "curvature_teacher_cost_improvement": improvement.mean(),
+        }
+    return teacher.to(traj.dtype), tie_mask.to(traj.dtype), stats
+
+
+def curvature_precondition_vjps(
+    grads: torch.Tensor,
+    traj: torch.Tensor,
+    q0: torch.Tensor,
+    strike: StrikeContext,
+    lengths: torch.Tensor,
+    weights: dict,
+    cost: FusedCost,
+    cfg: Phase2Config,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply the analytic positive trajectory metric to one or more VJPs.
+
+    ``grads`` is [batch, waypoint, joint, rhs].  Its first RHS is the full
+    actor-trajectory gradient; a second RHS can be the torque contribution
+    measured by the torque-gradient budget.  Each RHS is independently
+    norm-matched per row, so this changes directions rather than silently
+    multiplying the actor learning rate by a spline-Hessian scale.
+    """
+    B, H, D, K = grads.shape
+    device = grads.device
+    with torch.no_grad():
+        group = torch.as_tensor(cost.spline._group_np, device=device)
+        per_len = lengths.clamp(1, H).index_select(1, group)
+        valid = (
+            torch.arange(H, device=device).view(1, H, 1)
+            < per_len.unsqueeze(1)
+        ).to(grads.dtype)
+        n_valid = per_len.sum(dim=1).clamp_min(1).to(grads.dtype)
+        if cost.cfg.reduction != "mean":
+            n_valid = torch.ones_like(n_valid)
+        stiffness = _spline_smoothness_hessians(cost).index_select(
+            0, per_len.reshape(-1)
+        ).reshape(B, D, H, H)
+        smooth_weight = torch.as_tensor(
+            weights.get("smooth", 1.0), device=device, dtype=grads.dtype,
+        ).reshape(-1, 1, 1, 1)
+        stiffness = stiffness * smooth_weight / n_valid.view(B, 1, 1, 1)
+        eye_h = torch.eye(H, device=device, dtype=grads.dtype)
+        chol = torch.linalg.cholesky(
+            (stiffness + float(cfg.curvature_damping) * eye_h)
+            .reshape(B * D, H, H)
+        )
+
+        jac = grads.new_zeros(B, 12, D, H)
+        root_w = grads.new_zeros(B, 12)
+        for hi, hand in enumerate(HANDS):
+            hit = strike.hit_index[:, hi].clamp(1, H)
+            active = (strike.active[:, hi] > 0.5).to(grads.dtype)
+            at_hit = traj.gather(
+                1, (hit - 1).view(B, 1, 1).expand(B, 1, D),
+            ).squeeze(1)
+            prev_all = torch.cat([q0.float().unsqueeze(1), traj[:, :-1]], dim=1)
+            at_prev = prev_all.gather(
+                1, (hit - 1).view(B, 1, 1).expand(B, 1, D),
+            ).squeeze(1)
+            local = _dls_contact_local(cost, strike, hi)
+            _pos_hit, j_hit = _dls_contact_position_jacobian(
+                cost.fk, at_hit, hand, local,
+            )
+            _pos_prev, j_prev = _dls_contact_position_jacobian(
+                cost.fk, at_prev, hand, local,
+            )
+            j_hit = j_hit * active.view(B, 1, 1)
+            j_prev = j_prev * (active * (hit > 1).to(grads.dtype)).view(B, 1, 1)
+            hidx = (hit - 1).view(B, 1, 1, 1).expand(B, 3, D, 1)
+            pidx = (hit - 2).clamp_min(0).view(B, 1, 1, 1).expand(B, 3, D, 1)
+            jpos = jac[:, hi * 6:hi * 6 + 3]
+            jvel = jac[:, hi * 6 + 3:hi * 6 + 6]
+            jpos.scatter_add_(3, hidx, j_hit.unsqueeze(-1))
+            jvel.scatter_add_(3, hidx, (j_hit / cost.dt).unsqueeze(-1))
+            jvel.scatter_add_(3, pidx, (-j_prev / cost.dt).unsqueeze(-1))
+            root_w[:, hi * 6:hi * 6 + 3] = (
+                float(cfg.curvature_position_weight) ** 0.5 * active.unsqueeze(1)
+            )
+            root_w[:, hi * 6 + 3:hi * 6 + 6] = (
+                float(cfg.curvature_velocity_weight) ** 0.5 * active.unsqueeze(1)
+            )
+
+        rhs = torch.cat([
+            grads.permute(0, 2, 1, 3),
+            jac.permute(0, 2, 3, 1),
+        ], dim=-1).reshape(B * D, H, K + 12)
+        solved = torch.cholesky_solve(rhs, chol).reshape(B, D, H, K + 12)
+        u0, u_j = solved[..., :K], solved[..., K:]
+        ju0 = torch.einsum("brdh,bdhk->brk", jac, u0)
+        juj = torch.einsum("brdh,bdhs->brs", jac, u_j)
+        small = (
+            torch.eye(12, device=device, dtype=grads.dtype).unsqueeze(0)
+            + root_w.unsqueeze(2) * juj * root_w.unsqueeze(1)
+        )
+        correction = torch.linalg.solve(
+            small, root_w.unsqueeze(-1) * ju0,
+        ) * root_w.unsqueeze(-1)
+        result = (
+            u0 - torch.einsum("bdhs,bsk->bdhk", u_j, correction)
+        ).permute(0, 2, 1, 3) * valid.unsqueeze(-1)
+
+        original = grads * valid.unsqueeze(-1)
+        original_norm = torch.linalg.vector_norm(original.reshape(B, -1, K), dim=1)
+        result_norm = torch.linalg.vector_norm(result.reshape(B, -1, K), dim=1)
+        usable = (
+            torch.isfinite(result).all(dim=(1, 2))
+            & torch.isfinite(result_norm) & (result_norm > 1e-20)
+            & torch.isfinite(original_norm)
+        )
+        ratio = original_norm / result_norm.clamp_min(1e-20)
+        matched = result * ratio.view(B, 1, 1, K)
+        mixed = (
+            (1.0 - float(cfg.curvature_direct_mix)) * original
+            + float(cfg.curvature_direct_mix) * matched
+        )
+        output = torch.where(usable.view(B, 1, 1, K), mixed, original)
+        dot = (original[..., 0] * output[..., 0]).sum(dim=(1, 2))
+        cosine = dot / (
+            original_norm[:, 0]
+            * torch.linalg.vector_norm(output[..., 0].reshape(B, -1), dim=1)
+        ).clamp_min(1e-20)
+        stats = {
+            "curvature_direct_rows": grads.new_tensor(float(B)),
+            "curvature_direct_cosine": cosine.mean(),
+            "curvature_direct_fallback_frac": (~usable[:, 0]).float().mean(),
+            "curvature_direct_grad_norm": original_norm[:, 0].mean(),
+        }
+    return output, stats
+
+
+def curvature_direct_vjp_correction(
+    total: torch.Tensor,
+    traj: torch.Tensor,
+    q0: torch.Tensor,
+    strike: StrikeContext,
+    lengths: torch.Tensor,
+    weights: dict,
+    cost: FusedCost,
+    cfg: Phase2Config,
+    *,
+    torque_term_mean: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Return the VJP adjustment that replaces, rather than adds to, g_x.
+
+    The scalar forward loss is unchanged.  First take its exact VJP into the
+    actor trajectory, then calculate ``P^-1 g_x - g_x``.  A later backward of
+    ``traj`` with that delta replaces the ordinary trajectory VJP.  When the
+    torque budget refreshes, return an equal-value proxy whose gradient is
+    the separately preconditioned torque VJP, so the cap measures the actual
+    direction being sent into the model.
+    """
+    if not 0.0 < float(cfg.curvature_direct_frac) <= 1.0:
+        raise ValueError("curvature_direct_frac must be positive")
+    B = int(traj.shape[0])
+    rows = _dls_rows(B, cfg.curvature_direct_frac, traj.device)
+    full_grad = torch.autograd.grad(total, traj, retain_graph=True)[0].detach()
+    grad_list = [full_grad.index_select(0, rows).float()]
+    if torque_term_mean is not None and cfg.w_cost > 0.0:
+        torque_grad = torch.autograd.grad(
+            float(cfg.w_cost) * torque_term_mean, traj, retain_graph=True,
+        )[0].detach()
+        grad_list.append(torque_grad.index_select(0, rows).float())
+    preconditioned, stats = curvature_precondition_vjps(
+        torch.stack(grad_list, dim=-1),
+        traj.detach().index_select(0, rows).float(),
+        q0.detach().index_select(0, rows).float(),
+        _strike_rows(strike, rows), lengths.index_select(0, rows),
+        _index_batch_weights(weights, rows, B), cost, cfg,
+    )
+    delta = torch.zeros_like(traj)
+    delta.index_copy_(
+        0, rows,
+        (preconditioned[..., 0] - grad_list[0]).to(traj.dtype),
+    )
+    torque_proxy = torque_term_mean
+    if len(grad_list) == 2:
+        torque_delta = torch.zeros_like(traj)
+        torque_delta.index_copy_(
+            0, rows,
+            (preconditioned[..., 1] - grad_list[1]).to(traj.dtype),
+        )
+        torque_proxy = torque_term_mean + (
+            (traj - traj.detach()) * torque_delta
+        ).sum() / float(cfg.w_cost)
+    return delta.detach(), torque_proxy, stats
+
+
+def dls_terminal_lookahead_loss(
+    traj: torch.Tensor,
+    q0: torch.Tensor,
+    v0: torch.Tensor,
+    strike: StrikeContext,
+    lengths: torch.Tensor,
+    weights: dict,
+    cost: FusedCost,
+    cfg: Phase2Config,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Full-cost DLS lookahead plus a detached-teacher imitation tie."""
+    B = int(traj.shape[0])
+    rows = _dls_rows(
+        B, cfg.dls_terminal_frac, traj.device,
+        eligible=(strike.active > 0.5).any(dim=1),
+    )
+    if rows.numel() == 0:
+        zero = traj.sum() * 0.0
+        stats = {
+            "dls_terminal_rows": zero.detach(),
+            "dls_terminal_active_hands": zero.detach(),
+            "dls_terminal_err_before_m": zero.detach(),
+            "dls_terminal_err_after_m": zero.detach(),
+            "dls_terminal_delta_abs_rad": zero.detach(),
+            "dls_terminal_cost": zero.detach(),
+            "dls_terminal_tie": zero.detach(),
+        }
+        return zero, zero, zero, stats
+    traj_rows = traj.index_select(0, rows)
+    strike_rows = _strike_rows(strike, rows)
+    if cfg.terminal_lookahead_mode == "curvature":
+        teacher, tie_mask, stats = curvature_terminal_teacher(
+            traj_rows, q0.index_select(0, rows), v0.index_select(0, rows),
+            strike_rows, lengths.index_select(0, rows),
+            _index_batch_weights(weights, rows, B), cost, cfg,
+        )
+    else:
+        teacher, tie_mask, stats = dls_terminal_teacher(
+            traj_rows, strike_rows, cost,
+            steps=cfg.dls_terminal_steps,
+            window=cfg.dls_terminal_window,
+            damping=cfg.dls_terminal_damping,
+            max_step_rad=cfg.dls_terminal_max_step_rad,
+        )
+    # Numerically this is the DLS-corrected trajectory; analytically it has an
+    # identity Jacobian w.r.t. the actor trajectory (straight-through).
+    corrected = traj_rows + (teacher - traj_rows.detach())
+    ct = cost.forward(
+        q0.index_select(0, rows), corrected,
+        v0.index_select(0, rows), strike_rows,
+        lengths=lengths.index_select(0, rows),
+        weights=_index_batch_weights(weights, rows, B),
+    )
+    tie = _masked_huber(traj_rows, teacher, tie_mask, 0.02)[0]
+    torque = ct.terms["torque"].mean()
+    stats["dls_terminal_cost"] = ct.total.mean().detach()
+    stats["dls_terminal_tie"] = tie.detach()
+    return ct.total.mean(), tie, torque, stats
+
+
 def _copy_verified_timing_rows(
     batch: dict,
     proposal: dict,
@@ -7748,11 +8503,12 @@ def _timing_assist_batch(
     selection: str = "collar",
     metric_prefix: str = "timing_assist",
 ) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, dict[str, float]]:
-    """Propose ray-frontier timing pairs and commit only exact passes.
+    """Select and directly admit critic-proposed timing pairs.
 
-    Rejected rows remain byte-for-byte on their original timing path.  Their
-    exact diagnostics still supervise the critic, which turns false positives
-    into useful data without exposing the actor optimizer to them.
+    There is deliberately no separate actor/physics admission pass.  The
+    selected rows enter the ordinary actor batch, whose single normal cost
+    evaluation supplies both their actor gradient and their exact critic
+    labels.  Dedicated horizon-anchor rows remain in the batch independently.
     """
     tc = cfg.timing_critic
     b = int(batch["q0"].shape[0])
@@ -7813,7 +8569,13 @@ def _timing_assist_batch(
         # directional sample of the two-hand Pareto frontier.
         selected = last_pass
     anchor_ok = predicted_ok[:, 0]
-    selected = torch.where(anchor_ok, selected, torch.zeros_like(selected))
+    # An uncertain anchor must not suppress exploration: dedicated anchor rows
+    # already preserve the known long-horizon task.  Advance one ray cell when
+    # no connected predicted-manageable component exists, then let the normal
+    # actor pass provide the exact label for that informative point.
+    explore = torch.full_like(selected, min(1, k - 1))
+    selected = torch.where(anchor_ok, selected, explore)
+    selected = selected.clamp_min(min(1, k - 1))
     selected_pred_ok = predicted_ok.gather(1, selected.unsqueeze(1))[:, 0]
     if selection == "interior":
         boundary_pair = pairs[
@@ -7832,94 +8594,140 @@ def _timing_assist_batch(
         interior_pair = torch.where(
             active.bool(), interior_pair, torch.full_like(interior_pair, -1),
         )
-        interior_pair = torch.where(
-            anchor_ok.unsqueeze(1), interior_pair, pairs[:, 0],
-        )
+        proposal_pair = interior_pair
         proposal = _index_batch(batch, rows)
         retime_batch_timing(proposal, interior_pair, pool)
-        proposal_enc = _index_encoded(encoding, rows)
-        proposal_features = build_critic_features(
-            q0=proposal["q0"], qd0=proposal["v0"],
-            goal_pos=proposal["context"].goal_pos,
-            goal_tth=proposal["context"].goal_tth,
-        )
     else:
         flat = torch.arange(n, device=selected.device) * k + selected
+        proposal_pair = pairs[
+            torch.arange(n, device=selected.device), selected,
+        ]
         proposal = _index_batch(candidate, flat)
-        proposal_enc = _index_encoded(
-            _index_encoded(encoding, repeated_rows), flat,
-        )
-        proposal_features = features.index_select(0, flat)
 
-    # Match ordinary fresh-row preprocessing before the exact actor/physics
-    # check.  Rejected proposals never reach the actor optimizer.
-    fresh_active = (
-        proposal["active"] & ~proposal["mpc_init"].unsqueeze(-1)
-    )
-    proposal["init"] = correct_quintic_init_arms(
-        cost.fk, proposal["init"], proposal["q0"], proposal["hit"],
-        proposal["context"].goal_pos,
-        active=fresh_active, steps=1,
-        q_bounds=(pool.q_lo, pool.q_hi),
-        joint_names=cost.joint_names, qd0=proposal["v0"],
-        dt=float(pool.cfg.dt),
-    )
-
-    hit_eff = effective_hits(
-        proposal["hit"], proposal["active"], int(batch["bucket"]),
-    )
-    proposal_strike = _index_batch({"strike": strike}, rows)["strike"]
-    proposal_strike = replace(proposal_strike, hit_index=hit_eff)
-    proposal_weights = _index_batch_weights(weights, rows, b)
-    decoded = model(
-        proposal["init"], proposal["state"], proposal_enc, proposal["masks"],
-    )
-    ct = cost.forward(
-        proposal["q0"], decoded.traj, proposal["v0"], proposal_strike,
-        lengths=group_lengths(hit_eff), weights=proposal_weights,
-    )
-    proposal_gate = _gate_from_ct(ct)
-    residual = residuals_from_gate(proposal_gate, tc)
-    normalized_residual = robust_transform(residual, tc.scales)
-    exact_limit = (
-        float(tc.acceptable_normalized_violation)
-        if tc.representation == "distributional" else 0.0
-    )
-    exact_ok = (
-        torch.isfinite(normalized_residual).all(dim=1)
-        & (normalized_residual <= exact_limit).all(dim=1)
-    )
-    src_ok = exact_ok.nonzero(as_tuple=True)[0]
-    if int(src_ok.numel()):
-        _copy_verified_timing_rows(
-            batch, proposal, rows.index_select(0, src_ok), src_ok,
-        )
+    # Geometric seed correction is deliberately deferred until every timing
+    # row has been finalized, then applied once to the complete actor batch.
+    src = torch.arange(n, device=rows.device)
+    _copy_verified_timing_rows(batch, proposal, rows, src)
 
     detail_prefix = (
         "timing" if metric_prefix == "timing_assist" else metric_prefix
     )
-    # Accepted proposals are evaluated again as primary actor rows and receive
-    # their critic label there.  Keep only rejected proposal observations here
-    # so every unique collocation has equal weight rather than double-counting
-    # accepted boundary/interior points.
-    rejected = (~exact_ok).nonzero(as_tuple=True)[0]
-    return (
-        proposal_features.index_select(0, rejected).detach(),
-        proposal_gate.index_select(0, rejected).detach(),
-    ), {
+    advanced = (
+        (proposal_pair < pairs[:, 0]) & active.bool()
+    ).any(dim=1)
+    # Carry selection metadata through the shuffled primary batch.  The normal
+    # actor pass joins it with exact feasibility below, without provenance in
+    # the critic's bounded replay representation.
+    if "timing_selected_pred_manageable" not in batch:
+        batch["timing_selected_pred_manageable"] = torch.zeros(
+            b, device=rows.device, dtype=torch.bool,
+        )
+        batch["timing_advanced"] = torch.zeros(
+            b, device=rows.device, dtype=torch.bool,
+        )
+    batch["timing_selected_pred_manageable"].index_copy_(
+        0, rows, selected_pred_ok,
+    )
+    batch["timing_advanced"].index_copy_(0, rows, advanced)
+    active_tth = (
+        proposal_pair[active.bool()].float() * float(pool.cfg.dt)
+    )
+
+    def _mean_or_zero(values: torch.Tensor) -> float:
+        return float(values.mean()) if int(values.numel()) else 0.0
+
+    def _median_or_zero(values: torch.Tensor) -> float:
+        return float(values.median()) if int(values.numel()) else 0.0
+
+    return None, {
         f"{metric_prefix}_proposed": float(n),
-        f"{metric_prefix}_accepted": float(exact_ok.sum()),
-        f"{metric_prefix}_rejected": float((~exact_ok).sum()),
         f"{detail_prefix}_selected_pred_manageable": float(selected_pred_ok.sum()),
-        f"{detail_prefix}_selected_true_manageable": float(exact_ok.sum()),
-        f"{detail_prefix}_selected_false_manageable": float(
-            (selected_pred_ok & ~exact_ok).sum()
-        ),
-        f"{detail_prefix}_selected_missed_manageable": float(
-            (~selected_pred_ok & exact_ok).sum()
-        ),
+        f"{detail_prefix}_advanced": float(advanced.sum()),
+        f"{detail_prefix}_selected_tth_mean_s": _mean_or_zero(active_tth),
+        f"{detail_prefix}_selected_tth_p50_s": _median_or_zero(active_tth),
         f"{detail_prefix}_anchor_pred_fail": float((~anchor_ok).sum()),
         f"{detail_prefix}_ray_all_pred_pass": float((first_fail == k).sum()),
+    }
+
+
+@torch.no_grad()
+def _timing_interiors_from_group_frontier(
+    *,
+    batch: dict,
+    boundary_rows: torch.Tensor,
+    interior_rows: torch.Tensor,
+    pool: Phase2Pool,
+    generator: torch.Generator,
+    metric_prefix: str = "timing_interior",
+) -> dict[str, float]:
+    """Derive all interior rows from the already-selected group frontier.
+
+    Expanded timing rows belonging to one physical task carry the same group
+    id.  One critic ray search therefore determines that task's frontier; its
+    four component-wise-looser samples need no additional critic evaluation.
+    """
+    n = int(interior_rows.numel())
+    if n == 0:
+        return {f"{metric_prefix}_proposed": 0.0}
+    groups = batch.get("timing_primary_group")
+    if not torch.is_tensor(groups):
+        raise ValueError("grouped timing interiors require timing_primary_group")
+    boundary_group = groups.index_select(0, boundary_rows)
+    interior_group = groups.index_select(0, interior_rows)
+    if bool((boundary_group < 0).any()) or bool((interior_group < 0).any()):
+        raise ValueError("grouped timing rows must have nonnegative group ids")
+    if int(boundary_group.unique().numel()) != int(boundary_group.numel()):
+        raise ValueError("grouped timing reuse requires one boundary per task")
+    lookup = torch.full(
+        (int(groups.max()) + 1,), -1,
+        device=groups.device, dtype=torch.long,
+    )
+    lookup.index_copy_(0, boundary_group, boundary_rows)
+    source_rows = lookup.index_select(0, interior_group)
+    if bool((source_rows < 0).any()):
+        raise ValueError("an interior timing row has no group boundary")
+
+    active = batch["active"].index_select(0, interior_rows)
+    boundary_pair = batch["hit"].index_select(0, source_rows)
+    horizon = int(batch["bucket"])
+    width = (horizon - boundary_pair).clamp_min(0)
+    u = torch.rand(
+        boundary_pair.shape,
+        generator=generator,
+        device="cpu",
+        dtype=torch.float32,
+    ).to(boundary_pair.device)
+    interior_pair = boundary_pair + torch.floor(
+        u * (width + 1).to(u.dtype)
+    ).long()
+    interior_pair = torch.where(
+        active.bool(), interior_pair, torch.full_like(interior_pair, -1),
+    )
+    proposal = _index_batch(batch, interior_rows)
+    retime_batch_timing(proposal, interior_pair, pool)
+    src = torch.arange(n, device=interior_rows.device)
+    _copy_verified_timing_rows(batch, proposal, interior_rows, src)
+
+    pred = batch["timing_selected_pred_manageable"].index_select(
+        0, source_rows,
+    )
+    advanced = (
+        (interior_pair < horizon) & active.bool()
+    ).any(dim=1)
+    batch["timing_selected_pred_manageable"].index_copy_(
+        0, interior_rows, pred,
+    )
+    batch["timing_advanced"].index_copy_(0, interior_rows, advanced)
+    active_tth = interior_pair[active.bool()].float() * float(pool.cfg.dt)
+    mean_tth = float(active_tth.mean()) if int(active_tth.numel()) else 0.0
+    median_tth = float(active_tth.median()) if int(active_tth.numel()) else 0.0
+    return {
+        f"{metric_prefix}_proposed": float(n),
+        f"{metric_prefix}_selected_pred_manageable": float(pred.sum()),
+        f"{metric_prefix}_advanced": float(advanced.sum()),
+        f"{metric_prefix}_selected_tth_mean_s": mean_tth,
+        f"{metric_prefix}_selected_tth_p50_s": median_tth,
+        f"{metric_prefix}_reused_frontier": float(n),
     }
 
 
@@ -8589,43 +9397,52 @@ def _sample_fresh_batch(
 def _timing_primary_layout(
     batch_size: int,
     cfg: ViolationCriticConfig,
-) -> tuple[int, int, int, int]:
-    """Return ``(base tasks, boundary rows, interior rows, MPC rows)``.
+) -> tuple[int, int, int, int, int]:
+    """Return ``(base tasks, anchor, boundary, interior, MPC rows)``.
 
     The default is exactly 40 independent task states at batch 512, expanded
-    to two frontier and four interior timings apiece.  Smaller CPU batches
-    scale the number of base tasks proportionally while preserving the six
-    timing samples per task.
+    to one permanent horizon anchor, one frontier and four interior timings
+    apiece.  Smaller CPU batches scale the number of base tasks proportionally
+    while preserving the six timing samples per task.
     """
     b = int(batch_size)
-    per_task = int(cfg.primary_boundary_per_task) + int(
-        cfg.primary_interior_per_task
+    per_task = (
+        int(cfg.primary_anchor_per_task)
+        + int(cfg.primary_boundary_per_task)
+        + int(cfg.primary_interior_per_task)
     )
     base = max(1, int(round(
         b * int(cfg.primary_base_tasks_per_512) / 512.0
     )))
     base = min(base, b // per_task)
+    anchor = base * int(cfg.primary_anchor_per_task)
     boundary = base * int(cfg.primary_boundary_per_task)
     interior = base * int(cfg.primary_interior_per_task)
-    return base, boundary, interior, b - boundary - interior
+    return base, anchor, boundary, interior, b - anchor - boundary - interior
 
 
 def _expand_timing_base_tasks(
     batch: dict,
     *,
+    anchor_per_task: int,
     boundary_per_task: int,
     interior_per_task: int,
 ) -> dict:
-    """Repeat each physical task over boundary/interior timing strata."""
+    """Repeat each task over anchor/boundary/interior timing strata."""
     n = int(batch["q0"].shape[0])
     kinds = torch.tensor(
-        [2] * int(boundary_per_task) + [3] * int(interior_per_task),
+        [0] * int(anchor_per_task)
+        + [2] * int(boundary_per_task)
+        + [3] * int(interior_per_task),
         device=batch["q0"].device, dtype=torch.long,
     )
     per_task = int(kinds.numel())
     rows = torch.arange(n, device=batch["q0"].device).repeat_interleave(per_task)
     out = _index_batch(batch, rows)
     out["timing_primary_kind"] = kinds.repeat(n)
+    out["timing_primary_group"] = torch.arange(
+        n, device=batch["q0"].device, dtype=torch.long,
+    ).repeat_interleave(per_task)
     return out
 
 
@@ -8656,6 +9473,7 @@ def _ls_probe_scalar_F(
     dtype,
     amp,
     rec,
+    torque_grad_scale: float = 1.0,
     return_tensor: bool = False,
 ) -> float | torch.Tensor:
     """Re-encode + rewrite + complete ``loss+extra`` for one LS probe (no side effects).
@@ -8713,7 +9531,10 @@ def _ls_probe_scalar_F(
         step_out = step_fns[bucket](
             batch["init"], batch["state"], batch["q0"], batch["v0"],
             enc, batch["masks"], strike, lengths, w,
-            torch.zeros((), device=device),
+            torch.as_tensor(
+                float(torque_grad_scale) - 1.0,
+                device=device, dtype=torch.float32,
+            ),
         )
         # LS forces grad_balance=""; step returns 4-tuple.
         loss, _metrics, _traj, gate = step_out[:4]
@@ -8794,6 +9615,26 @@ def _ls_probe_scalar_F(
             + sfx_ramp * (cfg.w_suffix_cost * loss_sfx_cost
                           + cfg.w_suffix_tie * loss_sfx_tie)
         )
+        if (
+            cfg.dls_terminal_frac > 0.0
+            and (cfg.w_dls_terminal_cost > 0.0 or cfg.w_dls_terminal_tie > 0.0)
+        ):
+            dls_cost, dls_tie, dls_torque, _ = dls_terminal_lookahead_loss(
+                _traj, batch["q0"], batch["v0"], strike, lengths, w,
+                costs[bucket], cfg,
+            )
+            extra = extra + (
+                cfg.w_dls_terminal_cost * dls_cost
+                + cfg.w_dls_terminal_tie * dls_tie
+            )
+            # Cached torque-budget steps scale the DLS branch by the same
+            # factor as the main cost.  Refresh steps use scale=1 and measure
+            # the combined torque gradient in ``train_phase2``.
+            if cfg.torque_grad_cap > 0.0:
+                extra = extra + (
+                    (float(torque_grad_scale) - 1.0)
+                    * cfg.w_dls_terminal_cost * dls_torque
+                )
         if cfg.w_waist_sp_tether > 0.0 and enc.waist_yaw_res is not None:
             res = enc.waist_yaw_res.float()
             extra = extra + cfg.w_waist_sp_tether * res.pow(2).mean()
@@ -8923,6 +9764,52 @@ def _invocation_throughput(
     }
 
 
+class _CudaPhaseTimer:
+    """Low-cadence CUDA-event timing for one outer update.
+
+    Events are resolved with one synchronization at :meth:`finish`, so normal
+    steps incur no timing synchronization and sampled steps incur exactly one.
+    """
+
+    def __init__(self, *, enabled: bool, device: torch.device):
+        self.enabled = bool(enabled and device.type == "cuda")
+        self.wall_start = time.perf_counter()
+        self._last_name = "setup"
+        self._events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+        self._last_event = None
+        if self.enabled:
+            self._last_event = torch.cuda.Event(enable_timing=True)
+            self._last_event.record()
+
+    def mark(self, next_name: str) -> None:
+        if not self.enabled:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        assert self._last_event is not None
+        self._events.append((self._last_name, self._last_event, event))
+        self._last_name = str(next_name)
+        self._last_event = event
+
+    def finish(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        self.mark("done")
+        assert self._last_event is not None
+        self._last_event.synchronize()
+        out: dict[str, float] = {}
+        cuda_total = 0.0
+        for name, start, end in self._events:
+            elapsed = float(start.elapsed_time(end))
+            out[f"phase_{name}_cuda_ms"] = elapsed
+            cuda_total += elapsed
+        wall = 1_000.0 * (time.perf_counter() - self.wall_start)
+        out["phase_total_cuda_ms"] = cuda_total
+        out["phase_total_wall_ms"] = wall
+        out["phase_host_gap_ms"] = max(wall - cuda_total, 0.0)
+        return out
+
+
 def train_phase2(
     *,
     model,
@@ -8962,6 +9849,11 @@ def train_phase2(
     """
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.curvature_direct_frac > 0.0:
+        if cfg.dls_terminal_frac > 0.0:
+            raise ValueError("direct curvature requires dls_terminal_frac=0")
+        if cfg.grad_balance:
+            raise ValueError("direct curvature requires grad_balance='' ")
     device = torch.device(cfg.device)
     if device.type == "cuda":
         torch.cuda.set_device(device.index or 0)
@@ -9092,6 +9984,15 @@ def train_phase2(
                   f"pen_{tw}={al.pen[tw]:.4g} "
                   f"(pen {'from ckpt' if had_pen else 'from config'})",
                   flush=True)
+
+    if cfg.compile_mode is not None and float(cfg.torque_grad_cap) > 0.0:
+        # Torque-budget refreshes take a second VJP from the same forward graph.
+        # AOTAutograd otherwise donates (and invalidates) saved buffers after
+        # the first backward, which is incompatible with retain_graph=True.
+        # This only changes buffer lifetime; compiled forward/backward math and
+        # parameter ownership remain unchanged for SaLSa candidate writes.
+        import torch._functorch.config as _functorch_config
+        _functorch_config.donated_buffer = False
 
     encode_step = make_encode_step(
         model,
@@ -9513,6 +10414,10 @@ def train_phase2(
     last_step = int(start_step)
     gb_norm_ema_by_bucket: dict[int, dict[str, torch.Tensor]] = {}
     gb_visits_by_bucket: dict[int, int] = {}
+    torque_grad_cached_scale = 1.0
+    torque_grad_cache_initialized = False
+    torque_grad_visits = 0
+    phase_timing_latest: dict[str, float] = {}
     t0 = time.perf_counter()
     t_last = t0
     stopped = "max_steps"
@@ -9583,17 +10488,28 @@ def train_phase2(
             stopped = "max_hours"
             emit({"event": "stop", "reason": "max_hours", "step": step})
             break
+        phase_timer = _CudaPhaseTimer(
+            enabled=(
+                int(cfg.phase_timing_every) > 0
+                and (step + 1) % int(cfg.phase_timing_every) == 0
+            ),
+            device=device,
+        )
         updates_attempted += 1
         last_step = step + 1
         update_executed = False
         # Selector owns LR under line search (plan §7): no cosine write.
         if ls_rt is not None:
             known_search, search_reasons, ls_j = resolve_known_search(ls_rt)
+            ls_direction_due = needs_line_search_direction(
+                ls_rt, known_search=known_search, j=ls_j,
+            )
             eps_reuse = float(ls_rt.ctrl.last_selected_epsilon or ls_rt.eta_ref)
             ls_rt.adapter.set_group_lrs(eps_reuse)
             lr = eps_reuse
         else:
             known_search, search_reasons, ls_j = False, [], 0
+            ls_direction_due = False
             lr = cfg.lr_at(step)
             for g in opt.param_groups:
                 g["lr"] = lr
@@ -9692,9 +10608,9 @@ def train_phase2(
             and cfg.timing_critic.representation == "distributional"
             and cfg.timing_critic.anchor_curriculum
         ):
-            # Anchor-first training owns the horizon: ordinary rows begin at
-            # the longest available time and exact-verified critic proposals
-            # are the only path toward shorter timings.
+            # Anchor-first training owns the horizon: permanent anchor rows
+            # stay at the longest time while critic-selected rows are the path
+            # toward shorter timings and receive labels in the normal pass.
             bi = len(pool.buckets) - 1
         else:
             bi = int(rng.choice(len(pool.buckets), p=bucket_p))
@@ -9726,14 +10642,14 @@ def train_phase2(
                 yaw_i=yaw_i, step=step,
             )
         if batch is None and timing_mpc_ring is not None:
-            base_n, boundary_n, interior_n, mpc_n = _timing_primary_layout(
-                bs, cfg.timing_critic,
-            )
+            (
+                base_n, anchor_n, boundary_n, interior_n, mpc_n,
+            ) = _timing_primary_layout(bs, cfg.timing_critic)
             live_n = sum(post_hit.size(b) for b in post_hit.data)
             kind_fracs = cfg.effective_kind_fracs(
                 pool, extra_counts={KIND_POST_HIT: live_n},
             )
-            timing_n = boundary_n + interior_n
+            timing_n = anchor_n + boundary_n + interior_n
             if bool(timing_critic.curriculum_open):
                 base_batch = _sample_fresh_batch(
                     pool, bucket, base_n, generator=gen,
@@ -9743,6 +10659,9 @@ def train_phase2(
                 )
                 timing_part = _expand_timing_base_tasks(
                     base_batch,
+                    anchor_per_task=(
+                        cfg.timing_critic.primary_anchor_per_task
+                    ),
                     boundary_per_task=(
                         cfg.timing_critic.primary_boundary_per_task
                     ),
@@ -9762,6 +10681,9 @@ def train_phase2(
                 timing_part["timing_primary_kind"] = torch.zeros(
                     timing_n, device=device, dtype=torch.long,
                 )
+                timing_part["timing_primary_group"] = torch.full(
+                    (timing_n,), -1, device=device, dtype=torch.long,
+                )
 
             parts = [timing_part]
             if mpc_n > 0 and timing_mpc_ring.size(bucket) > 0:
@@ -9776,6 +10698,9 @@ def train_phase2(
                 )
                 mpc_part["timing_primary_kind"] = torch.ones(
                     mpc_n, device=device, dtype=torch.long,
+                )
+                mpc_part["timing_primary_group"] = torch.full(
+                    (mpc_n,), -1, device=device, dtype=torch.long,
                 )
                 parts.append(mpc_part)
                 use_replay = True
@@ -9794,6 +10719,9 @@ def train_phase2(
                 fallback["timing_primary_kind"] = torch.zeros(
                     mpc_n, device=device, dtype=torch.long,
                 )
+                fallback["timing_primary_group"] = torch.full(
+                    (mpc_n,), -1, device=device, dtype=torch.long,
+                )
                 parts.append(fallback)
                 roll_acc["timing_primary_mpc_fallback"] = (
                     roll_acc.get("timing_primary_mpc_fallback", 0.0)
@@ -9805,6 +10733,18 @@ def train_phase2(
             roll_acc["timing_primary_base_tasks"] = (
                 roll_acc.get("timing_primary_base_tasks", 0.0)
                 + float(base_n if timing_critic.curriculum_open else timing_n)
+            )
+            roll_acc["timing_primary_anchor"] = (
+                roll_acc.get("timing_primary_anchor", 0.0)
+                + float(anchor_n if timing_critic.curriculum_open else timing_n)
+            )
+            roll_acc["timing_primary_boundary"] = (
+                roll_acc.get("timing_primary_boundary", 0.0)
+                + float(boundary_n if timing_critic.curriculum_open else 0)
+            )
+            roll_acc["timing_primary_interior"] = (
+                roll_acc.get("timing_primary_interior", 0.0)
+                + float(interior_n if timing_critic.curriculum_open else 0)
             )
         if batch is None:
             use_replay = (
@@ -9947,7 +10887,11 @@ def train_phase2(
                 w, batch["al_ok"], probe_penalty=float(cfg.voxel_probe_penalty),
             )
 
-        if ls_rt is not None and replay_mgr is not None:
+        if (
+            ls_rt is not None
+            and replay_mgr is not None
+            and ls_direction_due
+        ):
             # Pre-rewrite snapshot of init / yaw_now / strike (plan §14).
             ls_rec = replay_mgr.begin_record(
                 primary_batch=batch,
@@ -9977,6 +10921,7 @@ def train_phase2(
                 ls_rec.samples.yaw_now_jitter = noise.detach()
             batch["context"].yaw_now = yn + noise
 
+        phase_timer.mark("actor_forward")
         ctxm = (torch.autocast(device_type="cuda", dtype=amp) if amp is not None
                 else torch.autocast(device_type="cuda", enabled=False))
         with ctxm:
@@ -10008,19 +10953,6 @@ def train_phase2(
                     dt=float(getattr(pool.cfg, "dt", 0.02)),
                     ease_wp=getattr(pool.cfg, "waist_upright_ease_wp", None),
                 )
-            # Always 1-shot on FRESH pool quintics when FK+aim are available --
-            # kit jitter exists even at upright, and a leaned SP plants an
-            # upright IK arm on a leaned torso.  Replay inits are shifted
-            # decoder plans, not quintics.
-            fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
-            batch["init"] = correct_quintic_init_arms(
-                costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
-                batch["context"].goal_pos,
-                active=fresh_active, steps=1,
-                q_bounds=(pool.q_lo, pool.q_hi),
-                joint_names=base.joint_names, qd0=batch["v0"],
-                dt=float(getattr(pool.cfg, "dt", 0.02)),
-            )
             if (
                 timing_critic is not None
                 and cfg.timing_critic.mode in {"assist", "control"}
@@ -10032,27 +10964,52 @@ def train_phase2(
                     and cfg.timing_critic.anchor_curriculum
                     and "timing_primary_kind" in batch
                 ):
-                    proposal_specs = (
-                        (2, "boundary", "timing_boundary"),
-                        (3, "interior", "timing_interior"),
+                    boundary_rows = (
+                        batch["timing_primary_kind"] == 2
+                    ).nonzero(as_tuple=True)[0]
+                    interior_rows = (
+                        batch["timing_primary_kind"] == 3
+                    ).nonzero(as_tuple=True)[0]
+                    obs, stats = _timing_assist_batch(
+                        batch=batch, encoding=enc, strike=strike,
+                        model=model, cost=costs[bucket], weights=w,
+                        pool=pool, critic=timing_critic, cfg=cfg,
+                        rows=boundary_rows, selection="boundary",
+                        metric_prefix="timing_boundary",
                     )
-                    for kind, selection, prefix in proposal_specs:
-                        proposal_rows = (
-                            batch["timing_primary_kind"] == int(kind)
-                        ).nonzero(as_tuple=True)[0]
+                    if obs is not None:
+                        critic_extra_observations.append(obs)
+                    for key, value in stats.items():
+                        roll_acc[key] = roll_acc.get(key, 0.0) + float(value)
+                    group = batch.get("timing_primary_group")
+                    grouped = (
+                        torch.is_tensor(group)
+                        and int(boundary_rows.numel()) > 0
+                        and int(interior_rows.numel()) > 0
+                        and int(group.index_select(0, boundary_rows).unique().numel())
+                        == int(boundary_rows.numel())
+                    )
+                    if grouped:
+                        stats = _timing_interiors_from_group_frontier(
+                            batch=batch,
+                            boundary_rows=boundary_rows,
+                            interior_rows=interior_rows,
+                            pool=pool,
+                            generator=timing_critic.generator,
+                        )
+                        obs = None
+                    else:
                         obs, stats = _timing_assist_batch(
                             batch=batch, encoding=enc, strike=strike,
                             model=model, cost=costs[bucket], weights=w,
                             pool=pool, critic=timing_critic, cfg=cfg,
-                            rows=proposal_rows, selection=selection,
-                            metric_prefix=prefix,
+                            rows=interior_rows, selection="interior",
+                            metric_prefix="timing_interior",
                         )
-                        if obs is not None:
-                            critic_extra_observations.append(obs)
-                        for key, value in stats.items():
-                            roll_acc[key] = (
-                                roll_acc.get(key, 0.0) + float(value)
-                            )
+                    if obs is not None:
+                        critic_extra_observations.append(obs)
+                    for key, value in stats.items():
+                        roll_acc[key] = roll_acc.get(key, 0.0) + float(value)
                 else:
                     assist_obs, assist_stats = _timing_assist_batch(
                         batch=batch, encoding=enc, strike=strike, model=model,
@@ -10063,12 +11020,24 @@ def train_phase2(
                         critic_extra_observations.append(assist_obs)
                     for key, value in assist_stats.items():
                         roll_acc[key] = roll_acc.get(key, 0.0) + float(value)
-                # The accepted timing rows changed their decoder masks and
+                # Critic-selected timing rows changed their decoder masks and
                 # segment endpoints.  The context encoding is still valid by
                 # the enc_goal_tth=False contract checked above.
                 hit_eff = effective_hits(batch["hit"], batch["active"], bucket)
                 lengths = group_lengths(hit_eff)
                 strike = replace(strike, hit_index=hit_eff)
+            # Apply one geometric correction after timing selection has fixed
+            # every row. This replaces the former full-batch pass plus separate
+            # boundary/interior corrections.
+            fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
+            batch["init"] = correct_quintic_init_arms(
+                costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
+                batch["context"].goal_pos,
+                active=fresh_active, steps=1,
+                q_bounds=(pool.q_lo, pool.q_hi),
+                joint_names=base.joint_names, qd0=batch["v0"],
+                dt=float(getattr(pool.cfg, "dt", 0.02)),
+            )
             if timing_parent_batch is not None:
                 all_rows = torch.arange(
                     int(batch["q0"].shape[0]), device=device,
@@ -10105,10 +11074,27 @@ def train_phase2(
             loss_aux = None
             ct = None
             torque_term_mean = None
+            torque_refresh_due = bool(
+                cfg.torque_grad_cap > 0.0
+                and not cfg.grad_balance
+                and (
+                    not torque_grad_cache_initialized
+                    or torque_grad_visits
+                    % int(cfg.torque_grad_cap_refresh) == 0
+                )
+            )
+            torque_step_scale = (
+                1.0 if torque_refresh_due else torque_grad_cached_scale
+            )
+            if cfg.torque_grad_cap > 0.0:
+                torque_grad_visits += 1
             step_out = step_fns[bucket](
                 batch["init"], batch["state"], batch["q0"], batch["v0"],
                 enc, batch["masks"], strike, lengths, w,
-                torch.zeros((), device=device),
+                torch.as_tensor(
+                    torque_step_scale - 1.0,
+                    device=device, dtype=torch.float32,
+                ),
             )
             if cfg.grad_balance:
                 loss, metrics, _traj, gate, ct, loss_aux = step_out
@@ -10116,6 +11102,7 @@ def train_phase2(
                 loss, metrics, _traj, gate, torque_term_mean = step_out
             else:
                 loss, metrics, _traj, gate = step_out
+            phase_timer.mark("aux_forward")
             hard_ok = _hard_feasibility_ok_from_gate(gate)
             if timing_critic is not None:
                 critic_observation = (
@@ -10126,6 +11113,98 @@ def train_phase2(
                     ),
                     gate.detach(),
                 )
+                if (
+                    cfg.timing_critic.representation == "distributional"
+                    and "timing_primary_kind" in batch
+                    and "timing_selected_pred_manageable" in batch
+                ):
+                    # The ordinary actor/cost pass is the sole exact evaluator
+                    # for critic-selected collocations.  Join its labels with
+                    # the admission metadata for telemetry; there is no
+                    # pre-admission actor forward.
+                    timing_residual = residuals_from_gate(
+                        gate.detach(), cfg.timing_critic,
+                    )
+                    timing_normalized = robust_transform(
+                        timing_residual, cfg.timing_critic.scales,
+                    )
+                    timing_exact_ok = (
+                        torch.isfinite(timing_normalized).all(dim=1)
+                        & (
+                            timing_normalized
+                            <= float(
+                                cfg.timing_critic.acceptable_normalized_violation
+                            )
+                        ).all(dim=1)
+                    )
+                    timing_pred = batch[
+                        "timing_selected_pred_manageable"
+                    ].bool()
+                    timing_advanced = batch["timing_advanced"].bool()
+                    for timing_kind, timing_prefix in (
+                        (2, "timing_boundary"),
+                        (3, "timing_interior"),
+                    ):
+                        timing_rows = (
+                            batch["timing_primary_kind"] == timing_kind
+                        )
+                        timing_true = timing_exact_ok & timing_rows
+                        timing_selected = timing_pred & timing_rows
+                        timing_tp = timing_selected & timing_exact_ok
+                        timing_accepted_advanced = (
+                            timing_true & timing_advanced
+                        )
+                        timing_n = int(timing_rows.sum())
+                        timing_selected_n = int(timing_selected.sum())
+                        timing_accepted_n = int(timing_true.sum())
+                        for key, value in {
+                            f"{timing_prefix}_accepted": timing_accepted_n,
+                            f"{timing_prefix}_rejected": (
+                                timing_n - timing_accepted_n
+                            ),
+                            f"{timing_prefix}_selected_true_manageable": (
+                                timing_accepted_n
+                            ),
+                            f"{timing_prefix}_selected_false_manageable": int(
+                                (timing_selected & ~timing_exact_ok).sum()
+                            ),
+                            f"{timing_prefix}_selected_missed_manageable": int(
+                                (~timing_pred & timing_true).sum()
+                            ),
+                            f"{timing_prefix}_selected_true_positive": int(
+                                timing_tp.sum()
+                            ),
+                            f"{timing_prefix}_selected_precision": (
+                                int(timing_tp.sum())
+                                / max(timing_selected_n, 1)
+                            ),
+                            f"{timing_prefix}_accepted_advanced": int(
+                                timing_accepted_advanced.sum()
+                            ),
+                        }.items():
+                            roll_acc[key] = (
+                                roll_acc.get(key, 0.0) + float(value)
+                            )
+                        accepted_active = (
+                            timing_accepted_advanced.unsqueeze(1)
+                            & batch["active"].bool()
+                        )
+                        accepted_tth = batch[
+                            "context"
+                        ].goal_tth[accepted_active].float()
+                        if int(accepted_tth.numel()):
+                            roll_acc[
+                                f"{timing_prefix}_accepted_advanced_tth_mean_s"
+                            ] = roll_acc.get(
+                                f"{timing_prefix}_accepted_advanced_tth_mean_s",
+                                0.0,
+                            ) + float(accepted_tth.mean())
+                            roll_acc[
+                                f"{timing_prefix}_accepted_advanced_tth_p50_s"
+                            ] = roll_acc.get(
+                                f"{timing_prefix}_accepted_advanced_tth_p50_s",
+                                0.0,
+                            ) + float(accepted_tth.median())
             if voxel_state is not None and voxel_meta is not None:
                 probe_stats = voxel_state.record_probe_results(
                     voxel_meta, hard_ok, step=step,
@@ -10252,6 +11331,38 @@ def train_phase2(
                 + sfx_ramp * (cfg.w_suffix_cost * loss_sfx_cost
                               + cfg.w_suffix_tie * loss_sfx_tie)
             )
+            dls_stats: dict[str, torch.Tensor] = {}
+            if (
+                cfg.dls_terminal_frac > 0.0
+                and (
+                    cfg.w_dls_terminal_cost > 0.0
+                    or cfg.w_dls_terminal_tie > 0.0
+                )
+            ):
+                dls_cost, dls_tie, dls_torque, dls_stats = (
+                    dls_terminal_lookahead_loss(
+                        _traj, batch["q0"], batch["v0"], strike, lengths,
+                        w, costs[bucket], cfg,
+                    )
+                )
+                extra = extra + (
+                    cfg.w_dls_terminal_cost * dls_cost
+                    + cfg.w_dls_terminal_tie * dls_tie
+                )
+                if cfg.torque_grad_cap > 0.0:
+                    # The cached rotation must apply to every torque gradient,
+                    # including the lookahead.  On refresh steps the combined
+                    # scalar below is handed to the exact budget measurement.
+                    extra = extra + (
+                        (float(torque_step_scale) - 1.0)
+                        * cfg.w_dls_terminal_cost * dls_torque
+                    )
+                    if torque_term_mean is not None and cfg.w_cost > 0.0:
+                        torque_term_mean = torque_term_mean + (
+                            cfg.w_dls_terminal_cost / cfg.w_cost
+                        ) * dls_torque
+                for key, value in dls_stats.items():
+                    roll_acc[key] = roll_acc.get(key, 0.0) + float(value.detach())
             if cfg.w_waist_sp_tether > 0.0 and enc.waist_yaw_res is not None:
                 # res = sp - aim_yaw by construction, so this IS the tether to
                 # the analytic law.  Unramped: exactly zero at init.
@@ -10350,6 +11461,7 @@ def train_phase2(
                     ss_acc[i_] += v_
                 ss_n += 1
         total = loss + extra
+        phase_timer.mark("backward")
         if enc.waist_yaw_res is not None:
             sp_res_acc += float(enc.waist_yaw_res.detach().abs().mean())
             sp_res_n += 1
@@ -10553,14 +11665,34 @@ def train_phase2(
                 if extra.requires_grad:
                     extra.backward()
         else:
-            total.backward(retain_graph=cfg.torque_grad_cap > 0.0)
-            if ls_rt is not None:
-                # Bind Armijo/curvature to the scalar objective itself.  This
-                # snapshot must precede both the torque-budget rotation and
-                # global norm clipping; live p.grad continues through both and
-                # remains the optimizer-direction input q.
+            curvature_delta = None
+            if cfg.curvature_direct_frac > 0.0:
+                curvature_delta, torque_term_mean, curvature_stats = (
+                    curvature_direct_vjp_correction(
+                        total, _traj, batch["q0"], strike, lengths, w,
+                        costs[bucket], cfg,
+                        torque_term_mean=(
+                            torque_term_mean if torque_refresh_due else None
+                        ),
+                    )
+                )
+                for key, value in curvature_stats.items():
+                    roll_acc[key] = roll_acc.get(key, 0.0) + float(value.detach())
+            total.backward(
+                retain_graph=torque_refresh_due or curvature_delta is not None
+            )
+            if ls_rt is not None and ls_direction_due:
+                # Armijo needs the true scalar-objective gradient.  In direct
+                # curvature mode this snapshot must precede the output-space
+                # VJP correction; the live p.grad then becomes Adam's proposed
+                # direction, which SaLSa checks against the true objective.
                 g_objective = snapshot_g_preclip(ls_rt.adapter._params)
-            if cfg.torque_grad_cap > 0.0 and torque_term_mean is not None:
+            if curvature_delta is not None:
+                torch.autograd.backward(
+                    _traj, grad_tensors=curvature_delta,
+                    retain_graph=torque_refresh_due,
+                )
+            if torque_refresh_due and torque_term_mean is not None:
                 tgc = clip_torque_gradient_budget(
                     trainable_params(model),
                     torque_term_mean,
@@ -10568,13 +11700,38 @@ def train_phase2(
                     cap=float(cfg.torque_grad_cap),
                 )
                 _accumulate_torque_grad_cap_stats(roll_acc, tgc)
+                roll_acc["torque_grad_cap_refresh"] = (
+                    roll_acc.get("torque_grad_cap_refresh", 0.0) + 1.0
+                )
+                measured_scale = tgc.get("torque_grad_cap_scale")
+                if measured_scale is not None and math.isfinite(
+                    float(measured_scale)
+                ):
+                    if torque_grad_cache_initialized:
+                        decay = float(cfg.torque_grad_cap_scale_ema)
+                        torque_grad_cached_scale = (
+                            decay * torque_grad_cached_scale
+                            + (1.0 - decay) * float(measured_scale)
+                        )
+                    else:
+                        torque_grad_cached_scale = float(measured_scale)
+                    torque_grad_cache_initialized = True
+            elif cfg.torque_grad_cap > 0.0:
+                roll_acc["torque_grad_cap_reuse"] = (
+                    roll_acc.get("torque_grad_cap_reuse", 0.0) + 1.0
+                )
+                roll_acc["torque_grad_cap_cached_scale"] = (
+                    roll_acc.get("torque_grad_cap_cached_scale", 0.0)
+                    + float(torque_grad_cached_scale)
+                )
 
         g_preclip = None
         g_for_lbfgs = None
-        if ls_rt is not None:
+        if ls_rt is not None and ls_direction_due:
             g_preclip = snapshot_g_preclip(ls_rt.adapter._params)
 
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        phase_timer.mark("optimizer")
         if ls_rt is not None and ls_rt.optimizer_kind == "lbfgs":
             # L-BFGS curvature pairs use the same raw objective-gradient
             # convention at both ends; q clipping only selects the live step.
@@ -10593,25 +11750,41 @@ def train_phase2(
         elif ls_rt is not None:
             F0 = float((loss + extra).detach())
             # Early triggers before commit (refs not yet updated).
-            viol_now = {
-                g_: float(metrics.float().detach().cpu().numpy()[VIOL_OFFSET + i])
-                for i, g_ in enumerate(VIOL_KEYS)
-            }
-            _g2 = 0.0
-            for _g in g_objective:
-                if _g is not None:
-                    _g2 += float(_g.detach().double().pow(2).sum().item())
-            gnorm_pre = _g2 ** 0.5
-            late_reasons = check_early_triggers(
-                cfg=ls_rt.cfg,
-                refs=ls_rt.refs,
-                gnorm=gnorm_pre,
-                viol_metrics=viol_now,
-            )
+            if ls_rt.cfg.search_on_early_triggers:
+                viol_now = {
+                    g_: float(
+                        metrics.float().detach().cpu().numpy()[VIOL_OFFSET + i]
+                    )
+                    for i, g_ in enumerate(VIOL_KEYS)
+                }
+                _g2 = 0.0
+                assert g_objective is not None
+                for _g in g_objective:
+                    if _g is not None:
+                        _g2 += float(
+                            _g.detach().double().pow(2).sum().item()
+                        )
+                gnorm_pre = _g2 ** 0.5
+                late_reasons = check_early_triggers(
+                    cfg=ls_rt.cfg,
+                    refs=ls_rt.refs,
+                    gnorm=gnorm_pre,
+                    viol_metrics=viol_now,
+                )
+            else:
+                # ``clip_grad_norm_`` returns the pre-clip norm. Trigger EMAs
+                # are unused when early searches are disabled, so avoid a
+                # second full-model float64 reduction and metric host sync.
+                viol_now = {}
+                gnorm_pre = float(gnorm)
+                late_reasons = []
             if ls_rt.cfg.mode == "fixed_epsilon":
                 run_search = False
             else:
-                run_search = bool(known_search) or bool(late_reasons)
+                run_search = bool(known_search) or (
+                    bool(ls_rt.cfg.search_on_early_triggers)
+                    and bool(late_reasons)
+                )
             all_reasons = list(search_reasons) + list(late_reasons)
             if run_search and include_bptt_step:
                 raise ReplayIncompleteError(
@@ -10669,6 +11842,7 @@ def train_phase2(
                     dtype=dtype,
                     amp=amp,
                     rec=ls_rec,
+                    torque_grad_scale=torque_step_scale,
                 )
 
             ls_result = run_search_or_ordinary(
@@ -10677,7 +11851,7 @@ def train_phase2(
                 run_search=run_search,
                 search_reasons=all_reasons,
                 F0=F0,
-                g_preclip=g_preclip,
+                    g_preclip=g_preclip,
                 probe_F=_probe_F,
                 g_objective=g_objective,
                 replay_ctx=replay_mgr,
@@ -10734,6 +11908,7 @@ def train_phase2(
                             dtype=dtype,
                             amp=amp,
                             rec=ls_rec,
+                            torque_grad_scale=torque_step_scale,
                             return_tensor=True,
                         )
                         tot.backward()
@@ -10750,7 +11925,7 @@ def train_phase2(
                     ls_log["lbfgs_pair_ok"] = 1.0 if accepted else 0.0
                     ls_rt.last_log = {**(ls_rt.last_log or {}), **ls_log}
             # Update trigger refs once per valid baseline (after decision).
-            if commit_side_effects:
+            if commit_side_effects and ls_rt.cfg.search_on_early_triggers:
                 ls_rt.refs.update_after_valid_baseline(gnorm_pre, viol_now)
         else:
             # Non-LS path; gnorm is finite here (nonfinite handled above).
@@ -10759,6 +11934,8 @@ def train_phase2(
 
         if update_executed:
             updates_executed += 1
+
+        phase_timer.mark("critic")
 
         # The label describes the pre-update actor evaluation above.  Train the
         # separate critic only after actor/line-search side effects are settled,
@@ -10789,6 +11966,8 @@ def train_phase2(
                 timing_critic.observe_gate(
                     observe_features, observe_gate, actor_step=step,
                 )
+
+        phase_timer.mark("bookkeeping")
 
         if (
             voxel_state is not None
@@ -10926,6 +12105,10 @@ def train_phase2(
                 ls_rt.al_lam_snapshot = dict(al.lam)
                 ls_rt.al_pen_snapshot = dict(al.pen)
 
+        phase_sample = phase_timer.finish()
+        if phase_sample:
+            phase_timing_latest = phase_sample
+
         if (step + 1) % cfg.log_every == 0 and rank == 0:
             now = time.perf_counter()
             rec = {"event": "train", "step": step + 1, "lr": lr,
@@ -11001,6 +12184,15 @@ def train_phase2(
             rec.update(_torque_grad_cap_log_fields(
                 roll_acc, cap=float(cfg.torque_grad_cap),
             ))
+            rec.update(phase_timing_latest)
+            phase_timing_latest = {}
+            if cfg.torque_grad_cap > 0.0:
+                rec["torque_grad_cap_refresh_interval"] = float(
+                    cfg.torque_grad_cap_refresh
+                )
+                rec["torque_grad_cap_cached_scale"] = float(
+                    torque_grad_cached_scale
+                )
             rec.update({k: float(v) for k, v in zip(METRIC_NAMES, acc / max(acc_n, 1))})
             if sp_res_n:
                 rec["waist_sp_res"] = sp_res_acc / sp_res_n

@@ -227,6 +227,37 @@ TORSO_CAPSULE = ((0.0, 0.0, 0.05), (0.0, 0.0, 0.32), 0.12)
 HEAD_SPHERE = ((0.02, 0.0, 0.52), 0.11)
 WRIST_RADIUS = 0.0225
 
+#: Fixed lower-body collision capsules in the pelvis frame.  The optimizer has
+#: no leg DoF: the Isaac drummer configuration welds the twelve leg joints at
+#: the upstream ``UNITREE_G1_29DOF_CFG`` standing pose (hip pitch ``-0.10``,
+#: knee ``+0.30``, ankle pitch ``-0.20`` radians; all other leg joints zero).
+#: These centre lines are the resulting URDF joint-frame positions, with a
+#: conservative envelope for the pelvis/hip, thigh, shin and foot meshes.
+#:
+#: They intentionally remain PELVIS-fixed -- unlike :data:`TORSO_CAPSULE`, they
+#: must not lean or yaw with the commanded waist.  This gives the analytic cost
+#: and start/eval screens the same fixed-base lower-body reference.  They are
+#: collision *proxies*, not new lower-body dynamics or a replacement for a full
+#: mesh SDF.
+#:
+#: ``(name, endpoint_a, endpoint_b, radius_m)``.  The mirrored leg values are
+#: generated from ``assets/g1_29dof_rev_1_0.urdf`` at that exact frozen pose.
+FIXED_LOWER_BODY_CAPSULES = (
+    ("pelvis", (0.0, 0.0, 0.055), (0.0, 0.0, -0.145), 0.140),
+    ("left_thigh", (0.000000, 0.064452, -0.102700),
+     (0.033601, 0.118601, -0.437614), 0.082),
+    ("left_shin", (0.033601, 0.118601, -0.437614),
+     (-0.026002, 0.118506, -0.731644), 0.072),
+    ("left_foot", (-0.096002, 0.118506, -0.749202),
+     (0.124000, 0.118506, -0.749202), 0.055),
+    ("right_thigh", (0.000000, -0.064452, -0.102700),
+     (0.033601, -0.118601, -0.437614), 0.082),
+    ("right_shin", (0.033601, -0.118601, -0.437614),
+     (-0.026002, -0.118506, -0.731644), 0.072),
+    ("right_foot", (-0.096002, -0.118506, -0.749202),
+     (0.124000, -0.118506, -0.749202), 0.055),
+)
+
 #: Pelvis origin in the env frame; add to pelvis-frame FK to get env coords.
 PELVIS_IN_ENV = np.array([0.0, 0.0, 0.80])
 

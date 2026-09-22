@@ -92,6 +92,7 @@ from .limits import (
 from .rnea import BatchedRNEA
 from .sdf import (
     DrumSceneSpec,
+    fixed_capsule_self_sdf,
     hit_region_dist,
     point_capsule_sdf,
     point_cylinder_sdf,
@@ -540,7 +541,10 @@ class TrajectoryScorer:
         self._under_half = t(np.full(self.scene.num_drums, under_depth / 2.0))
 
         # Robot sample points per hand: [tip, shaft*S, wrist], wrist-local.
-        from .constants import STICK_RADIUS, TIP_RADIUS, TORSO_CAPSULE, HEAD_SPHERE, WRIST_RADIUS
+        from .constants import (
+            FIXED_LOWER_BODY_CAPSULES,
+            STICK_RADIUS, TIP_RADIUS, TORSO_CAPSULE, HEAD_SPHERE, WRIST_RADIUS,
+        )
 
         self._pts_local = {}
         for hand in ("left", "right"):
@@ -565,6 +569,9 @@ class TrajectoryScorer:
         self._torso_a, self._torso_b, self._torso_r = t(a), t(b), float(r)
         hc, hr = HEAD_SPHERE
         self._head_c, self._head_r = t(hc), float(hr)
+        self._lower_a = t([x[1] for x in FIXED_LOWER_BODY_CAPSULES])
+        self._lower_b = t([x[2] for x in FIXED_LOWER_BODY_CAPSULES])
+        self._lower_r = t([x[3] for x in FIXED_LOWER_BODY_CAPSULES])
         self._stick_axis_local = {h: t(stick_axis_local(h)) for h in ("left", "right")}
 
         self.tau_limit = scale_soft_wrist_effort(
@@ -667,7 +674,7 @@ class TrajectoryScorer:
         return body - self._wrist_r, under - self._wrist_r
 
     def _self_sdf(self, Qt: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
-        """(B, 2) stick-capsule and wrist vs torso capsule / head sphere."""
+        """(B, 2) stick-capsule and wrist vs torso, head and fixed lower body."""
         Rt, pt = self.fk.frame(Qt, "torso")
         a = pt + (Rt @ self._torso_a.view(1, 3, 1)).squeeze(-1)
         b = pt + (Rt @ self._torso_b.view(1, 3, 1)).squeeze(-1)
@@ -677,8 +684,13 @@ class TrajectoryScorer:
         s_h = segment_segment_sdf(butt, tip, hc, hc, self._stick_r, self._head_r)
         s_wt = point_capsule_sdf(wrist, a, b, self._torso_r) - self._wrist_r
         s_wh = point_sphere_sdf(wrist, hc, self._head_r) - self._wrist_r
+        s_lower_st, s_lower_wr = fixed_capsule_self_sdf(
+            butt, tip, wrist, self._lower_a, self._lower_b, self._lower_r,
+            stick_radius=self._stick_r, wrist_radius=self._wrist_r,
+        )
         return torch.stack(
-            [torch.minimum(s_t, s_h), torch.minimum(s_wt, s_wh)], dim=-1
+            [torch.minimum(torch.minimum(s_t, s_h), s_lower_st),
+             torch.minimum(torch.minimum(s_wt, s_wh), s_lower_wr)], dim=-1
         )
 
     def _stick_stick_sdf(self, pl: torch.Tensor, pr: torch.Tensor) -> torch.Tensor:

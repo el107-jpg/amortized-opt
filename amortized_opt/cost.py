@@ -57,7 +57,7 @@ group          what it prices
                ReLU hard excess (max-shaped dense grad).
 ``smooth``     closed-form ``int v^2 / a^2 / j^2`` per segment.
 ``posture``    mid-range well, elbow-down preference, anti-axial
-               twist, and an optional UPRIGHT well on waist
+               twist, a compact arm-mass proxy, and an optional UPRIGHT well on waist
                pitch/roll (``w_waist_upright``; yaw excluded).
                With ``waist_pr_ref`` set the well is
                ``mean((q_pr - stopgrad(sp))²)`` -- a decoder tax,
@@ -119,6 +119,7 @@ import torch.nn.functional as F
 
 from .constants import (
     CONTROL_DT,
+    FIXED_LOWER_BODY_CAPSULES,
     G1_UPPER_BODY_JOINTS,
     HEAD_SPHERE,
     PD_SUBSTEPS,
@@ -163,6 +164,7 @@ from .limits import (
 from .rnea import BatchedRNEA
 from .sdf import (
     DrumSceneSpec,
+    fixed_capsule_self_sdf,
     point_capsule_sdf,
     point_cylinder_sdf,
     point_sphere_sdf,
@@ -538,6 +540,30 @@ class CostConfig:
 
     # --------------------------------------------------------- posture ----
     w_posture_mid: float = 1.0e-2
+    #: Compact striking posture.  This is deliberately an ARM-mass proxy, not
+    #: whole-body COM: phase 2 controls only the waist and arms, so a full-body
+    #: COM would be dominated by the fixed pelvis/legs and give a weak or
+    #: misleading gradient.  For each active hand we combine approximate
+    #: upper-arm, forearm, wrist/hand and stick centres, transform the result
+    #: into the torso frame, and square only the excess above the height and
+    #: horizontal-radius deadbands below.  The measured q0 sample is excluded.
+    #:
+    #: Raw units are metres in ``linear`` mode and m^2 in ``hinge_sq`` mode.
+    #: Zero by default so old objectives are bit-identical; phase-2 training
+    #: opts in after gradient calibration.
+    w_arm_compact: float = 0.0
+    #: ``"hinge_sq"`` preserves the original deadbanded ReLU-squared cost.
+    #: ``"linear"`` continuously prices torso-frame height and radius, so
+    #: every active-arm pose has a downward/inward gradient rather than a flat
+    #: region below an arbitrary threshold.
+    arm_compact_mode: str = "hinge_sq"
+    arm_compact_height_max: float = 0.28
+    arm_compact_radius_max: float = 0.28
+    #: Relative prices inside the unit-weight compactness term.  Keeping these
+    #: separate lets height/reach be balanced without changing its outer
+    #: gradient-budget weight.
+    arm_compact_height_scale: float = 1.0
+    arm_compact_radius_scale: float = 1.0
     #: UPRIGHT WELL on the waist LEAN joints:
     #: ``w_waist_upright * mean_valid(q_waist_pitch^2 + q_waist_roll^2)``, in
     #: rad^2, reduced over the two rows only (NOT diluted by the other 15
@@ -782,6 +808,18 @@ class CostConfig:
             raise ValueError("beta_idle_cyl must be > 0")
         if self.w_idle_vel < 0.0:
             raise ValueError("w_idle_vel must be >= 0")
+        if self.w_arm_compact < 0.0:
+            raise ValueError("w_arm_compact must be >= 0")
+        if self.arm_compact_mode not in ("hinge_sq", "linear"):
+            raise ValueError(f"arm_compact_mode={self.arm_compact_mode!r}")
+        if self.arm_compact_height_max < 0.0:
+            raise ValueError("arm_compact_height_max must be >= 0")
+        if self.arm_compact_radius_max <= 0.0:
+            raise ValueError("arm_compact_radius_max must be > 0")
+        if self.arm_compact_height_scale < 0.0:
+            raise ValueError("arm_compact_height_scale must be >= 0")
+        if self.arm_compact_radius_scale < 0.0:
+            raise ValueError("arm_compact_radius_scale must be >= 0")
         if self.terminal_axial_lo > self.terminal_axial_hi:
             raise ValueError("terminal_axial_lo must be <= terminal_axial_hi")
         return self
@@ -1323,6 +1361,12 @@ class FusedCost:
         self.c_torso_a, self.c_torso_b, self.c_torso_r = t(a), t(b), float(r)
         hc, hr = HEAD_SPHERE
         self.c_head_c, self.c_head_r = t(hc), float(hr)
+        # The lower body is welded at the upstream G1 standing pose while this
+        # optimizer commands the waist/arms only.  Keep its collision proxies
+        # in the pelvis frame; they intentionally do not follow ``torso``.
+        self.c_lower_a = t([x[1] for x in FIXED_LOWER_BODY_CAPSULES])
+        self.c_lower_b = t([x[2] for x in FIXED_LOWER_BODY_CAPSULES])
+        self.c_lower_r = t([x[3] for x in FIXED_LOWER_BODY_CAPSULES])
 
         # Stick mount, per hand: contact(sigma) = p + R @ (mount_p + sigma*axis)
         self.c_mount_p, self.c_mount_axis = {}, {}
@@ -1330,6 +1374,9 @@ class FusedCost:
             Rm, pm = stick_mount_transform(hand)
             self.c_mount_p[hand] = t(pm)
             self.c_mount_axis[hand] = t(stick_axis_local(hand))
+        # Approximate mass split used by the compact active-arm proxy:
+        # shoulder-group, elbow/forearm, wrist+hand, drumstick.
+        self.c_arm_compact_masses = t((2.095, 0.600, 0.824, 0.100))
         self.c_sigmas = t(np.asarray(SHAFT_SIGMAS, float))  # (Sc,)
         self.n_sigmas = int(self.c_sigmas.shape[0])
         tip_first = np.zeros(self.n_sigmas)
@@ -1783,6 +1830,7 @@ class FusedCost:
             (cfg.w_posture_mid * w["posture_mid"]) * raw["posture_mid"]
             + (cfg.w_elbow_down * w["posture_elbow"]) * raw["posture_elbow"]
             + cfg.w_axial_twist * raw["posture_twist"]
+            + cfg.w_arm_compact * raw["posture_arm_compact"]
             # The IDLE ARM pair, both exactly zero without an installed cylinder.
             # They ride the ``posture`` group multiplier (an objective block, no
             # augmented-Lagrangian multiplier of their own) and share one
@@ -2032,7 +2080,9 @@ class FusedCost:
             pen_u = pen_u + hand_pen_u
             n_seen = n_seen + hand_n
 
-            # --- self collision: stick capsule + wrist vs torso / head ------
+            # --- self collision: stick capsule + wrist vs body --------------
+            # The upper body rides the commanded waist; the pelvis/legs are a
+            # fixed standing-pose capsule bank in the pelvis frame.
             Rt, pt = frames["torso"]
             off = lambda loc: (pt + (Rt @ loc.to(pt.dtype).view(1, 3, 1)).squeeze(-1)
                                ).reshape(B, S, 3)
@@ -2047,8 +2097,13 @@ class FusedCost:
             )
             s_wt = point_capsule_sdf(wrist_w, a, b, self.c_torso_r) - self.c_wrist_r
             s_wh = point_sphere_sdf(wrist_w, hc, self.c_head_r) - self.c_wrist_r
-            sdf_self_st = torch.minimum(s_t, s_h)
-            sdf_self_wr = torch.minimum(s_wt, s_wh)
+            s_lower_st, s_lower_wr = fixed_capsule_self_sdf(
+                butt_w, tip_w, wrist_w,
+                self.c_lower_a, self.c_lower_b, self.c_lower_r,
+                stick_radius=self.c_stick_r, wrist_radius=self.c_wrist_r,
+            )
+            sdf_self_st = torch.minimum(torch.minimum(s_t, s_h), s_lower_st)
+            sdf_self_wr = torch.minimum(torch.minimum(s_wt, s_wh), s_lower_wr)
             hs_st = _softplus_hinge(cfg.collision_margin - sdf_self_st, cfg.beta_collision)
             hs_wr = _softplus_hinge(cfg.collision_margin - sdf_self_wr, cfg.beta_collision)
             pen_s = pen_s + (hs_st * smask + hs_wr * smask).sum(dim=1)
@@ -2117,6 +2172,10 @@ class FusedCost:
             ).detach()
             diag[f"collision_min_sdf_{hand}"] = msd.detach()
             diag[f"collision_pen_max_{hand}"] = hand_max.detach()
+            diag[f"collision_lower_min_sdf_{hand}"] = torch.minimum(
+                torch.where(smask > 0.5, s_lower_st, big).amin(dim=1),
+                torch.where(smask > 0.5, s_lower_wr, big).amin(dim=1),
+            ).detach()
 
         # --- cross-hand: stick vs stick, wrist vs stick, wrist vs wrist ------
         # Everything above scores ONE hand's capsule against the drums and
@@ -2951,6 +3010,86 @@ class FusedCost:
         raw["posture_twist"] = val
         diag["posture_twist_max"] = (tw.abs() * hm).amax(dim=(1, 2)).detach()
         counts["posture_twist"] = cnt2.detach()
+
+        # ACTIVE-ARM COMPACTNESS.  Reuse the one FK pass already paid for by
+        # collision/terminal/posture.  The four proxy points and masses follow
+        # the G1 URDF's rough mass distribution:
+        #   shoulder group 2.095 kg, elbow link 0.600 kg,
+        #   wrist+rubber hand 0.824 kg, plus a light 0.100 kg stick.
+        # Exact link COM FK would require another ~14 frames in the hot pass;
+        # this segment-centre proxy preserves the useful gradient at negligible
+        # cost and, unlike whole-body COM, is directly controllable here.
+        Rt, pt = frames["torso"]
+        Rt = Rt.reshape(B, S, 3, 3)
+        pt = pt.reshape(B, S, 3)
+        compact = ss.q.new_zeros(B)
+        compact_n = ss.q.new_zeros(B)
+        compact_z_sum = ss.q.new_zeros(B)
+        compact_r_sum = ss.q.new_zeros(B)
+        z_peak = ss.q.new_zeros(B)
+        r_peak = ss.q.new_zeros(B)
+        z_ex_peak = ss.q.new_zeros(B)
+        r_ex_peak = ss.q.new_zeros(B)
+        masses = self.c_arm_compact_masses
+        mass_sum = masses.sum()
+        for hi, hand in enumerate(_HANDS):
+            shoulder = frames[f"{hand}_shoulder"][1].reshape(B, S, 3)
+            elbow = frames[f"{hand}_elbow"][1].reshape(B, S, 3)
+            Rw, wrist_flat = frames[f"{hand}_wrist"]
+            Rw = Rw.reshape(B, S, 3, 3)
+            wrist = wrist_flat.reshape(B, S, 3)
+            upper = 0.65 * shoulder + 0.35 * elbow
+            forearm = 0.5 * (elbow + wrist)
+            hand_com = wrist + torch.einsum(
+                "bsij,j->bsi", Rw, self.c_mount_p[hand] * 0.25
+            )
+            stick_com = wrist + torch.einsum(
+                "bsij,j->bsi", Rw, self.c_mount_p[hand]
+            )
+            arm_com = (
+                masses[0] * upper + masses[1] * forearm
+                + masses[2] * hand_com + masses[3] * stick_com
+            ) / mass_sum
+            torso_com = torch.einsum(
+                "bsji,bsj->bsi", Rt, arm_com - pt
+            )
+            z = torso_com[..., 2]
+            radius = torch.linalg.vector_norm(torso_com[..., :2], dim=-1)
+            z_ex = (z - float(cfg.arm_compact_height_max)).clamp_min(0.0)
+            r_ex = (radius - float(cfg.arm_compact_radius_max)).clamp_min(0.0)
+            # Only scheduled arms participate.  Sample zero is measured q0 and
+            # cannot be changed by the decoder, so do not add an objective floor.
+            m = m_hand[hand] * ctx.active[:, hi].unsqueeze(1)
+            m = torch.cat([torch.zeros_like(m[:, :1]), m[:, 1:]], dim=1)
+            if cfg.arm_compact_mode == "linear":
+                posture_cost = (
+                    float(cfg.arm_compact_height_scale) * z
+                    + float(cfg.arm_compact_radius_scale) * radius
+                )
+            else:
+                posture_cost = (
+                    float(cfg.arm_compact_height_scale) * z_ex.square()
+                    + float(cfg.arm_compact_radius_scale) * r_ex.square()
+                )
+            compact = compact + posture_cost.mul(m).sum(dim=1)
+            compact_n = compact_n + m.sum(dim=1)
+            compact_z_sum = compact_z_sum + (z * m).sum(dim=1)
+            compact_r_sum = compact_r_sum + (radius * m).sum(dim=1)
+            z_peak = torch.maximum(z_peak, (z * m).amax(dim=1))
+            r_peak = torch.maximum(r_peak, (radius * m).amax(dim=1))
+            z_ex_peak = torch.maximum(z_ex_peak, (z_ex * m).amax(dim=1))
+            r_ex_peak = torch.maximum(r_ex_peak, (r_ex * m).amax(dim=1))
+        den_compact = compact_n.clamp_min(1.0)
+        raw["posture_arm_compact"] = compact / (
+            den_compact if cfg.reduction == "mean" else 1.0
+        )
+        counts["posture_arm_compact"] = compact_n.detach()
+        diag["arm_com_height_max"] = z_peak.detach()
+        diag["arm_com_radius_max"] = r_peak.detach()
+        diag["arm_com_height_mean"] = (compact_z_sum / den_compact).detach()
+        diag["arm_com_radius_mean"] = (compact_r_sum / den_compact).detach()
+        diag["arm_com_height_excess_max"] = z_ex_peak.detach()
+        diag["arm_com_radius_excess_max"] = r_ex_peak.detach()
 
         # UPRIGHT WELL: mean q^2 over the waist PITCH/ROLL rows only.  The mask
         # is ``ss.mask * c_waist_pr``, so (a) the mean is over 2 rows rather than

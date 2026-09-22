@@ -50,6 +50,7 @@ __all__ = [
     "params_finite",
     "build_objective_direction_fingerprint",
     "resolve_known_search",
+    "needs_line_search_direction",
     "run_search_or_ordinary",
     "assert_replayable_extras_or_raise",
     "runtime_state_dict",
@@ -226,7 +227,11 @@ def build_objective_direction_fingerprint(
         return {str(k): float(values[k]) for k in sorted(values)}
 
     return {
-        "contract": "raw_objective_gradient_v2",
+        "contract": (
+            "raw_objective_gradient_curvature_direct_v1"
+            if float(getattr(phase2_cfg, "curvature_direct_frac", 0.0) or 0.0) > 0.0
+            else "raw_objective_gradient_v2"
+        ),
         "optimizer": str(
             getattr(phase2_cfg, "optimizer", "adamw") or "adamw"
         ).lower(),
@@ -240,6 +245,62 @@ def build_objective_direction_fingerprint(
         "torque_grad_cap": float(
             getattr(phase2_cfg, "torque_grad_cap", 0.0) or 0.0
         ),
+        "torque_grad_cap_refresh": int(
+            getattr(phase2_cfg, "torque_grad_cap_refresh", 1) or 1
+        ),
+        "torque_grad_cap_scale_ema": float(
+            getattr(phase2_cfg, "torque_grad_cap_scale_ema", 0.8)
+        ),
+        # Training-time DLS changes both the scalar objective and its direction;
+        # never carry SaLSa acceptance history across an enable/weight change.
+        "dls_terminal_frac": float(
+            getattr(phase2_cfg, "dls_terminal_frac", 0.0) or 0.0
+        ),
+        "w_dls_terminal_cost": float(
+            getattr(phase2_cfg, "w_dls_terminal_cost", 0.0) or 0.0
+        ),
+        "w_dls_terminal_tie": float(
+            getattr(phase2_cfg, "w_dls_terminal_tie", 0.0) or 0.0
+        ),
+        "dls_terminal_steps": int(
+            getattr(phase2_cfg, "dls_terminal_steps", 1) or 1
+        ),
+        "dls_terminal_window": int(
+            getattr(phase2_cfg, "dls_terminal_window", 16) or 16
+        ),
+        "dls_terminal_damping": float(
+            getattr(phase2_cfg, "dls_terminal_damping", 0.05)
+        ),
+        "dls_terminal_max_step_rad": float(
+            getattr(phase2_cfg, "dls_terminal_max_step_rad", 0.35)
+        ),
+        # Do not invalidate older DLS selector history when the new mode is
+        # disabled.  Enabling curvature (or changing its metric) *does* change
+        # the scalar lookahead objective and must reset acceptance history.
+        **({
+            "terminal_lookahead_mode": "curvature",
+            "curvature_damping": float(phase2_cfg.curvature_damping),
+            "curvature_position_weight": float(
+                phase2_cfg.curvature_position_weight
+            ),
+            "curvature_velocity_weight": float(
+                phase2_cfg.curvature_velocity_weight
+            ),
+            "curvature_max_step_rad": float(phase2_cfg.curvature_max_step_rad),
+        } if getattr(phase2_cfg, "terminal_lookahead_mode", "dls") == "curvature"
+          else {}),
+        **({
+            "curvature_direct_frac": float(phase2_cfg.curvature_direct_frac),
+            "curvature_direct_mix": float(phase2_cfg.curvature_direct_mix),
+            "curvature_damping": float(phase2_cfg.curvature_damping),
+            "curvature_position_weight": float(
+                phase2_cfg.curvature_position_weight
+            ),
+            "curvature_velocity_weight": float(
+                phase2_cfg.curvature_velocity_weight
+            ),
+        } if float(getattr(phase2_cfg, "curvature_direct_frac", 0.0) or 0.0) > 0.0
+          else {}),
         "grad_clip": float(getattr(phase2_cfg, "grad_clip", 0.0) or 0.0),
         "strict_actual_update": bool(ls_cfg.strict_actual_update),
         "reject_current_probe_increase": bool(
@@ -249,6 +310,7 @@ def build_objective_direction_fingerprint(
         "force_search_on_al_change": bool(
             ls_cfg.force_search_on_al_change
         ),
+        "search_on_early_triggers": bool(ls_cfg.search_on_early_triggers),
         "reseed_epsilon_on_objective_change": bool(
             ls_cfg.reseed_epsilon_on_objective_change
         ),
@@ -303,6 +365,14 @@ def init_line_search_runtime(
             ),
             force_search_on_al_change=bool(
                 requested_cfg.force_search_on_al_change
+            ),
+            search_interval_mode=str(requested_cfg.search_interval_mode),
+            initial_interval=int(requested_cfg.initial_interval),
+            min_interval=int(requested_cfg.min_interval),
+            max_interval=int(requested_cfg.max_interval),
+            warmup_updates=int(requested_cfg.warmup_updates),
+            search_on_early_triggers=bool(
+                requested_cfg.search_on_early_triggers
             ),
             reseed_epsilon_on_objective_change=bool(
                 requested_cfg.reseed_epsilon_on_objective_change
@@ -468,6 +538,33 @@ def resolve_known_search(rt: LineSearchRuntime) -> tuple[bool, list[str], int]:
     return run, reasons, j
 
 
+def needs_line_search_direction(
+    rt: LineSearchRuntime,
+    *,
+    known_search: bool,
+    j: int,
+) -> bool:
+    """Whether this update needs the expensive transactional Adam direction.
+
+    Gradient-mode AdamW on a scheduled non-search update is exactly the native
+    optimizer step.  Parameter/gradient snapshots are only necessary when a
+    search can still happen, an actual-step diagnostic is due, or a backend
+    whose ordinary update is implemented by the adapter is selected.
+    """
+    diagnostic_every = int(rt.cfg.actual_update_diagnostic_every)
+    diagnostic_due = bool(
+        diagnostic_every > 0 and int(j) % diagnostic_every == 0
+    )
+    return bool(
+        known_search
+        or rt.cfg.search_on_early_triggers
+        or rt.cfg.strict_actual_update
+        or diagnostic_due
+        or rt.optimizer_kind == "lbfgs"
+        or getattr(rt.adapter, "moment_on", "gradient") == "step"
+    )
+
+
 def run_search_or_ordinary(
     rt: LineSearchRuntime,
     *,
@@ -475,7 +572,7 @@ def run_search_or_ordinary(
     run_search: bool,
     search_reasons: Sequence[str],
     F0: float,
-    g_preclip: Sequence[Tensor | None],
+    g_preclip: Sequence[Tensor | None] | None,
     probe_F: Callable[[], float],
     g_objective: Sequence[Tensor | None] | None = None,
     replay_ctx: ObjectiveReplayContext | None = None,
@@ -648,17 +745,14 @@ def run_search_or_ordinary(
                     rt.adapter, st, eps_cur, rt.adapter.moment_on,
                 )
         else:
-            rt.adapter.snapshot_theta0()
-            st = rt.adapter.stage_from_q(
-                g_objective=objective_grad,
-                use_param_grad_as_q=True,
-            )
-            u_breakdown = _step_vector_breakdown(
-                rt.adapter, st, eps_cur, rt.adapter.moment_on,
-            )
+            # Exact fast path for gradient-mode AdamW.  Staging computes the
+            # same moment update as ``opt.step`` but also snapshots all model
+            # parameters and constructs every SaLSa direction. None of those
+            # tensors are consumed on an ordinary scheduled update.
             rt.adapter.set_group_lrs(eps_cur)
             rt.adapter.opt.step()
             rt.adapter.clear_transaction()
+            u_breakdown["ls_fast_ordinary"] = 1.0
         advance_successful_update(rt.ctrl, j)
         log = logging_dict_from_search(
             epsilon=eps_cur,

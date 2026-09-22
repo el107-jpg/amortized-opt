@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from scripts.ablate_distributional_ood_critic import (
@@ -6,6 +7,7 @@ from scripts.ablate_distributional_ood_critic import (
 )
 
 from amortized_opt.distributional_critic import (
+    calibrated_risk_threshold,
     DistributionalEnsemble,
     MANAGEABLE_BINS,
     categorical_ordinal_loss,
@@ -48,6 +50,27 @@ def test_softmax_and_isomax_ensemble_shapes_and_gradients():
         assert all(p.grad is not None for p in model.parameters())
 
 
+def test_fused_softmax_heads_match_serial_forward_and_gradients():
+    torch.manual_seed(13)
+    model = DistributionalEnsemble(12, num_heads=3, kind="softmax")
+    per_head = torch.randn(3, 7, 12)
+    fused, distance = model.forward_per_head(per_head)
+    serial = torch.stack([
+        head(per_head[index])[0]
+        for index, head in enumerate(model.heads)
+    ])
+    assert distance is None
+    torch.testing.assert_close(fused, serial)
+
+    fused.square().mean().backward()
+    fused_grad = [parameter.grad.detach().clone() for parameter in model.parameters()]
+    model.zero_grad(set_to_none=True)
+    serial.square().mean().backward()
+    serial_grad = [parameter.grad.detach().clone() for parameter in model.parameters()]
+    for actual, expected in zip(fused_grad, serial_grad):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_temperature_entropy_and_uniform_unknown_objective():
     logits = torch.zeros(2, 4, 5, 10, requires_grad=True)
     p = probabilities(logits, torch.ones(5))
@@ -80,6 +103,36 @@ def test_distributional_risk_distinguishes_equal_entropy_shapes_and_heads():
     _, agreed_parts = distributional_risk(agreed)
     _, split_parts = distributional_risk(split)
     assert split_parts["epistemic"].item() > agreed_parts["epistemic"].item()
+
+
+def test_vectorized_risk_calibration_matches_reference_sweep_with_ties():
+    risk = torch.tensor([0.4, 0.1, 0.1, 0.8, 0.3, 0.4, 0.6])
+    truth = torch.tensor([True, True, False, True, True, False, True])
+
+    def reference(min_precision):
+        best = None
+        for threshold in risk.unique(sorted=True):
+            selected = risk <= threshold
+            count = int(selected.sum())
+            true_count = int((selected & truth).sum())
+            precision = true_count / max(count, 1)
+            recall = true_count / max(int(truth.sum()), 1)
+            if precision + 1.0e-12 < min_precision:
+                continue
+            candidate = (recall, count, float(threshold))
+            if best is None or candidate > best[0]:
+                best = (candidate, float(threshold), precision, recall)
+        return None if best is None else best[1:]
+
+    for min_precision in (0.5, 0.7, 0.95, 1.1):
+        actual = calibrated_risk_threshold(
+            risk, truth, min_precision=min_precision,
+        )
+        expected = reference(min_precision)
+        if expected is None:
+            assert actual is None
+        else:
+            assert actual == pytest.approx(expected)
 
 
 def test_selective_metrics_reward_entropy_that_identifies_errors():

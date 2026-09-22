@@ -74,6 +74,8 @@ def _train_scalar_tag(key: str) -> str:
         return f"grad/{key[5:]}"
     if key.startswith("gb_"):
         return f"grad_balance/{key[3:]}"
+    if key.startswith("phase_"):
+        return f"performance/{key.removeprefix('phase_')}"
     if key.startswith("d_") or key.startswith(("tcf_", "tcm_", "tcn_", "tce_", "tcx_")):
         return f"{_diag_section(key)}/{key}"
     if key.startswith("waist_") or key.startswith("pr_distill"):
@@ -128,6 +130,12 @@ def scalars_from_record(rec: dict) -> list[tuple[str, float, int]]:
         for key, val in (rec.get("roller") or {}).items():
             if key.startswith("timing_"):
                 add(f"timing_curriculum/{key.removeprefix('timing_')}", val)
+            elif key.startswith("dls_terminal_"):
+                add(f"terminal_dls/{key.removeprefix('dls_terminal_')}", val)
+            elif key.startswith("curvature_teacher_"):
+                add(f"terminal_curvature/{key.removeprefix('curvature_teacher_')}", val)
+            elif key.startswith("curvature_direct_"):
+                add(f"curvature_direct/{key.removeprefix('curvature_direct_')}", val)
         for key, val in rec.items():
             if key in _SKIP_KEYS or key in ("event", "step", "lam", "lam_i", "pen"):
                 continue

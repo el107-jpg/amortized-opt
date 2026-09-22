@@ -492,8 +492,8 @@ def test_stage_a_unlocks_at_30_of_81():
     assert not stage_a_pass({**base, "accepted": 81, "elbow_down": 0.5})
 
 
-def test_phase2_turns_on_weak_terminal_aim():
-    assert phase2_cost_config().w_terminal_aim == pytest.approx(10.0)
+def test_phase2_turns_on_precision_terminal_aim():
+    assert phase2_cost_config().w_terminal_aim == pytest.approx(40.0)
     assert phase2_cost_config().w_torque * 1.0 == pytest.approx(
         phase2_cost_config().w_joint_box * 0.05
     )
@@ -501,7 +501,7 @@ def test_phase2_turns_on_weak_terminal_aim():
         phase2_cost_config().w_velocity * 0.5
     )
     assert A.CostConfig().w_terminal_aim == pytest.approx(0.0)
-    assert phase2_cost_config().terminal_aim_deadband_m == pytest.approx(0.02)
+    assert phase2_cost_config().terminal_aim_deadband_m == pytest.approx(0.005)
 
 
 def test_sample_fresh_batch_draws_live_post_hit(bits):

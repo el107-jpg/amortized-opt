@@ -28,6 +28,11 @@ pinocchio = ["pin>=2.7"]
 # scripts/render_mpc.py and the report scripts.
 plots = ["matplotlib>=3.8"]
 monitoring = ["tensorboard>=2.14"]
+editor = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "httpx>=0.27",
+]
 dev = ["pytest>=8", "tensorboard>=2.14"]
 # NOT installable from PyPI, listed for the record: the Isaac layer
 # (g1_scene, isaac_rl, isaac_rl_ppo) needs `isaaclab` + `isaacsim` and

@@ -44,15 +44,15 @@ def test_timing_pair_is_atomic_and_idle_hand_uses_sentinel():
 
 def test_primary_layout_groups_timing_tables_by_physical_task():
     cfg = ViolationCriticConfig()
-    assert _timing_primary_layout(512, cfg) == (40, 80, 160, 272)
-    assert _timing_primary_layout(64, cfg) == (5, 10, 20, 34)
+    assert _timing_primary_layout(512, cfg) == (40, 40, 40, 160, 272)
+    assert _timing_primary_layout(64, cfg) == (5, 5, 5, 20, 34)
 
     batch = {
         "q0": torch.tensor([[1.0], [2.0]]),
         "v0": torch.tensor([[3.0], [4.0]]),
     }
     expanded = _expand_timing_base_tasks(
-        batch, boundary_per_task=2, interior_per_task=4,
+        batch, anchor_per_task=1, boundary_per_task=1, interior_per_task=4,
     )
     assert expanded["q0"].shape == (12, 1)
     torch.testing.assert_close(
@@ -60,7 +60,10 @@ def test_primary_layout_groups_timing_tables_by_physical_task():
         torch.tensor([1.0] * 6 + [2.0] * 6),
     )
     assert expanded["timing_primary_kind"].tolist() == (
-        [2, 2, 3, 3, 3, 3] * 2
+        [0, 2, 3, 3, 3, 3] * 2
+    )
+    assert expanded["timing_primary_group"].tolist() == (
+        [0] * 6 + [1] * 6
     )
 
 
@@ -263,11 +266,11 @@ def test_retime_batch_rejects_non_atomic_idle_component():
 
 
 @pytest.mark.parametrize(
-    ("terminal_dist", "expected_accepted"),
-    [(0.10, 0), (0.0, 2)],
+    ("score_pattern", "expected_pred"),
+    [([-1.0, -1.0, 1.0, 1.0], 2), ([1.0, 1.0, 1.0, 1.0], 0)],
 )
-def test_assist_exact_barrier_commits_only_passing_proposals(
-    monkeypatch, terminal_dist, expected_accepted,
+def test_assist_directly_admits_without_actor_prevalidation(
+    monkeypatch, score_pattern, expected_pred,
 ):
     names = ("waist_yaw_joint", "left_elbow_joint", "right_elbow_joint")
     dt, horizon, batch_size, d_ctx = 0.02, 6, 2, 4
@@ -292,25 +295,14 @@ def test_assist_exact_barrier_commits_only_passing_proposals(
 
     class Actor(torch.nn.Module):
         def forward(self, init, state, encoding, masks):
-            return SimpleNamespace(traj=init)
+            raise AssertionError("timing admission must not run the actor")
 
     class Cost:
         joint_names = names
         fk = object()
 
         def forward(self, q0, traj, v0, strike, lengths, weights):
-            b = q0.shape[0]
-            diagnostics = {
-                "terminal_region_dist": torch.full((b,), terminal_dist),
-                "joint_box_excess_max": torch.zeros(b),
-                "collision_pen_max": torch.zeros(b),
-                "collision_min_sdf": torch.zeros(b),
-                "torque_excess_max": torch.zeros(b),
-            }
-            return SimpleNamespace(
-                diagnostics=diagnostics,
-                violations={"waist_pr_band": torch.zeros(b)},
-            )
+            raise AssertionError("timing admission must not run physics")
 
     monkeypatch.setattr(
         "amortized_opt.train_cost.correct_quintic_init_arms",
@@ -350,7 +342,7 @@ def test_assist_exact_barrier_commits_only_passing_proposals(
     )
     # Predict an exit after the second ray point for every row.
     critic.conservative_score = lambda x: torch.tensor(
-        [-1.0, -1.0, 1.0, 1.0] * batch_size, device=x.device,
+        score_pattern * batch_size, device=x.device,
     )
     cfg = Phase2Config(
         device="cpu", compile_mode=None, timing_critic=critic_cfg,
@@ -362,19 +354,17 @@ def test_assist_exact_barrier_commits_only_passing_proposals(
         model=Actor(), cost=Cost(), weights={}, pool=Pool(),
         critic=critic, cfg=cfg,
     )
-    assert observation is not None
+    assert observation is None
     assert stats["timing_assist_proposed"] == batch_size
-    assert stats["timing_assist_accepted"] == expected_accepted
-    assert stats["timing_assist_rejected"] == batch_size - expected_accepted
-    assert stats["timing_selected_pred_manageable"] == batch_size
-    assert stats["timing_selected_false_manageable"] == (
-        batch_size - expected_accepted
+    assert stats["timing_selected_pred_manageable"] == expected_pred
+    assert stats["timing_advanced"] == batch_size
+    assert stats["timing_selected_tth_mean_s"] < horizon * dt
+    assert stats["timing_selected_tth_p50_s"] < horizon * dt
+    assert batch["timing_selected_pred_manageable"].tolist() == (
+        [expected_pred > 0] * batch_size
     )
-    assert stats["timing_selected_missed_manageable"] == 0
-    if expected_accepted:
-        assert not torch.equal(batch["hit"], original_hit)
-        torch.testing.assert_close(
-            batch["masks"].hit_tth, batch["hit"].float() * dt,
-        )
-    else:
-        assert torch.equal(batch["hit"], original_hit)
+    assert batch["timing_advanced"].tolist() == [True, True]
+    assert not torch.equal(batch["hit"], original_hit)
+    torch.testing.assert_close(
+        batch["masks"].hit_tth, batch["hit"].float() * dt,
+    )

@@ -16,6 +16,7 @@ from typing import Any
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.func import functional_call, vmap
 
 from .violation_critic import (
     PriorityAuditCoreset,
@@ -37,6 +38,58 @@ BIN_EDGES = (
     0.2, 0.5, 1.0, 2.0, math.inf,
 )
 MANAGEABLE_BINS = 5
+
+
+def calibrated_risk_threshold(
+    risk: torch.Tensor,
+    truth: torch.Tensor,
+    *,
+    min_precision: float,
+) -> tuple[float, float, float] | None:
+    """Select the widest risk threshold satisfying a precision constraint.
+
+    The sweep remains on the input device and only transfers the winning
+    threshold/metrics.  Tied risks are atomic because a threshold necessarily
+    includes every row with that value.
+    """
+    if risk.ndim != 1 or truth.ndim != 1 or risk.numel() != truth.numel():
+        raise ValueError("risk and truth must be equally-sized vectors")
+    if risk.numel() == 0:
+        return None
+    order = torch.argsort(risk, stable=True)
+    risk_sorted = risk.index_select(0, order)
+    truth_sorted = truth.bool().index_select(0, order)
+    count_all = torch.arange(
+        1, risk_sorted.numel() + 1,
+        device=risk.device, dtype=torch.long,
+    )
+    true_all = truth_sorted.long().cumsum(dim=0)
+    distinct_end = torch.ones_like(truth_sorted, dtype=torch.bool)
+    if risk_sorted.numel() > 1:
+        distinct_end[:-1] = risk_sorted[:-1] != risk_sorted[1:]
+    candidate_count = count_all[distinct_end]
+    candidate_true = true_all[distinct_end]
+    candidate_risk = risk_sorted[distinct_end]
+    candidate_precision = (
+        candidate_true.float() / candidate_count.float().clamp_min(1.0)
+    )
+    truth_total = truth_sorted.long().sum().clamp_min(1)
+    candidate_recall = candidate_true.float() / truth_total.float()
+    precision_ok = (
+        candidate_precision + 1.0e-12 >= float(min_precision)
+    )
+    if not bool(precision_ok.any()):
+        return None
+    # Original lexicographic tie-break: recall, count, threshold.  Candidate
+    # count and threshold are monotone, so the final maximum-TP entry wins.
+    best_true = candidate_true[precision_ok].max()
+    winner = precision_ok & (candidate_true == best_true)
+    best_i = winner.nonzero(as_tuple=True)[0][-1]
+    return (
+        float(candidate_risk[best_i]),
+        float(candidate_precision[best_i]),
+        float(candidate_recall[best_i]),
+    )
 
 
 def bin_representatives(
@@ -242,11 +295,41 @@ class DistributionalEnsemble(nn.Module):
             for _ in range(self.num_heads)
         ])
 
+    def _softmax_per_head(self, x: torch.Tensor) -> torch.Tensor:
+        """Evaluate independent heads as one batched program.
+
+        Parameters remain owned by the checkpoint-compatible ``ModuleList``;
+        the differentiable stacks are transient and preserve per-head grads.
+        """
+        if x.ndim != 3 or int(x.shape[0]) != self.num_heads:
+            raise ValueError("per-head input must have shape (heads, batch, dim)")
+        names = tuple(dict(self.heads[0].named_parameters()))
+        parameters = {
+            name: torch.stack([
+                dict(head.named_parameters())[name] for head in self.heads
+            ])
+            for name in names
+        }
+
+        def call_head(params, features):
+            return functional_call(self.heads[0], params, (features,))[0]
+
+        return vmap(call_head)(parameters, x)
+
+    def forward_per_head(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.kind == "softmax":
+            return self._softmax_per_head(x), None
+        rows = [head(x[i]) for i, head in enumerate(self.heads)]
+        return (
+            torch.stack([row[0] for row in rows], dim=0),
+            torch.stack([row[1] for row in rows], dim=0),
+        )
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        rows = [head(x) for head in self.heads]
-        logits = torch.stack([row[0] for row in rows], dim=0)
-        distance = None if rows[0][1] is None else torch.stack([row[1] for row in rows], dim=0)
-        return logits, distance
+        expanded = x.unsqueeze(0).expand(self.num_heads, *x.shape)
+        return self.forward_per_head(expanded)
 
 
 class OnlineDistributionalCriticTrainer:
@@ -377,46 +460,51 @@ class OnlineDistributionalCriticTrainer:
         return stats
 
     def _update_once(self) -> dict[str, float]:
-        per_head = []
-        supervised_losses = []
-        ood_losses = []
-        train_entropies = []
-        ood_entropies = []
-        for head in self.live.heads:
+        features = []
+        targets = []
+        unknowns = []
+        unknown_n = int(round(
+            float(self.cfg.batch_size) * float(self.cfg.global_ood_fraction)
+        ))
+        use_ood = unknown_n > 0 and float(self.cfg.global_ood_weight) > 0.0
+        # Keep the legacy per-head sample/OOD draw ordering so fusion changes
+        # execution only, not the critic's stochastic training stream.
+        for _head in self.live.heads:
             x, target = self.recent.sample(
                 self.cfg.batch_size, generator=self.generator, device=self.device,
                 manageable_fraction=self.cfg.replay_manageable_fraction,
                 near_failure_fraction=self.cfg.replay_near_failure_fraction,
                 boundary_band=self.cfg.replay_boundary_band,
             )
-            target_bin = distributional_targets(target)
-            logits, _ = head(x)
-            supervised_loss = categorical_ordinal_loss(
-                logits.unsqueeze(0), target_bin,
-            )
-            head_loss = supervised_loss
-            supervised_losses.append(supervised_loss.detach())
-            train_entropies.append(
-                normalized_entropy(logits.detach().softmax(dim=-1)).mean()
-            )
-            unknown_n = int(round(
-                float(self.cfg.batch_size) * float(self.cfg.global_ood_fraction)
-            ))
-            if unknown_n > 0 and float(self.cfg.global_ood_weight) > 0.0:
-                unknown = self.global_sampler.sample(
+            features.append(x)
+            targets.append(target)
+            if use_ood:
+                unknowns.append(self.global_sampler.sample(
                     unknown_n, generator=self.generator,
-                ).to(self.device)
-                unknown_logits, _ = head(unknown)
-                ood_loss = high_entropy_loss(unknown_logits.unsqueeze(0))
-                head_loss = head_loss + float(self.cfg.global_ood_weight) * ood_loss
-                ood_losses.append(ood_loss.detach())
-                ood_entropies.append(
-                    normalized_entropy(
-                        unknown_logits.detach().softmax(dim=-1)
-                    ).mean()
-                )
-            per_head.append(head_loss)
-        loss = torch.stack(per_head).mean()
+                ))
+        feature_batch = torch.stack(features)
+        target_batch = torch.stack(targets)
+        logits, _ = self.live.forward_per_head(feature_batch)
+        supervised_loss = categorical_ordinal_loss(
+            logits.reshape(1, -1, N_DISTRIBUTIONS, N_BINS),
+            distributional_targets(
+                target_batch.reshape(-1, N_PHYSICAL_CONSTRAINTS)
+            ),
+        )
+        loss = supervised_loss
+        train_entropy = normalized_entropy(
+            logits.detach().softmax(dim=-1)
+        ).mean()
+        ood_loss = None
+        ood_entropy = None
+        if use_ood:
+            unknown = torch.stack(unknowns).to(self.device)
+            unknown_logits, _ = self.live.forward_per_head(unknown)
+            ood_loss = high_entropy_loss(unknown_logits)
+            loss = loss + float(self.cfg.global_ood_weight) * ood_loss
+            ood_entropy = normalized_entropy(
+                unknown_logits.detach().softmax(dim=-1)
+            ).mean()
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
@@ -427,15 +515,15 @@ class OnlineDistributionalCriticTrainer:
         self.updates += 1
         stats = {
             "loss": float(loss.detach()),
-            "loss_supervised": float(torch.stack(supervised_losses).mean()),
-            "entropy_train": float(torch.stack(train_entropies).mean()),
+            "loss_supervised": float(supervised_loss.detach()),
+            "entropy_train": float(train_entropy),
             "recent_size": float(len(self.recent)),
             "anchor_close_ema": float(self.anchor_close_ema),
             "curriculum_open": float(self.curriculum_open),
         }
-        if ood_losses:
-            stats["loss_ood"] = float(torch.stack(ood_losses).mean())
-            stats["entropy_ood"] = float(torch.stack(ood_entropies).mean())
+        if ood_loss is not None and ood_entropy is not None:
+            stats["loss_ood"] = float(ood_loss.detach())
+            stats["entropy_ood"] = float(ood_entropy)
         for key, value in stats.items():
             self._metric_sum[key] = self._metric_sum.get(key, 0.0) + float(value)
         self._metric_n += 1
@@ -456,21 +544,17 @@ class OnlineDistributionalCriticTrainer:
         probability = logits.softmax(dim=-1)
         risk, risk_parts = self._risk(probability)
         truth = target.amax(dim=1) <= float(self.cfg.acceptable_normalized_violation)
-        best = None
-        for threshold in risk.unique(sorted=True):
-            selected = risk <= threshold
-            count = int(selected.sum())
-            precision = float((selected & truth).sum()) / max(count, 1)
-            recall = float((selected & truth).sum()) / max(int(truth.sum()), 1)
-            if precision + 1.0e-12 < float(self.cfg.risk_min_precision):
-                continue
-            candidate = (recall, count, float(threshold))
-            if best is None or candidate > best[0]:
-                best = (candidate, float(threshold), precision, recall)
+        best = calibrated_risk_threshold(
+            risk,
+            truth,
+            min_precision=float(self.cfg.risk_min_precision),
+        )
         if best is not None:
-            self.risk_threshold = best[1]
-            self.calibration_precision = best[2]
-            self.calibration_recall = best[3]
+            (
+                self.risk_threshold,
+                self.calibration_precision,
+                self.calibration_recall,
+            ) = best
 
         mixture_entropy = normalized_entropy(probability.mean(dim=0))
         member_entropy = normalized_entropy(probability).mean(dim=0)

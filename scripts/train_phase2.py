@@ -222,7 +222,7 @@ def parse_args(argv=None):
         help="EMA decay for the stable critic copy used by timing decisions",
     )
     p.add_argument("--timing-critic-batch", type=int, default=256)
-    p.add_argument("--timing-critic-updates", type=int, default=4)
+    p.add_argument("--timing-critic-updates", type=int, default=1)
     p.add_argument("--timing-critic-bootstrap-prob", type=float, default=0.8)
     p.add_argument("--timing-critic-prior-scale", type=float, default=0.0)
     p.add_argument("--timing-critic-dropout", type=float, default=0.0)
@@ -250,7 +250,8 @@ def parse_args(argv=None):
     p.add_argument("--timing-critic-min-assist-samples", type=int, default=2048)
     p.add_argument("--timing-critic-coarse-step", type=int, default=5)
     p.add_argument("--timing-primary-base-tasks-per-512", type=int, default=40)
-    p.add_argument("--timing-primary-boundary-per-task", type=int, default=2)
+    p.add_argument("--timing-primary-anchor-per-task", type=int, default=1)
+    p.add_argument("--timing-primary-boundary-per-task", type=int, default=1)
     p.add_argument("--timing-primary-interior-per-task", type=int, default=4)
     p.add_argument("--timing-primary-mpc-terminal-limit", type=float, default=0.040)
     p.add_argument(
@@ -261,7 +262,7 @@ def parse_args(argv=None):
         choices=("regression", "distributional"), default="regression",
     )
     p.add_argument("--timing-acceptable-normalized-violation", type=float, default=0.2)
-    p.add_argument("--timing-risk-min-precision", type=float, default=0.5)
+    p.add_argument("--timing-risk-min-precision", type=float, default=0.7)
     p.add_argument("--timing-risk-recalibrate-every", type=int, default=25)
     p.add_argument("--timing-global-ood-fraction", type=float, default=4.0)
     p.add_argument("--timing-global-ood-weight", type=float, default=0.0025)
@@ -359,6 +360,42 @@ def parse_args(argv=None):
     p.add_argument("--suffix-warmup", type=int, default=None,
                    help="smoothstep ramp of both suffix weights, steps "
                         "(default 1000)")
+    p.add_argument("--dls-terminal-frac", type=float, default=None,
+                   help="deterministic batch fraction receiving an arm-only "
+                        "DLS terminal lookahead (0 disables it)")
+    p.add_argument("--w-dls-terminal-cost", type=float, default=None,
+                   help="full-physics cost weight on the DLS-corrected "
+                        "straight-through trajectory")
+    p.add_argument("--w-dls-terminal-tie", type=float, default=None,
+                   help="Huber weight teaching the raw actor trajectory to "
+                        "internalize its detached DLS correction")
+    p.add_argument("--dls-terminal-steps", type=int, default=None,
+                   help="DLS iterations per active hand (default 1)")
+    p.add_argument("--dls-terminal-window", type=int, default=None,
+                   help="final approach knots over which to spread the "
+                        "terminal arm correction (default 16)")
+    p.add_argument("--dls-terminal-damping", type=float, default=None,
+                   help="DLS damping coefficient (default 0.05)")
+    p.add_argument("--dls-terminal-max-step-rad", type=float, default=None,
+                   help="per-iteration, per-joint DLS trust region in radians "
+                        "(default 0.35)")
+    p.add_argument("--terminal-lookahead-mode", choices=("dls", "curvature"),
+                   default=None, help="terminal teacher: current arm-only DLS "
+                        "or full-cost analytic trajectory-curvature step")
+    p.add_argument("--curvature-damping", type=float, default=None,
+                   help="positive diagonal regularizer for the trajectory solve")
+    p.add_argument("--curvature-position-weight", type=float, default=None,
+                   help="terminal contact-position Gauss-Newton curvature weight")
+    p.add_argument("--curvature-velocity-weight", type=float, default=None,
+                   help="terminal contact-velocity Gauss-Newton curvature weight")
+    p.add_argument("--curvature-max-step-rad", type=float, default=None,
+                   help="maximum absolute waypoint change in the curvature teacher")
+    p.add_argument("--curvature-direct-frac", type=float, default=None,
+                   help="fraction of actor rows whose trajectory-space backward "
+                        "gradient is directly curvature-preconditioned (default 0)")
+    p.add_argument("--curvature-direct-mix", type=float, default=None,
+                   help="mix between ordinary and norm-matched preconditioned "
+                        "trajectory gradient (default 1)")
     p.add_argument("--yaw-now-jitter", type=float, default=None,
                    help="std-dev (rad) of Gaussian jitter on the yaw_now "
                         "conditioning token, teaching the waist-sp head to "
@@ -457,9 +494,12 @@ def parse_args(argv=None):
                         "Default None keeps CostConfig's 0.0 = OFF")
     p.add_argument("--w-terminal-aim", type=float, default=None,
                    help="plain (non-AL) in-plane pull toward the AIM after a "
-                        "2 cm deadband.  phase2_cost_config default is 10; "
+                        "configurable deadband. phase2_cost_config default is 40; "
                         "pass 0 to restore CostConfig's off switch.  Does not "
                         "ride lam_terminal")
+    p.add_argument("--terminal-aim-deadband-m", type=float, default=None,
+                   help="in-plane terminal AIM deadband in metres; "
+                        "phase2_cost_config default is 0.005")
     p.add_argument("--tip-crossover-ramp", type=int, default=None,
                    help="steps over which tip_crossover ramps 0 -> 1 "
                         "(default: off, full from step 0)")
@@ -489,6 +529,18 @@ def parse_args(argv=None):
     p.add_argument("--w-waist-upright", type=float, default=None,
                    help="quadratic upright well on waist pitch/roll, rad^-2 "
                         "(CostConfig.w_waist_upright).  Yaw is excluded")
+    p.add_argument("--w-arm-compact", type=float, default=None,
+                   help="plain objective weight on active-arm COM-proxy height "
+                        "and horizontal reach beyond their deadbands (m^-2). "
+                        "Measured in the torso frame; q0 is excluded")
+    p.add_argument("--arm-compact-mode", choices=("linear", "hinge_sq"),
+                   default=None,
+                   help="linear continuously prices COM-proxy height+radius; "
+                        "hinge_sq preserves the old squared-ReLU deadbands")
+    p.add_argument("--arm-compact-height-max", type=float, default=None,
+                   help="free active-arm COM-proxy height in torso frame (m)")
+    p.add_argument("--arm-compact-radius-max", type=float, default=None,
+                   help="free active-arm COM-proxy horizontal radius from torso (m)")
     p.add_argument("--w-waist-pr-terminal", type=float, default=None,
                    help="economic-MPC V_f on waist P/R at the NEARER active hit, "
                         "rad^-2 (CostConfig.w_waist_pr_terminal).  Always vs 0. "
@@ -865,6 +917,13 @@ def parse_args(argv=None):
                    help="after total.backward(), cap ||g_torque||/||g|| to this "
                         "fraction (0=off).  Uses terms['torque'] incl. AL/PHR; "
                         "works with --line-search")
+    p.add_argument("--torque-grad-cap-refresh", type=int, default=1,
+                   help="exact torque-gradient cap VJP every N outer steps; "
+                        "reuse its EMA scale between refreshes")
+    p.add_argument("--torque-grad-cap-scale-ema", type=float, default=0.8,
+                   help="EMA decay for torque cap scales measured on refresh")
+    p.add_argument("--phase-timing-every", type=int, default=0,
+                   help="CUDA-event outer-step phase profile cadence (0=off)")
     p.add_argument("--replay-viol-downweight", type=float, default=0.0,
                    help="replay sampling beta: weight *= exp(-beta * harvested "
                         "torque violation); does not scale loss (0=off)")
@@ -907,6 +966,11 @@ def parse_args(argv=None):
                    choices=["adaptive", "fixed"],
                    help="search_interval_mode: adaptive K∈[1,10] or fixed "
                         "(default adaptive)")
+    p.add_argument("--line-search-initial-interval", type=int, default=None,
+                   help="initial/fixed successful updates between searches")
+    p.add_argument("--line-search-disable-early-triggers", action="store_true",
+                   help="do not let gradient/violation spikes search before "
+                        "the scheduled interval")
     p.add_argument("--line-search-expansion", type=float, default=None,
                    help="expansion_factor on last selected epsilon (default 1.1)")
     p.add_argument("--line-search-warmup-updates", type=int, default=None,
@@ -1785,6 +1849,9 @@ def main(argv=None) -> int:
             primary_base_tasks_per_512=int(
                 args.timing_primary_base_tasks_per_512
             ),
+            primary_anchor_per_task=int(
+                args.timing_primary_anchor_per_task
+            ),
             primary_boundary_per_task=int(
                 args.timing_primary_boundary_per_task
             ),
@@ -1852,12 +1919,24 @@ def main(argv=None) -> int:
                else {"w_tip_crossover": float(args.w_tip_crossover)}),
             **({} if args.w_terminal_aim is None
                else {"w_terminal_aim": float(args.w_terminal_aim)}),
+            **({} if args.terminal_aim_deadband_m is None
+               else {"terminal_aim_deadband_m": float(
+                   args.terminal_aim_deadband_m
+               )}),
             **({} if args.torque_physics is None
                else {"torque_physics": str(args.torque_physics)}),
             **({} if args.waist_pr_box is None
                else {"waist_pr_box": float(args.waist_pr_box)}),
             **({} if args.w_waist_upright is None
                else {"w_waist_upright": float(args.w_waist_upright)}),
+            **({} if args.w_arm_compact is None
+               else {"w_arm_compact": float(args.w_arm_compact)}),
+            **({} if args.arm_compact_mode is None
+               else {"arm_compact_mode": str(args.arm_compact_mode)}),
+            **({} if args.arm_compact_height_max is None
+               else {"arm_compact_height_max": float(args.arm_compact_height_max)}),
+            **({} if args.arm_compact_radius_max is None
+               else {"arm_compact_radius_max": float(args.arm_compact_radius_max)}),
             **({} if args.w_waist_pr_terminal is None
                else {"w_waist_pr_terminal": float(args.w_waist_pr_terminal)}),
             **({} if args.w_waist_aim is None
@@ -1915,6 +1994,9 @@ def main(argv=None) -> int:
         grad_balance_norm_ema=float(args.grad_balance_norm_ema),
         torque_grad_scale=float(args.torque_grad_scale),
         torque_grad_cap=float(args.torque_grad_cap),
+        torque_grad_cap_refresh=int(args.torque_grad_cap_refresh),
+        torque_grad_cap_scale_ema=float(args.torque_grad_cap_scale_ema),
+        phase_timing_every=int(args.phase_timing_every),
         replay_viol_downweight=float(args.replay_viol_downweight),
         replay_viol_uniform_mix=float(args.replay_viol_uniform_mix),
         replay_proficiency=bool(args.replay_proficiency),
@@ -1933,6 +2015,14 @@ def main(argv=None) -> int:
                else {"max_trials": int(args.line_search_max_trials)}),
             **({} if args.line_search_interval is None
                else {"search_interval_mode": str(args.line_search_interval)}),
+            **({} if args.line_search_initial_interval is None
+               else {
+                   "initial_interval": int(args.line_search_initial_interval),
+                   "min_interval": int(args.line_search_initial_interval),
+                   "max_interval": int(args.line_search_initial_interval),
+               }),
+            **({} if not args.line_search_disable_early_triggers
+               else {"search_on_early_triggers": False}),
             **({} if args.line_search_expansion is None
                else {"expansion_factor": float(args.line_search_expansion)}),
             **({} if args.line_search_warmup_updates is None
@@ -2021,6 +2111,34 @@ def main(argv=None) -> int:
         cfg.w_suffix_tie = float(args.w_suffix_tie)
     if args.suffix_warmup is not None:
         cfg.suffix_warmup = int(args.suffix_warmup)
+    if args.dls_terminal_frac is not None:
+        cfg.dls_terminal_frac = float(args.dls_terminal_frac)
+    if args.w_dls_terminal_cost is not None:
+        cfg.w_dls_terminal_cost = float(args.w_dls_terminal_cost)
+    if args.w_dls_terminal_tie is not None:
+        cfg.w_dls_terminal_tie = float(args.w_dls_terminal_tie)
+    if args.dls_terminal_steps is not None:
+        cfg.dls_terminal_steps = int(args.dls_terminal_steps)
+    if args.dls_terminal_window is not None:
+        cfg.dls_terminal_window = int(args.dls_terminal_window)
+    if args.dls_terminal_damping is not None:
+        cfg.dls_terminal_damping = float(args.dls_terminal_damping)
+    if args.dls_terminal_max_step_rad is not None:
+        cfg.dls_terminal_max_step_rad = float(args.dls_terminal_max_step_rad)
+    if args.terminal_lookahead_mode is not None:
+        cfg.terminal_lookahead_mode = str(args.terminal_lookahead_mode)
+    if args.curvature_damping is not None:
+        cfg.curvature_damping = float(args.curvature_damping)
+    if args.curvature_position_weight is not None:
+        cfg.curvature_position_weight = float(args.curvature_position_weight)
+    if args.curvature_velocity_weight is not None:
+        cfg.curvature_velocity_weight = float(args.curvature_velocity_weight)
+    if args.curvature_max_step_rad is not None:
+        cfg.curvature_max_step_rad = float(args.curvature_max_step_rad)
+    if args.curvature_direct_frac is not None:
+        cfg.curvature_direct_frac = float(args.curvature_direct_frac)
+    if args.curvature_direct_mix is not None:
+        cfg.curvature_direct_mix = float(args.curvature_direct_mix)
     if args.yaw_now_jitter is not None:
         cfg.yaw_now_jitter = float(args.yaw_now_jitter)
     if args.ramp_start is not None:

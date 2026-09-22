@@ -1,5 +1,15 @@
 # Task-Time Frontier Critic Implementation Plan
 
+> **Production amendment (2026-09-18):** This document records the original
+> guarded rollout plan.  The measured production curriculum now uses the
+> calibrated distributional critic to select timing pairs without a separate
+> actor/physics pre-admission evaluation.  Forty permanent 1-second anchor rows
+> remain in each 512-row batch; 40 critic-selected frontier and 160 looser
+> interior rows enter the normal actor pass directly, alongside 272
+> previous-step MPC rows.  That single normal pass supplies the exact critic
+> labels.  Accordingly, references below to an "exact verification barrier"
+> describe the superseded rollout design, not the current admission behavior.
+
 ## Implementation status
 
 The initial implementation now includes the Phase 0/1 contracts, shadow

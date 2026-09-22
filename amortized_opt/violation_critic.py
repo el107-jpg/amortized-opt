@@ -60,11 +60,11 @@ class ViolationCriticConfig:
     # away from support, the distinct priors preserve epistemic disagreement.
     randomized_prior_scale: float = 0.0
     batch_size: int = 256
-    # Four is the first online increase justified by the frozen-replay sweep.
-    # Effective reuse depends on actor-label influx: with critic batch 256 it
-    # is about 12.8 presentations/label for 80 new labels per outer step, 3.2
-    # for 320, and 1.6 for 640.  No actor or physics forwards are repeated.
-    updates_per_step: int = 4
+    # Effective reuse depends on actor-label influx. The actor now supplies
+    # hundreds of fresh exact labels per outer step, so one
+    # online update keeps pace without serializing four tiny optimizer steps on
+    # the actor's critical path.
+    updates_per_step: int = 1
     recent_capacity: int = 8192
     audit_capacity: int = 1024
     huber_delta: float = 1.0
@@ -98,12 +98,14 @@ class ViolationCriticConfig:
     collar_outside_probability: float = 0.10
 
     # Anchor-first primary actor mixture.  At batch 512, 40 independent base
-    # tasks are each expanded over the two-dimensional timing table into two
-    # conservative frontier points and four component-wise-looser interior
-    # points (240 rows).  The remaining 272 rows use the exact-confirmed MPC
-    # generation produced by the preceding outer step.
+    # tasks are each expanded into one permanent one-second anchor, one
+    # critic-selected frontier point, and four component-wise-looser interior
+    # points (240 rows).  The remaining 272 rows use the MPC generation from
+    # the preceding outer step.  Critic-selected rows are admitted directly;
+    # the ordinary actor pass supplies their exact labels once, in-batch.
     primary_base_tasks_per_512: int = 40
-    primary_boundary_per_task: int = 2
+    primary_anchor_per_task: int = 1
+    primary_boundary_per_task: int = 1
     primary_interior_per_task: int = 4
     # Exact physical ingress limits for the previous-generation MPC ring.
     # Joint and torque retain the ordinary close-feasibility rule below.
@@ -219,6 +221,8 @@ class ViolationCriticConfig:
             raise ValueError("assist_fraction must be in [0, 1]")
         if self.primary_base_tasks_per_512 < 1:
             raise ValueError("primary_base_tasks_per_512 must be positive")
+        if self.primary_anchor_per_task < 1:
+            raise ValueError("primary_anchor_per_task must be positive")
         if self.primary_boundary_per_task < 1:
             raise ValueError("primary_boundary_per_task must be positive")
         if self.primary_interior_per_task < 1:

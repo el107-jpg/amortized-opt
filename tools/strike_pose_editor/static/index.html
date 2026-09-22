@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Strike Pose Editor · Trajectory Teaching Studio</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">G1 drummer / interactive trajectory supervision</p>
+      <h1>Trajectory Teaching Studio</h1>
+    </div>
+    <div class="connection-cluster" aria-live="polite">
+      <span id="session-name" class="session-name">session —</span>
+      <span id="connection-status" class="status-pill pending">Connecting</span>
+    </div>
+  </header>
+
+  <main class="app-shell">
+    <aside class="panel scenario-panel" aria-label="Scenario and trajectory controls">
+      <section>
+        <div class="section-heading">
+          <div><p class="section-kicker">Teaching sample</p><h2>Scenario</h2></div>
+          <span id="scenario-status" class="mini-status">none</span>
+        </div>
+        <button id="sample-button" class="button primary full" type="button">Sample IL teaching task</button>
+        <dl id="scenario-facts" class="fact-list">
+          <div><dt>ID</dt><dd>—</dd></div><div><dt>Start</dt><dd>—</dd></div><div><dt>Hits</dt><dd>—</dd></div>
+        </dl>
+      </section>
+
+      <section>
+        <p class="section-kicker">Comparison</p><h2>Trajectories</h2>
+        <label class="field trajectory-field"><span>Edit / inspect</span><select id="trajectory-select" disabled><option>No scenario loaded</option></select></label>
+        <div id="overlay-controls" class="overlay-controls">
+          <label class="overlay-row base"><input id="overlay-base" type="checkbox" checked><span></span><b id="base-overlay-label">Current actor</b></label>
+          <label class="overlay-row teacher"><input id="overlay-teacher" type="checkbox" checked><span></span>Teacher path</label>
+          <label class="overlay-row adapted"><input id="overlay-adapted" type="checkbox" checked><span></span>Adapted path <small id="adapted-state">unavailable</small></label>
+        </div>
+        <div class="hand-visibility" role="group" aria-label="Visible hands">
+          <span class="visibility-label">Visible hands</span>
+          <label class="overlay-row hand left"><input id="show-left-hand" type="checkbox" checked><span></span>Left</label>
+          <label class="overlay-row hand right"><input id="show-right-hand" type="checkbox" checked><span></span>Right</label>
+        </div>
+      </section>
+
+      <section class="round-section">
+        <div class="section-heading">
+          <div><p class="section-kicker">Optimizer history</p><h2>Rounds</h2></div><span id="round-count" class="count-badge">0</span>
+        </div>
+        <div id="round-list" class="round-list"><p class="empty-state">Sample a scenario to begin.</p></div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <section class="panel viewport-panel">
+        <header class="viewport-toolbar">
+          <div><p class="section-kicker">Analytic FK</p><h2 id="viewport-title">No trajectory loaded</h2></div>
+          <div class="button-row"><button id="play-button" class="button ghost compact" type="button" disabled>▶ Play</button><button id="camera-button" class="button ghost compact" type="button">Reset view</button></div>
+        </header>
+        <div class="canvas-wrap">
+          <canvas id="trajectory-canvas" aria-label="Orbitable three-dimensional trajectory preview"></canvas>
+          <div class="canvas-help">Drag to orbit · wheel to zoom · dashed stick + bullseye show the unsolved IK target · torso/legs are a planted visual reference</div>
+          <div class="canvas-legend" aria-hidden="true"><span class="base" id="base-legend-label">Current actor</span><span class="teacher">Teacher</span><span class="adapted">Adapted</span><span class="target">IK target</span></div>
+        </div>
+        <div class="timeline-block">
+          <div class="timeline-readout"><label for="time-slider">Waypoint <strong id="waypoint-value">1 / 50</strong></label><span id="time-value">t = 0.02 s</span></div>
+          <div class="timeline-track"><input id="time-slider" type="range" min="0" max="49" step="1" value="0" disabled><div id="hit-markers" class="hit-markers" aria-hidden="true"></div></div>
+        </div>
+      </section>
+
+      <section class="panel diagnostics-panel">
+        <div class="section-heading"><div><p class="section-kicker">Selected trajectory</p><h2>Diagnostics</h2></div><span id="diagnostic-status" class="mini-status">waiting</span></div>
+        <div id="feasibility-banner" class="feasibility-banner unknown" aria-live="polite">
+          <div><strong id="feasibility-title">Feasibility not evaluated</strong><p id="feasibility-detail">Select a trajectory to inspect the backend's physical acceptance checks.</p></div>
+          <span id="feasibility-mark">?</span>
+        </div>
+        <div id="feasibility-checks" class="feasibility-checks"></div>
+        <div id="metrics" class="metrics-grid"></div><div id="warnings" class="warnings" aria-live="polite"></div>
+      </section>
+    </section>
+
+    <aside class="panel waypoint-panel joint-editor-panel" aria-label="Task-space and joint editor">
+      <div class="section-heading">
+        <div><p class="section-kicker">Selected hit</p><h2>Task-space pose</h2></div>
+        <div class="button-row"><button id="reset-waypoint-button" class="button ghost compact" type="button" disabled>Reset</button><button id="copy-neighbor-button" class="button ghost compact" type="button" disabled>Blend</button></div>
+      </div>
+      <section class="task-space-card">
+        <div class="task-space-toolbar">
+          <label class="field"><span>Hand / terminal</span><select id="ik-hand" disabled><option value="left">Left hit</option><option value="right">Right hit</option></select></label>
+          <button id="ik-load-hit" class="button ghost compact" type="button" disabled>Go to hit</button>
+        </div>
+        <p class="task-help">Set the stick contact and shaft direction. The bullseye and dashed stick update before IK. Waist angles are exact; azimuth/elevation take priority over the precise contact point.</p>
+        <div class="task-subheading">Contact · pelvis frame</div>
+        <div class="task-range-grid three">
+          <label class="task-range"><span>X <output id="ik-contact-x-value">—</output></span><input id="ik-contact-x" data-ik-field type="range" step="0.002" disabled></label>
+          <label class="task-range"><span>Y <output id="ik-contact-y-value">—</output></span><input id="ik-contact-y" data-ik-field type="range" step="0.002" disabled></label>
+          <label class="task-range"><span>Z <output id="ik-contact-z-value">—</output></span><input id="ik-contact-z" data-ik-field type="range" step="0.002" disabled></label>
+        </div>
+        <div class="task-subheading">Stick direction</div>
+        <div class="task-range-grid">
+          <label class="task-range"><span>Azimuth <output id="ik-azimuth-value">—</output></span><input id="ik-azimuth" data-ik-field type="range" min="-180" max="180" step="0.5" disabled></label>
+          <label class="task-range"><span>Elevation <output id="ik-elevation-value">—</output></span><input id="ik-elevation" data-ik-field type="range" min="-89" max="89" step="0.5" disabled></label>
+        </div>
+        <div class="task-subheading">Waist · exact</div>
+        <div class="task-range-grid three">
+          <label class="task-range"><span>Yaw <output id="ik-waist-yaw-value">—</output></span><input id="ik-waist-yaw" data-ik-field type="range" step="0.005" disabled></label>
+          <label class="task-range"><span>Pitch <output id="ik-waist-pitch-value">—</output></span><input id="ik-waist-pitch" data-ik-field type="range" step="0.005" disabled></label>
+          <label class="task-range"><span>Roll <output id="ik-waist-roll-value">—</output></span><input id="ik-waist-roll" data-ik-field type="range" step="0.005" disabled></label>
+        </div>
+        <label class="ik-auto"><input id="ik-auto" type="checkbox" checked><span>Automatically solve after edits</span></label>
+        <div class="action-grid"><button id="ik-solve" class="button primary" type="button" disabled>Solve elbow-down IK</button><button id="ik-clear-guides" class="button ghost" type="button" disabled>Clear joint guides</button></div>
+        <div id="ik-status" class="ik-status">Load a scenario to initialize the hit target.</div>
+        <div id="ik-metrics" class="ik-metrics"></div>
+      </section>
+      <details class="advanced-joints">
+        <summary>Advanced joint adjustments <span id="ik-guide-count">0 guides</span></summary>
+        <p class="task-help">The waist and selected arm are editable. The opposite arm is reference-only and remains protected by base-policy distillation.</p>
+        <div id="joint-controls" class="joint-controls"><p class="empty-state">Load a scenario to edit its waypoints.</p></div>
+      </details>
+    </aside>
+
+    <aside class="panel teaching-panel" aria-label="Keyframes, optimization, and training">
+      <section>
+        <p class="section-kicker">Constraint at waypoint</p><h2>Keyframe</h2>
+        <div class="segmented" role="radiogroup" aria-label="Keyframe type">
+          <label><input type="radio" name="keyframe-mode" value="soft" checked><span>Soft</span></label><label><input type="radio" name="keyframe-mode" value="hard"><span>Hard</span></label>
+        </div>
+        <label class="range-field" for="keyframe-weight"><span class="range-label"><span>Soft weight</span><output id="keyframe-weight-value">1.0×</output></span><input id="keyframe-weight" type="range" min="0.1" max="10" step="0.1" value="1"></label>
+        <button id="keyframe-button" class="button primary full" type="button" disabled>Add / update joint keyframe</button>
+        <div id="keyframe-list" class="keyframe-list"><p class="empty-state">No keyframes in this scenario.</p></div>
+      </section>
+
+      <section>
+        <p class="section-kicker">Physics-constrained solve</p><h2>Teacher optimization</h2>
+        <p class="muted">Optimize automatically carries the selected hand's displayed contact, stick direction, waist, and IK seed into a persistent terminal task. Joint keyframes are optional extra posture guidance. Saving supervises only the selected arm plus waist.</p>
+        <div class="action-grid"><button id="optimize-button" class="button primary" type="button" disabled>Optimize</button><button id="reoptimize-button" class="button secondary" type="button" disabled>Reoptimize</button></div>
+        <button id="save-teacher-button" class="button secondary full spaced" type="button" disabled>Save selected-hand teacher</button>
+      </section>
+
+      <section>
+        <p class="section-kicker">Adapter experiment</p><h2>Quick IL train</h2>
+        <p class="muted">Launch an isolated adapter-only job. Editing remains responsive while the job runs.</p>
+        <div class="train-presets"><button class="button ghost train-button" type="button" data-steps="100" disabled>100 steps</button><button class="button ghost train-button" type="button" data-steps="500" disabled>500 steps</button><button class="button ghost train-button" type="button" data-steps="1000" disabled>1k steps</button></div>
+        <div id="job-card" class="job-card" hidden><div class="job-heading"><strong id="job-title">Training</strong><span id="job-percent">0%</span></div><div class="progress-track"><span id="job-progress"></span></div><p id="job-detail">Queued…</p></div>
+      </section>
+
+      <p id="action-message" class="action-message" aria-live="polite"></p>
+    </aside>
+  </main>
+
+  <template id="metric-template"><article class="metric-card"><span class="metric-label"></span><strong class="metric-value"></strong></article></template>
+</body>
+</html>

@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from .constants import (
+    FIXED_LOWER_BODY_CAPSULES,
     HEAD_SPHERE,
     PELVIS_IN_ENV,
     STICK_RADIUS,
@@ -230,6 +231,36 @@ def segment_segment_sdf(
     diff = (a0 + s.unsqueeze(-1) * d1) - (b0 + t.unsqueeze(-1) * d2)
     dist = torch.sqrt((diff * diff).sum(dim=-1) + _EPS**2)
     return dist - ra - rb
+
+
+def fixed_capsule_self_sdf(
+    butt: torch.Tensor,
+    tip: torch.Tensor,
+    wrist: torch.Tensor,
+    capsule_a: torch.Tensor,
+    capsule_b: torch.Tensor,
+    capsule_r: torch.Tensor,
+    *,
+    stick_radius: float,
+    wrist_radius: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stick/wrist SDF to a bank of pelvis-fixed body capsules.
+
+    ``butt``, ``tip`` and ``wrist`` have arbitrary matching leading dimensions
+    followed by ``3``; the capsule bank has shape ``(K, 3)`` / ``(K,)``.  The
+    returned stick and wrist distances have the input leading shape, reduced by
+    the closest fixed body proxy.  This makes the lower-body representation
+    reusable by the training cost, start screen and evaluator.
+    """
+    stick = segment_segment_sdf(
+        butt.unsqueeze(-2), tip.unsqueeze(-2), capsule_a, capsule_b,
+        stick_radius, capsule_r,
+    ).amin(dim=-1)
+    wrist_sdf = (
+        point_capsule_sdf(wrist.unsqueeze(-2), capsule_a, capsule_b, capsule_r)
+        - wrist_radius
+    ).amin(dim=-1)
+    return stick, wrist_sdf
 
 
 def _match_lead(x, ref: torch.Tensor) -> torch.Tensor:
@@ -588,6 +619,9 @@ class SdfPenalty:
         hc, hr = HEAD_SPHERE
         self.head_c = t(hc)
         self.head_r = float(hr)
+        self.lower_a = t([x[1] for x in FIXED_LOWER_BODY_CAPSULES])
+        self.lower_b = t([x[2] for x in FIXED_LOWER_BODY_CAPSULES])
+        self.lower_r = t([x[3] for x in FIXED_LOWER_BODY_CAPSULES])
 
     # ------------------------------------------------------------------ core --
     def _cylinder_centers(self, head_centers: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -712,8 +746,17 @@ class SdfPenalty:
                 s_h = segment_segment_sdf(butt, tip, hc, hc, self.stick_r, self.head_r)
                 s_wt = point_capsule_sdf(wrist, a, b, self.torso_r) - self.wrist_r
                 s_wh = point_sphere_sdf(wrist, hc, self.head_r) - self.wrist_r
-                sdf_st = torch.minimum(s_t, s_h)
-                sdf_wr = torch.minimum(s_wt, s_wh)
+                # Fixed lower body lives in the same scene frame as the
+                # pelvis-rooted analytic FK; ``off`` only changes env/pelvis
+                # representation, so apply it to its capsule bank too.
+                lower_a = self.lower_a.to(dtype) + off
+                lower_b = self.lower_b.to(dtype) + off
+                s_lower_st, s_lower_wr = fixed_capsule_self_sdf(
+                    butt, tip, wrist, lower_a, lower_b, self.lower_r.to(dtype),
+                    stick_radius=self.stick_r, wrist_radius=self.wrist_r,
+                )
+                sdf_st = torch.minimum(torch.minimum(s_t, s_h), s_lower_st)
+                sdf_wr = torch.minimum(torch.minimum(s_wt, s_wh), s_lower_wr)
                 pen_self = pen_self + self._hinge(sdf_st) + self._hinge(sdf_wr)
                 min_sdf = torch.minimum(min_sdf, torch.minimum(sdf_st, sdf_wr))
                 hand_min = torch.minimum(hand_min, torch.minimum(sdf_st, sdf_wr))

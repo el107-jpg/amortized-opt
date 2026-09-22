@@ -34,7 +34,13 @@ import torch
 
 from .constants import G1_UPPER_BODY_JOINTS
 
-__all__ = ["StrikeImpedanceConfig", "StrikeImpedance", "distal_joint_masks"]
+__all__ = [
+    "StrikeImpedanceConfig",
+    "StrikeImpedance",
+    "ContactAwareStrikeImpedanceConfig",
+    "ContactAwareStrikeImpedance",
+    "distal_joint_masks",
+]
 
 #: Joint-name substrings that mark the distal (softened) part of each arm.
 _DISTAL = ("elbow", "wrist")
@@ -138,4 +144,134 @@ class StrikeImpedance:
         self._since = torch.where(
             fired.to(self.device), torch.zeros_like(self._since),
             (self._since + 1).clamp(max=self._FAR),
+        )
+
+
+@dataclass
+class ContactAwareStrikeImpedanceConfig:
+    """Real-contact impedance policy for Isaac deployment.
+
+    By default the incoming strike keeps nominal gains.  After its scheduled
+    instant, ``followthrough_wp`` softens the distal joints long enough for
+    inertia to finish a slightly late stroke.  A measured contact starts a
+    separate compliance window; persistent contact continually refreshes that
+    window, and gains then ramp smoothly back to nominal over ``recovery_wp``
+    ticks.  Set ``before_wp >= 0`` only for experiments that also soften the
+    incoming strike (0 = strike tick only).
+
+    Tick counts are control ticks, not physics substeps.  On the standard 50 Hz
+    controller, ``followthrough_wp=1`` is 20 ms, ``contact_hold_wp=3`` is 60 ms,
+    and ``recovery_wp=3`` is a further 60 ms ramp.
+    """
+
+    kp_scale: float = 0.5
+    kd_scale: float = 0.7
+    before_wp: int = -1
+    followthrough_wp: int = 1
+    contact_hold_wp: int = 3
+    recovery_wp: int = 3
+
+    def __post_init__(self) -> None:
+        for what, value in (("kp_scale", self.kp_scale), ("kd_scale", self.kd_scale)):
+            if not 0.0 < float(value) <= 1.0:
+                raise ValueError(f"{what} must be in (0, 1], got {value}")
+        for what, value in (
+            ("before_wp", self.before_wp),
+            ("followthrough_wp", self.followthrough_wp),
+            ("contact_hold_wp", self.contact_hold_wp),
+            ("recovery_wp", self.recovery_wp),
+        ):
+            minimum = -1 if what == "before_wp" else 0
+            if int(value) < minimum:
+                raise ValueError(f"{what} must be >= {minimum}, got {value}")
+            setattr(self, what, int(value))
+
+
+class ContactAwareStrikeImpedance:
+    """Per-hand scheduled-followthrough/contact-recovery gain scheduler.
+
+    Call :meth:`scales` before executing a control tick, then :meth:`observe`
+    after the physics substeps with both the schedule's fired mask and a contact
+    mask accumulated across those substeps.  No velocity is edited: momentum is
+    governed solely by the physical contact solver and the softened PD loop.
+    """
+
+    _FAR = 1_000_000
+
+    def __init__(
+        self,
+        cfg: ContactAwareStrikeImpedanceConfig,
+        batch: int,
+        device: torch.device | str = "cpu",
+        joint_names: tuple[str, ...] = G1_UPPER_BODY_JOINTS,
+    ):
+        self.cfg = cfg
+        self.device = torch.device(device)
+        self._mask = distal_joint_masks(joint_names).to(self.device)
+        shape = (int(batch), 2)
+        self._since_schedule = torch.full(
+            shape, self._FAR, device=self.device, dtype=torch.long,
+        )
+        self._since_contact = torch.full(
+            shape, self._FAR, device=self.device, dtype=torch.long,
+        )
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            self._since_schedule.fill_(self._FAR)
+            self._since_contact.fill_(self._FAR)
+            return
+        ids = env_ids.to(device=self.device, dtype=torch.long)
+        self._since_schedule[ids] = self._FAR
+        self._since_contact[ids] = self._FAR
+
+    def _event_depth(self, age: torch.Tensor, hold_wp: int) -> torch.Tensor:
+        """Full compliance for ``hold_wp`` ticks, followed by a linear ramp."""
+        x = age.to(self._mask.dtype)
+        hold = int(hold_wp)
+        recovery = int(self.cfg.recovery_wp)
+        full = x < float(hold)
+        if recovery == 0:
+            return full.to(self._mask.dtype)
+        ramp = ((float(hold + recovery) - x) / float(recovery + 1)).clamp(0.0, 1.0)
+        return torch.where(full, torch.ones_like(ramp), ramp)
+
+    def scales(self, ticks_to_hit: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-joint Kp/Kd multipliers for the coming control tick."""
+        tth = ticks_to_hit.to(device=self.device, dtype=self._mask.dtype)
+        if self.cfg.before_wp < 0:
+            approach = torch.zeros_like(tth)
+        else:
+            width = float(self.cfg.before_wp) + 1.0
+            approach = ((width - tth) / width).clamp(0.0, 1.0) * (tth >= 0)
+        follow = self._event_depth(self._since_schedule, self.cfg.followthrough_wp)
+        contact = self._event_depth(self._since_contact, self.cfg.contact_hold_wp)
+        depth = torch.maximum(approach, torch.maximum(follow, contact))
+        weight = depth @ self._mask
+        kp_mul = 1.0 + weight * (float(self.cfg.kp_scale) - 1.0)
+        kd_mul = 1.0 + weight * (float(self.cfg.kd_scale) - 1.0)
+        return kp_mul, kd_mul
+
+    def observe(self, fired: torch.Tensor, contact: torch.Tensor) -> None:
+        """Advance state from ``(B,2)`` scheduled-fire and real-contact masks."""
+        fired = fired.to(device=self.device, dtype=torch.bool)
+        contact = contact.to(device=self.device, dtype=torch.bool)
+        if fired.shape != self._since_schedule.shape:
+            raise ValueError(
+                f"fired must have shape {tuple(self._since_schedule.shape)}, "
+                f"got {tuple(fired.shape)}"
+            )
+        if contact.shape != self._since_contact.shape:
+            raise ValueError(
+                f"contact must have shape {tuple(self._since_contact.shape)}, "
+                f"got {tuple(contact.shape)}"
+            )
+        self._since_schedule = torch.where(
+            fired, torch.zeros_like(self._since_schedule),
+            (self._since_schedule + 1).clamp(max=self._FAR),
+        )
+        # A sustained contact refreshes the compliance hold every control tick.
+        self._since_contact = torch.where(
+            contact, torch.zeros_like(self._since_contact),
+            (self._since_contact + 1).clamp(max=self._FAR),
         )

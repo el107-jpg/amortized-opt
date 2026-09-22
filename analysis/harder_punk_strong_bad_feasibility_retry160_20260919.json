@@ -1,0 +1,117 @@
+{
+  "summary": {
+    "diagnostics": "analysis/harder_punk_30s_hit_diagnostics_states_20260919.json",
+    "cohort": "strong_bad",
+    "lead_s_requested": 0.35,
+    "states": 6,
+    "feasible": 0,
+    "infeasible": 6,
+    "timeout": 0,
+    "feasible_fraction": 0.0,
+    "elapsed_s": 643.9647600890021,
+    "seconds_per_state": 107.32746001483368,
+    "by_drum": {
+      "cymbal_left": {
+        "infeasible": 1
+      },
+      "floor_tom": {
+        "infeasible": 2
+      },
+      "hihat": {
+        "infeasible": 1
+      },
+      "snare": {
+        "infeasible": 1
+      },
+      "tom1": {
+        "infeasible": 1
+      }
+    }
+  },
+  "cases": [
+    {
+      "scheduled_time_s": 11.94,
+      "hand": "right",
+      "drum": "tom1",
+      "horizon_s": 0.12,
+      "proposed": {
+        "axial_mm": -89.72785621881485,
+        "lateral_beyond_mm": -27.250294685363773,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 146.1829833984375,
+      "status": "infeasible",
+      "teacher_rows": 0
+    },
+    {
+      "scheduled_time_s": 17.66,
+      "hand": "right",
+      "drum": "floor_tom",
+      "horizon_s": 0.26,
+      "proposed": {
+        "axial_mm": 127.91697680950165,
+        "lateral_beyond_mm": 193.3956611156464,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 58.25455856323242,
+      "status": "infeasible",
+      "teacher_rows": 0
+    },
+    {
+      "scheduled_time_s": 24.52,
+      "hand": "left",
+      "drum": "snare",
+      "horizon_s": 0.14,
+      "proposed": {
+        "axial_mm": -181.94594979286194,
+        "lateral_beyond_mm": 166.11165523529053,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 100.403076171875,
+      "status": "infeasible",
+      "teacher_rows": 0
+    },
+    {
+      "scheduled_time_s": 24.78,
+      "hand": "left",
+      "drum": "hihat",
+      "horizon_s": 0.12,
+      "proposed": {
+        "axial_mm": -71.31441682577133,
+        "lateral_beyond_mm": 60.281327366828926,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 36.65948486328125,
+      "status": "infeasible",
+      "teacher_rows": 0
+    },
+    {
+      "scheduled_time_s": 25.34,
+      "hand": "right",
+      "drum": "floor_tom",
+      "horizon_s": 0.12,
+      "proposed": {
+        "axial_mm": 115.5250146985054,
+        "lateral_beyond_mm": 114.86001491546632,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 306.9984130859375,
+      "status": "infeasible",
+      "teacher_rows": 0
+    },
+    {
+      "scheduled_time_s": 25.6,
+      "hand": "left",
+      "drum": "cymbal_left",
+      "horizon_s": 0.36,
+      "proposed": {
+        "axial_mm": -83.82658660411835,
+        "lateral_beyond_mm": 191.6372835636139,
+        "in_hit_region": false
+      },
+      "tracking_rms_mrad": 120.58474731445312,
+      "status": "infeasible",
+      "teacher_rows": 0
+    }
+  ]
+}

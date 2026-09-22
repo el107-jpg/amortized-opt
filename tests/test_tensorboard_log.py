@@ -22,6 +22,10 @@ def test_scalars_from_train_record():
         "roller": {
             "timing_boundary_accepted": 3.0,
             "timing_mpc_refresh": 7.0,
+            "dls_terminal_err_before_m": 0.08,
+            "dls_terminal_err_after_m": 0.02,
+            "curvature_teacher_accept_frac": 0.75,
+            "curvature_direct_cosine": 0.6,
             "unrelated": 99.0,
         },
         "cfg": {"max_steps": 20000},
@@ -40,6 +44,10 @@ def test_scalars_from_train_record():
     assert "timing_critic/curriculum_open" in tags
     assert "timing_curriculum/boundary_accepted" in tags
     assert "timing_curriculum/mpc_refresh" in tags
+    assert "terminal_dls/err_before_m" in tags
+    assert "terminal_dls/err_after_m" in tags
+    assert "terminal_curvature/accept_frac" in tags
+    assert "curvature_direct/cosine" in tags
     assert "timing_curriculum/unrelated" not in tags
     assert "train/cost" not in tags
     assert all(p[2] == 50 for p in pairs)
