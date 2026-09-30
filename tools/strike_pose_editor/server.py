@@ -26,11 +26,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .domain import DomainValidationError, EditorDomain
 from .il_train import collate_training_records, load_backbone, save_teacher_bundle
+from .hpipm_backend import (
+    HpipmUnavailable,
+    hpipm_available,
+    solve_hpipm_trajectory,
+)
 from .trajectory_opt import (
     DirectTrajectoryOptimizer,
     TaskSpaceConstraint,
     TrajectoryScenario,
     WaypointKeyframe,
+    quintic_terminal_initialization,
     sample_trajectory_scenario,
     warp_terminal_approach,
 )
@@ -276,6 +282,10 @@ class OptimizeRequest(BaseModel):
 
     iterations: int = Field(default=60, ge=1, le=500)
     lr: float = Field(default=1.0e-3, gt=0.0, le=0.1)
+    backend: str = Field(default="auto", pattern="^(auto|hpipm|adam)$")
+    sqp_initialization: str = Field(
+        default="current", pattern="^(current|quintic)$"
+    )
     task_constraint: TaskConstraintRequest | None = None
 
 
@@ -306,6 +316,8 @@ class ScenarioRecord:
     adapted: list[list[float]] | None = None
     geometry: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
     base_diagnostics: dict[str, Any] | None = None
+    optimizer_backend: str | None = None
+    backend_diagnostics: dict[str, Any] | None = None
 
 
 @dataclasses.dataclass
@@ -468,6 +480,8 @@ def create_app(
         diagnostics: dict[str, Any] = {}
         if record.rounds:
             latest = record.optimizer.result_json(include_geometry=True)
+            if record.backend_diagnostics is not None:
+                latest["diagnostics"]["optimizer_backend"] = record.backend_diagnostics
             trajectories["teacher"] = latest["trajectory"]
             geometries["teacher"] = latest["geometry"]
             diagnostics["teacher"] = latest["diagnostics"]
@@ -492,6 +506,8 @@ def create_app(
                     record.task_constraint.to_json()
                     if record.task_constraint is not None else None
                 ),
+                "optimizer_backend": record.optimizer_backend,
+                "optimizer_backend_diagnostics": record.backend_diagnostics,
             }
         )
         return data
@@ -547,6 +563,7 @@ def create_app(
 
     @app.get("/api/config")
     async def get_config() -> dict[str, Any]:
+        has_hpipm, hpipm_error = hpipm_available()
         out = domain.config()
         out.update(
             {
@@ -556,6 +573,21 @@ def create_app(
                 "checkpoint_available": app.state.checkpoint.is_file(),
                 "actor_loaded": app.state.actor is not None,
                 "sampling_mode": "random_il_teaching",
+                "optimizer_backends": [
+                    {
+                        "id": "hpipm",
+                        "label": "HPIPM SQP",
+                        "available": has_hpipm,
+                        "unavailable_reason": hpipm_error,
+                    },
+                    {
+                        "id": "adam",
+                        "label": "Adam fallback",
+                        "available": True,
+                        "unavailable_reason": None,
+                    },
+                ],
+                "default_optimizer_backend": "hpipm" if has_hpipm else "adam",
             }
         )
         return out
@@ -748,6 +780,17 @@ def create_app(
     ) -> dict[str, Any]:
         with app.state.trajectory_lock:
             record = get_scenario(scenario_id)
+            has_hpipm, hpipm_error = hpipm_available()
+            backend = body.backend
+            if backend == "auto":
+                backend = "hpipm" if has_hpipm else "adam"
+            if backend == "hpipm" and not has_hpipm:
+                raise HTTPException(status_code=409, detail=hpipm_error)
+            if backend != "hpipm" and body.sqp_initialization != "current":
+                raise HTTPException(
+                    status_code=422,
+                    detail="quintic SQP initialization requires the HPIPM backend",
+                )
             if body.task_constraint is not None:
                 requested = body.task_constraint
                 terminal_q = domain.validate_pose(
@@ -758,8 +801,8 @@ def create_app(
                     contact_position=requested.contact_position,
                     stick_direction=requested.stick_direction,
                     waist=requested.waist,
+                    terminal_q=requested.terminal_q,
                 )
-                previous = record.optimizer.trajectory.detach().clone()
                 hit_col = 0 if requested.hand == "left" else 1
                 hit_row = int(record.scenario.hit_index[0, hit_col].item()) - 1
                 selected_cols = [
@@ -767,12 +810,17 @@ def create_app(
                     if name.startswith("waist_")
                     or name.startswith(f"{requested.hand}_")
                 ]
-                previous = warp_terminal_approach(
-                    previous,
-                    terminal_q,
-                    hit_waypoint=hit_row + 1,
-                    joint_indices=selected_cols,
-                )
+                if backend == "hpipm" and body.sqp_initialization == "quintic":
+                    previous = quintic_terminal_initialization(
+                        record.scenario, terminal_q, hand=requested.hand
+                    )
+                else:
+                    previous = warp_terminal_approach(
+                        record.optimizer.trajectory.detach().clone(),
+                        terminal_q,
+                        hit_waypoint=hit_row + 1,
+                        joint_indices=selected_cols,
+                    )
                 active_keyframes = [
                     row for row in record.keyframes
                     if row.get("hand") in (None, requested.hand)
@@ -798,15 +846,90 @@ def create_app(
                 record.task_constraint = constraint
                 record.saved = False
                 record.geometry.pop("teacher", None)
-            if not math.isclose(record.optimizer.learning_rate, body.lr):
-                for group in record.optimizer.optimizer.param_groups:
-                    group["lr"] = body.lr
-                record.optimizer.learning_rate = body.lr
-            result = record.optimizer.solve(
-                max_iterations=body.iterations,
-                min_iterations=min(40, body.iterations),
-                patience=min(30, max(body.iterations // 4, 1)),
-            )
+            backend_diagnostics: dict[str, Any]
+            if backend == "hpipm":
+                if record.task_constraint is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="HPIPM SQP requires a solved task-space IK target",
+                    )
+                before = record.optimizer
+                try:
+                    hpipm_result = solve_hpipm_trajectory(
+                        record.scenario,
+                        before.trajectory.detach(),
+                        task_constraint=record.task_constraint,
+                        keyframes=before.keyframes,
+                        max_iterations=body.iterations,
+                    )
+                    candidate = DirectTrajectoryOptimizer(
+                        record.scenario,
+                        initial_trajectory=hpipm_result.trajectory,
+                        keyframes=before.keyframes,
+                        task_constraints=[record.task_constraint],
+                        learning_rate=body.lr,
+                    )
+                except HpipmUnavailable as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422, detail=f"HPIPM SQP failed: {exc}"
+                    ) from exc
+
+                def score(optimizer: DirectTrajectoryOptimizer) -> tuple[float, ...]:
+                    payload = optimizer.result_json(include_geometry=False)
+                    feasibility = payload["diagnostics"]["feasibility"]
+                    return (
+                        0.0 if bool(feasibility["feasible"]) else 1.0,
+                        0.0 if bool(feasibility["feasible"]) else float(
+                            feasibility["normalized_violation_score"]
+                        ),
+                        float(payload["diagnostics"]["objective"]),
+                    )
+
+                candidate_selected = score(candidate) < score(before)
+                record.optimizer = candidate if candidate_selected else before
+                record.optimizer.iteration = int(hpipm_result.iterations)
+                record.optimizer._converged = bool(hpipm_result.converged)
+                record.optimizer._stop_reason = (
+                    "hpipm_sqp" if candidate_selected
+                    else "hpipm_rescore_kept_warmstart"
+                )
+                backend_diagnostics = {
+                    **hpipm_result.diagnostics,
+                    "backend": "hpipm",
+                    "requested_backend": body.backend,
+                    "sqp_initialization": body.sqp_initialization,
+                    "sqp_initialization_source": (
+                        "fresh_velocity_matched_terminal_quintic"
+                        if body.sqp_initialization == "quintic"
+                        else "current_trajectory_terminal_warp"
+                    ),
+                    "candidate_selected_by_fused_cost": candidate_selected,
+                }
+                result = record.optimizer.result_json()
+            else:
+                if not math.isclose(record.optimizer.learning_rate, body.lr):
+                    for group in record.optimizer.optimizer.param_groups:
+                        group["lr"] = body.lr
+                    record.optimizer.learning_rate = body.lr
+                result = record.optimizer.solve(
+                    max_iterations=body.iterations,
+                    min_iterations=min(40, body.iterations),
+                    patience=min(30, max(body.iterations // 4, 1)),
+                )
+                backend_diagnostics = {
+                    "backend": "adam",
+                    "requested_backend": body.backend,
+                    "iterations": int(result["iteration"]),
+                    "converged": bool(
+                        result["diagnostics"]["convergence"]["converged"]
+                    ),
+                    "message": result["diagnostics"]["convergence"]["reason"],
+                }
+            record.optimizer_backend = backend
+            record.backend_diagnostics = backend_diagnostics
+            result["diagnostics"]["optimizer_backend"] = backend_diagnostics
             record.geometry["teacher"] = result["geometry"]
             record.rounds.append(
                 {
@@ -816,6 +939,12 @@ def create_app(
                     "diagnostics": result["diagnostics"],
                     "keyframes": result["keyframes"],
                     "status": "complete",
+                    "backend": backend,
+                    "backend_diagnostics": backend_diagnostics,
+                    "hand": (
+                        record.task_constraint.hand
+                        if record.task_constraint is not None else None
+                    ),
                 }
             )
             record.saved = False
@@ -861,6 +990,8 @@ def create_app(
                     "scenario_id": scenario_id,
                     "saved_at": _utc_now(),
                     "iterations": record.optimizer.iteration,
+                    "optimizer_backend": record.optimizer_backend,
+                    "optimizer_backend_diagnostics": record.backend_diagnostics,
                     "teaching_hand": body.hand,
                     "task_constraint": record.task_constraint.to_json(),
                     "keyframes": record.optimizer.keyframes_json(),

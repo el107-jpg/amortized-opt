@@ -3,7 +3,7 @@
 Two callables with the harness signature ``plan(case) -> PlanResult``:
 
 * :func:`quintic_case_planner` -- the phase-1 *target* generator turned into a
-  planner: the same per-arm quintic straight line to the goal-pose library plus
+  planner: the same per-arm accelerating strike seed to the goal-pose library plus
   the waist-aim yaw ramp that :mod:`amortized_opt.warmstart` builds.  This is
   the reference line the warm-started transformer should reach (and no more --
   it is exactly what phase 1 imitates).
@@ -97,7 +97,7 @@ def quintic_case_planner(
     joint_names=G1_UPPER_BODY_JOINTS,
     waist_upright_ease_wp: int | None = None,
 ):
-    """The raw quintic + waist-aim seed, as a harness planner."""
+    """The raw strike + waist-aim seed, as a harness planner (legacy name)."""
     lib = library or GoalPoseLibrary(joint_names=tuple(joint_names))
 
     def plan(case: EvalCase) -> PlanResult:
@@ -209,8 +209,12 @@ class ModelPlanner:
             if (self.amp_dtype is not None and dev.type == "cuda")
             else torch.autocast(device_type="cuda", enabled=False)
         )
+        core = self.model.module if hasattr(self.model, "module") else self.model
         with amp:
-            enc = self.model.encode_context(ctx)
+            enc = core.encode_context(ctx)
+            terminal_seed = core.terminal_initializer is not None
+            if terminal_seed and self.init != "hold":
+                init = core.initial_trajectory(ctx, state, masks).to(init.dtype)
             if self.init != "hold":
                 if enc.waist_pr_sp is not None:
                     init = seed_waist_pr_to_sp(
@@ -219,19 +223,21 @@ class ModelPlanner:
                         joint_names=self.joint_names, dt=float(case.dt),
                         ease_wp=self.waist_upright_ease_wp,
                     )
-                hit = torch.full((1, 2), -1, device=dev, dtype=torch.long)
-                hit[0, 0 if case.hand == "left" else 1] = int(case.N)
-                aims = torch.zeros(1, 2, 3, device=dev, dtype=init.dtype)
-                aims[0, 0 if case.hand == "left" else 1] = t(
-                    np.asarray(case.strike.position, float) + PELVIS_IN_ENV
-                )
-                init = correct_quintic_init_arms(
-                    self._chain_fk(dev, init.dtype), init, state[:, : len(self.joint_names)],
-                    hit, aims, steps=1, q_bounds=urdf_position_limits(self.joint_names),
-                    joint_names=self.joint_names,
-                    qd0=state[:, len(self.joint_names):], dt=float(case.dt),
-                )
-            out = self.model.refine(init, state, enc, masks, iterations=int(self.iterations))
+                if not terminal_seed:
+                    hit = torch.full((1, 2), -1, device=dev, dtype=torch.long)
+                    hit[0, 0 if case.hand == "left" else 1] = int(case.N)
+                    aims = torch.zeros(1, 2, 3, device=dev, dtype=init.dtype)
+                    aims[0, 0 if case.hand == "left" else 1] = t(
+                        np.asarray(case.strike.position, float) + PELVIS_IN_ENV
+                    )
+                    init = correct_quintic_init_arms(
+                        self._chain_fk(dev, init.dtype), init,
+                        state[:, : len(self.joint_names)], hit, aims, steps=1,
+                        q_bounds=urdf_position_limits(self.joint_names),
+                        joint_names=self.joint_names,
+                        qd0=state[:, len(self.joint_names):], dt=float(case.dt),
+                    )
+            out = core.refine(init, state, enc, masks, iterations=int(self.iterations))
         traj = out.traj[0, : int(case.N)].float().cpu().numpy()
         Q = np.concatenate([np.asarray(case.q_start, float)[None, :], traj], axis=0)
         return PlanResult(
@@ -355,6 +361,9 @@ def batched_model_plans(
             )
             with amp:
                 enc = core.encode_context(ctx)
+                terminal_seed = core.terminal_initializer is not None
+                if terminal_seed and init != "hold":
+                    init_t = core.initial_trajectory(ctx, state, masks).to(init_t.dtype)
                 if init != "hold":
                     if enc.waist_pr_sp is not None:
                         n = len(joint_names)
@@ -363,21 +372,22 @@ def batched_model_plans(
                             joint_names=joint_names, dt=float(sub[0].dt),
                             ease_wp=waist_upright_ease_wp,
                         )
-                    n = len(joint_names)
-                    hit = torch.full((B, 2), -1, device=dev, dtype=torch.long)
-                    aims = torch.zeros(B, 2, 3, device=dev, dtype=init_t.dtype)
-                    for i, c in enumerate(sub):
-                        hi = 0 if c.hand == "left" else 1
-                        hit[i, hi] = int(c.N)
-                        aims[i, hi] = t(
-                            np.asarray(c.strike.position, float) + PELVIS_IN_ENV
+                    if not terminal_seed:
+                        n = len(joint_names)
+                        hit = torch.full((B, 2), -1, device=dev, dtype=torch.long)
+                        aims = torch.zeros(B, 2, 3, device=dev, dtype=init_t.dtype)
+                        for i, c in enumerate(sub):
+                            hi = 0 if c.hand == "left" else 1
+                            hit[i, hi] = int(c.N)
+                            aims[i, hi] = t(
+                                np.asarray(c.strike.position, float) + PELVIS_IN_ENV
+                            )
+                        init_t = correct_quintic_init_arms(
+                            fk,
+                            init_t, state[:, :n], hit, aims, steps=1,
+                            q_bounds=q_bounds, joint_names=joint_names,
+                            qd0=state[:, n:], dt=float(sub[0].dt),
                         )
-                    init_t = correct_quintic_init_arms(
-                        fk,
-                        init_t, state[:, :n], hit, aims, steps=1,
-                        q_bounds=q_bounds, joint_names=joint_names,
-                        qd0=state[:, n:], dt=float(sub[0].dt),
-                    )
                 res = core.refine(init_t, state, enc, masks, iterations=int(iterations))
             traj = res.traj.float().cpu().numpy()
             for i, c in enumerate(sub):

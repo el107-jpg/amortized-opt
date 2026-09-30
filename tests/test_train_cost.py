@@ -31,6 +31,12 @@ from amortized_opt.train_cost import (
     WeightSchedule,
     default_weight_schedule,
     _sample_fresh_batch,
+    _index_batch,
+    _run_suffix_step_chunked,
+    _VerifiedSuffixRing,
+    _split_timing_superbatch,
+    _timing_curriculum_group_count,
+    _timing_primary_layout,
     _splice_frontier_batch,
     _wtensors,
     apply_bounce,
@@ -51,6 +57,7 @@ from amortized_opt.train_cost import (
     ramp_seed,
     stage_a_pass,
     temporal_consistency_loss,
+    waist_yaw_mpc_init_tie_loss,
 )
 
 from conftest import pick_cuda_device
@@ -89,6 +96,145 @@ def _batch(pool, n=32, seed=0):
     batch["hit_eff"] = he
     batch["lengths"] = group_lengths(he)
     return batch
+
+
+def test_timing_superbatch_split_keeps_task_groups_together():
+    # Four six-row timing groups plus eight ungrouped MPC rows -> 4 x B8.
+    groups = torch.cat((torch.arange(4).repeat_interleave(6),
+                        torch.full((8,), -1))).long()
+    batch = {
+        "q0": torch.arange(32).float().unsqueeze(1),
+        "timing_primary_group": groups,
+        "timing_primary_kind": torch.zeros(32, dtype=torch.long),
+        "mpc_init": groups < 0,
+        "bucket": 50,
+    }
+    gen = torch.Generator().manual_seed(7)
+    parts = _split_timing_superbatch(
+        batch, 8, 4, generator=gen,
+    )
+    assert [int(p["q0"].shape[0]) for p in parts] == [8, 8, 8, 8]
+    for group in range(4):
+        owners = [
+            i for i, part in enumerate(parts)
+            if bool((part["timing_primary_group"] == group).any())
+        ]
+        assert len(owners) == 1
+        assert int((parts[owners[0]]["timing_primary_group"] == group).sum()) == 6
+
+
+def test_timing_curriculum_group_ramp_preserves_512_row_layout():
+    from amortized_opt.violation_critic import ViolationCriticConfig
+
+    cfg = ViolationCriticConfig(
+        representation="distributional", anchor_curriculum=True,
+        anchor_curriculum_ramp_steps=2_000,
+    )
+    base, anchor, boundary, interior, mpc = _timing_primary_layout(512, cfg)
+    assert (base, anchor, boundary, interior, mpc) == (40, 40, 40, 160, 272)
+    timing_n = anchor + boundary + interior
+    per_task = cfg.primary_anchor_per_task + cfg.primary_boundary_per_task + cfg.primary_interior_per_task
+    for step, expected_groups in ((7_550, 0), (8_550, 20), (9_550, 40)):
+        groups = _timing_curriculum_group_count(
+            base_tasks=base, curriculum_open=True,
+            curriculum_open_actor_step=7_550, actor_step=step,
+            ramp_steps=cfg.anchor_curriculum_ramp_steps,
+        )
+        independent = timing_n - groups * per_task
+        selected = groups * (
+            cfg.primary_boundary_per_task + cfg.primary_interior_per_task
+        )
+        assert groups == expected_groups
+        assert groups * per_task + independent == timing_n == 240
+        assert timing_n + mpc == 512
+        assert selected == expected_groups * 5
+
+    # An old open checkpoint has no opening-step provenance and must not be
+    # unexpectedly re-ramped; the disabled setting is likewise full-open.
+    assert _timing_curriculum_group_count(
+        base_tasks=base, curriculum_open=True,
+        curriculum_open_actor_step=None, actor_step=7_550, ramp_steps=2_000,
+    ) == base
+    assert _timing_curriculum_group_count(
+        base_tasks=base, curriculum_open=True,
+        curriculum_open_actor_step=7_550, actor_step=7_550, ramp_steps=0,
+    ) == base
+
+
+def test_suffix_microbatch_preserves_weighted_loss_and_row_order(bits):
+    """Chunking is a memory schedule, not a change to the suffix objective."""
+    pool, model, _p2, _costs, _sim = bits
+    batch = _batch(pool, 7, seed=11)
+    enc = encode(model, batch["context"])
+    traj = batch["init"]
+    q0 = batch["q0"]
+    v0 = batch["v0"]
+    elem_mask = batch["masks"].elem_mask
+    offsets = torch.arange(7, device=traj.device)
+
+    def fake_suffix_fn(
+        traj_i, q0_i, v0_i, _enc_i, _em_i, _masks_i, offsets_i,
+    ):
+        # The tie is a batch mean, matching make_suffix_step's contract.
+        loss_tie = (q0_i.square().mean(dim=1)).mean()
+        return (
+            loss_tie,
+            torch.as_tensor(
+                float(traj_i.numel()), device=traj_i.device,
+                dtype=traj_i.dtype,
+            ),
+            q0_i[:, :1],
+            v0_i[:, :1],
+            offsets_i[:, None].to(traj_i.dtype),
+        )
+
+    args = (
+        fake_suffix_fn, traj, q0, v0, enc, elem_mask, batch["masks"],
+        offsets,
+    )
+    full = _run_suffix_step_chunked(*args, microbatch=0)
+    chunked = _run_suffix_step_chunked(*args, microbatch=3)
+    for expected, actual in zip(full, chunked):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_verified_suffix_ring_is_fifo_and_fixed_batch(bits):
+    pool, _model, _p2, _costs, _sim = bits
+    batch = _batch(pool, 40, seed=17)
+    bucket = int(batch["bucket"])
+    ring = _VerifiedSuffixRing(capacity=32, device=batch["q0"].device)
+    admitted = ring.add(
+        bucket, batch, batch["init"],
+        hard_ok=torch.ones(40, device=batch["q0"].device, dtype=torch.bool),
+    )
+    assert admitted == 40
+    assert len(ring) == ring.size(bucket) == 32
+    assert ring.data[bucket]["suffix_sequence"].min().item() == 8
+
+    sampled, fill = ring.sample(
+        bucket, 16, min_parents=16,
+        generator=torch.Generator(device=batch["q0"].device).manual_seed(3),
+    )
+    assert sampled is not None and sampled["q0"].shape[0] == 16
+    assert sampled["suffix_sequence"].unique().numel() == 16
+    assert fill == 1.0
+
+    restored = _VerifiedSuffixRing(capacity=32, device=batch["q0"].device)
+    restored.load_state_dict(ring.state_dict())
+    assert restored.size(bucket) == 32
+    torch.testing.assert_close(
+        restored.data[bucket]["suffix_sequence"],
+        ring.data[bucket]["suffix_sequence"],
+    )
+
+    cold = _VerifiedSuffixRing(capacity=32, device=batch["q0"].device)
+    cold.add(
+        bucket, _index_batch(batch, torch.arange(8, device=batch["q0"].device)),
+        batch["init"][:8],
+        hard_ok=torch.ones(8, device=batch["q0"].device, dtype=torch.bool),
+    )
+    sampled, fill = cold.sample(bucket, 16, min_parents=16)
+    assert sampled is None and fill == 0.0
 
 
 # ================================================== 1. a step descends ======
@@ -173,6 +319,12 @@ def test_torque_directional_curvature_probe_is_finite(bits):
         WeightSchedule().multipliers(0), al.weights(),
         torch.device(DEV), torch.float32,
     )
+    # Production weights can be row-wise (for example voxel probe rows have
+    # zero dual price).  The curvature diagnostic uses only the first two rows
+    # and must slice those weights with the trajectory subset.
+    weights["collision_peak"] = torch.linspace(
+        0.5, 1.0, 4, device=torch.device(DEV),
+    )
     cfg = Phase2Config(device=DEV, torque_curvature_rows=2)
     traj_before = out.traj.detach().clone()
     rnea_dtype = costs[pool.buckets[0]].rnea.axis.dtype
@@ -243,6 +395,28 @@ def test_mpc_init_tie_masks_fresh_rows_and_padded_tail():
     assert float(traj.grad[0, 0, 0].abs()) > 0.0
     assert float(traj.grad[1].abs().max()) == 0.0
     assert float(traj.grad[:, -1].abs().max()) == 0.0
+
+
+def test_waist_yaw_mpc_tie_only_differentiates_yaw():
+    B, H, n = 2, 5, A.N_DOF
+    yaw = A.G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
+    parent = torch.zeros(B, H, n)
+    traj = torch.zeros(B, H, n, requires_grad=True)
+    mask = torch.ones_like(traj)
+    with torch.no_grad():
+        traj[0, 0, yaw] = 0.1
+        traj[0, 0, yaw + 1] = 3.0
+        traj[1, 0, yaw] = 4.0
+    loss, count, grad_norm = waist_yaw_mpc_init_tie_loss(
+        traj, parent, mask, torch.tensor([True, False]), yaw_index=yaw,
+    )
+    assert float(loss) > 0.0
+    assert float(count) == H - 1
+    assert float(grad_norm) > 0.0
+    loss.backward()
+    assert float(traj.grad[0, 0, yaw].abs()) > 0.0
+    assert float(traj.grad[0, :, yaw + 1].abs().max()) == 0.0
+    assert float(traj.grad[1].abs().max()) == 0.0
 
 
 def test_tc_step_runs_and_is_differentiable(bits):
@@ -400,6 +574,85 @@ def test_checkpoint_round_trip_carries_the_multipliers(bits, tmp_path):
     assert ck["step"] == 42
     assert al2.lam == al.lam and al2.steps == al.steps
     assert al2.pen == al.pen and al2.err_prev == al.err_prev
+
+
+def test_checkpoint_round_trip_restores_phase2_rng_streams(tmp_path):
+    """Checkpointed global, local torch, and NumPy streams resume exactly."""
+    from amortized_opt.train_cost import (
+        load_phase2_checkpoint,
+        save_phase2_checkpoint,
+    )
+
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    al = AugmentedLagrangian(phase2_al_config())
+    cfg = Phase2Config(max_steps=1)
+    mcfg = A.ModelConfig(max_horizon=2)
+    streams = {
+        "gen": torch.Generator().manual_seed(11),
+        "sfx_gen": torch.Generator().manual_seed(12),
+        "jit_gen": torch.Generator().manual_seed(13),
+        "rng": np.random.default_rng(14),
+    }
+    old_global = torch.get_rng_state()
+    try:
+        torch.manual_seed(15)
+        # Advance every stream before saving so this checks state, not seeds.
+        for stream in streams.values():
+            if isinstance(stream, torch.Generator):
+                torch.rand(7, generator=stream)
+            else:
+                stream.random(7)
+        save_phase2_checkpoint(
+            tmp_path / "rng.pt", model=model, optimizer=opt, al=al, step=3,
+            cfg=cfg, model_cfg=mcfg, rng_streams=streams,
+        )
+        expected_global = torch.rand(5)
+        expected_torch = {
+            name: torch.rand(5, generator=stream)
+            for name, stream in streams.items()
+            if isinstance(stream, torch.Generator)
+        }
+        expected_numpy = streams["rng"].random(5)
+
+        restored = {
+            "gen": torch.Generator().manual_seed(101),
+            "sfx_gen": torch.Generator().manual_seed(102),
+            "jit_gen": torch.Generator().manual_seed(103),
+            "rng": np.random.default_rng(104),
+        }
+        load_phase2_checkpoint(tmp_path / "rng.pt", rng_streams=restored)
+        assert torch.equal(torch.rand(5), expected_global)
+        for name, stream in restored.items():
+            if isinstance(stream, torch.Generator):
+                assert torch.equal(torch.rand(5, generator=stream), expected_torch[name])
+            else:
+                np.testing.assert_array_equal(stream.random(5), expected_numpy)
+    finally:
+        torch.set_rng_state(old_global)
+
+
+def test_checkpoint_rng_restore_accepts_legacy_missing_stream_state(tmp_path):
+    """Old CPU-only checkpoints restore what they have and never require extras."""
+    from amortized_opt.train_cost import load_phase2_checkpoint
+
+    old_global = torch.get_rng_state()
+    try:
+        torch.manual_seed(22)
+        legacy_cpu = torch.get_rng_state().clone()
+        expected = torch.rand(4)
+        torch.save({"torch_rng": legacy_cpu}, tmp_path / "legacy.pt")
+        torch.manual_seed(999)
+        streams = {
+            "gen": torch.Generator().manual_seed(31),
+            "sfx_gen": torch.Generator().manual_seed(32),
+            "jit_gen": torch.Generator().manual_seed(33),
+            "rng": np.random.default_rng(34),
+        }
+        load_phase2_checkpoint(tmp_path / "legacy.pt", rng_streams=streams)
+        assert torch.equal(torch.rand(4), expected)
+    finally:
+        torch.set_rng_state(old_global)
 
 
 # ================================================ 6. schedule + roller ======

@@ -54,6 +54,7 @@ __all__ = [
     "TrajectoryScenario",
     "TaskSpaceConstraint",
     "WaypointKeyframe",
+    "quintic_terminal_initialization",
     "sample_trajectory_scenario",
     "warp_terminal_approach",
 ]
@@ -72,6 +73,64 @@ TASK_APPROACH_WINDOW_WAYPOINTS = 16
 TASK_APPROACH_POSITION_WEIGHT = 2.0e5
 TASK_APPROACH_DIRECTION_WEIGHT = 2.0e4
 TASK_APPROACH_WAIST_WEIGHT = 1.0e4
+
+
+def quintic_terminal_initialization(
+    scenario: "TrajectoryScenario",
+    terminal_q: torch.Tensor | np.ndarray | Iterable[float],
+    *,
+    hand: str,
+) -> torch.Tensor:
+    """Build a fresh velocity-matched quintic to an edited strike pose.
+
+    The selected arm and waist start at the scenario's measured ``q0/qd0``,
+    reach ``terminal_q`` at that hand's strike waypoint with zero terminal
+    velocity, and hold the pose afterward. The opposite arm retains the
+    scenario's analytic quintic warm start so its independently timed strike
+    still has a useful seed. This never copies the current actor or teacher
+    trajectory into the edited side.
+    """
+    if hand not in HANDS:
+        raise ValueError("hand must be left or right")
+    target = torch.as_tensor(
+        terminal_q, device=scenario.q0.device, dtype=scenario.q0.dtype
+    )
+    if tuple(target.shape) != (17,) or not bool(torch.isfinite(target).all().item()):
+        raise ValueError("terminal_q must be a finite 17-vector")
+    hit = int(scenario.hit_index[0, HANDS.index(hand)].item())
+    if not 1 <= hit <= scenario.horizon:
+        raise ValueError(f"selected-hand hit waypoint must be in [1, {scenario.horizon}]")
+
+    out = scenario.init.detach().clone()
+    cols = torch.as_tensor(
+        [
+            index
+            for index, name in enumerate(scenario.joint_names)
+            if name.startswith("waist_") or name.startswith(f"{hand}_")
+        ],
+        device=out.device,
+        dtype=torch.long,
+    )
+    q0 = scenario.q0[0].index_select(0, cols)
+    qd0 = scenario.qd0[0].index_select(0, cols)
+    goal = target.index_select(0, cols)
+    steps = torch.arange(
+        1, scenario.horizon + 1, device=out.device, dtype=out.dtype
+    ).unsqueeze(1)
+    duration_steps = torch.as_tensor(float(hit), device=out.device, dtype=out.dtype)
+    u = (steps / duration_steps).clamp(0.0, 1.0)
+    displacement = (goal - q0).unsqueeze(0)
+    opening_tangent = (qd0 * duration_steps * float(scenario.dt)).unsqueeze(0)
+    u3 = u.pow(3)
+    curve = (
+        q0.unsqueeze(0)
+        + opening_tangent * u
+        + (10.0 * displacement - 6.0 * opening_tangent) * u3
+        + (8.0 * opening_tangent - 15.0 * displacement) * u3 * u
+        + (6.0 * displacement - 3.0 * opening_tangent) * u3 * u.pow(2)
+    )
+    out[0, :, cols] = curve
+    return out
 
 
 def warp_terminal_approach(
@@ -243,6 +302,10 @@ class TaskSpaceConstraint:
     contact_position: tuple[float, float, float] | list[float]
     stick_direction: tuple[float, float, float] | list[float]
     waist: tuple[float, float, float] | list[float]
+    # Joint-space IK solution for the task pose.  The direct Adam backend does
+    # not need it after the endpoint warp, but the SQP backend uses the selected
+    # arm columns as a redundancy/posture reference at contact.
+    terminal_q: tuple[float, ...] | list[float] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -250,6 +313,11 @@ class TaskSpaceConstraint:
             "contact_position": [float(value) for value in self.contact_position],
             "stick_direction": [float(value) for value in self.stick_direction],
             "waist": [float(value) for value in self.waist],
+            "terminal_q": (
+                None
+                if self.terminal_q is None
+                else [float(value) for value in self.terminal_q]
+            ),
             "weights": {
                 "contact_position_m2": TASK_POSITION_WEIGHT,
                 "stick_direction_1_minus_cos": TASK_DIRECTION_WEIGHT,

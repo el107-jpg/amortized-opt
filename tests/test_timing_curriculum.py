@@ -8,9 +8,10 @@ from amortized_opt.tokenizer import ContextInputs, build_waypoint_masks
 from amortized_opt.train_cost import (
     Phase2Config,
     _expand_timing_base_tasks,
+    _bellman_parent_ingress_ok,
     _suffix_rows,
     _timing_assist_batch,
-    _timing_mpc_ingress_ok,
+    _timing_mpc_parent_ingress_ok,
     _timing_primary_layout,
     effective_hits,
     per_element_lengths,
@@ -67,24 +68,35 @@ def test_primary_layout_groups_timing_tables_by_physical_task():
     )
 
 
-def test_timing_mpc_ingress_uses_relaxed_physical_limits():
+def test_bellman_ingress_uses_half_former_mpc_physical_limits():
     cfg = ViolationCriticConfig()
+    slack = torch.sinh(torch.tensor(cfg.acceptable_normalized_violation))
+    joint_max = 0.5 * (cfg.joint_limit + float(slack) * cfg.joint_scale)
+    torque_max = 0.5 * (cfg.torque_limit + float(slack) * cfg.torque_scale)
     gate = torch.zeros(5, 8)
     gate[:, 4:8] = torch.tensor(
-        [0.040, -0.010, cfg.joint_limit, cfg.torque_limit]
+        [0.020, -0.005, joint_max, torque_max]
     )
-    gate[1, 4] = 0.0401
-    gate[2, 5] = -0.0101
-    gate[3, 6] = 0.1
-    gate[4, 7] = 20.0
+    gate[1, 4] = 0.0201
+    gate[2, 5] = -0.0051
+    gate[3, 6] = joint_max + 1.0e-4
+    gate[4, 7] = torque_max + 1.0e-3
 
-    assert _timing_mpc_ingress_ok(gate, cfg).tolist() == [
+    assert _bellman_parent_ingress_ok(gate, cfg).tolist() == [
         True,
         False,
         False,
         False,
         False,
     ]
+
+
+def test_critic_mpc_parent_ingress_accepts_every_actor_row():
+    gate = torch.tensor([
+        [0.0] * 8,
+        [0.0, 0.0, 0.0, 0.0, 10.0, -2.0, 3.0, 1_000.0],
+    ])
+    assert _timing_mpc_parent_ingress_ok(gate).tolist() == [True, True]
 
 
 def test_suffix_rows_include_every_primary_stratum_proportionally():

@@ -382,7 +382,18 @@ class OnlineDistributionalCriticTrainer:
         self.calibration_recall = 0.0
         self.anchor_samples = 0
         self.anchor_close_ema = 0.0
+        self.terminal_band_samples = 0
+        self.terminal_band_success_ema = 0.0
+        self.terminal_band_unlocked = int(cfg.short_floor_wp) <= 1
+        self.boundary_samples = 0
+        self.boundary_manageable_ema = 0.0
+        self.boundary_floor_wp = int(cfg.short_floor_wp)
+        self.boundary_last_adjust_step = -int(cfg.boundary_floor_update_every)
         self.curriculum_open = not bool(cfg.anchor_curriculum)
+        # ``None`` has two intentional meanings: the latch has not opened, or
+        # a legacy checkpoint was already open before ramp provenance existed.
+        # The latter is treated as fully ramped by ``curriculum_ramp_fraction``.
+        self.curriculum_open_actor_step: int | None = None
         self._metric_sum: dict[str, float] = {}
         self._metric_n = 0
         self._calibration_diagnostics: dict[str, float] = {}
@@ -410,6 +421,85 @@ class OnlineDistributionalCriticTrainer:
             return torch.zeros(features.shape[0], device=features.device, dtype=torch.bool)
         return self.risk_score(features) <= float(self.risk_threshold)
 
+    def curriculum_ramp_fraction(self, actor_step: int) -> float:
+        """Fraction of complete timing groups enabled at ``actor_step``.
+
+        This is deliberately derived from the absolute actor step so a
+        checkpoint resume cannot drift the curriculum.  A legacy open state
+        with no recorded opening step is conservatively treated as complete.
+        """
+        if not self.curriculum_open:
+            return 0.0
+        steps = int(self.cfg.anchor_curriculum_ramp_steps)
+        if steps <= 0 or self.curriculum_open_actor_step is None:
+            return 1.0
+        return min(1.0, max(0.0, (
+            int(actor_step) - int(self.curriculum_open_actor_step)
+        ) / float(steps)))
+
+    @torch.no_grad()
+    def observe_terminal_band(self, success: torch.Tensor) -> None:
+        """Update the exact near-terminal success latch from MPC suffix rows."""
+        values = success.detach().to(torch.float32).reshape(-1)
+        if not int(values.numel()):
+            return
+        rate = float(values.mean())
+        decay = float(self.cfg.short_success_ema)
+        if self.terminal_band_samples == 0:
+            self.terminal_band_success_ema = rate
+        else:
+            self.terminal_band_success_ema = (
+                decay * self.terminal_band_success_ema + (1.0 - decay) * rate
+            )
+        self.terminal_band_samples += int(values.numel())
+        if (
+            not self.terminal_band_unlocked
+            and self.terminal_band_samples >= int(self.cfg.short_unlock_min_samples)
+            and self.terminal_band_success_ema >= float(self.cfg.short_unlock_success)
+        ):
+            self.terminal_band_unlocked = True
+
+    @torch.no_grad()
+    def observe_boundary(
+        self,
+        success: torch.Tensor,
+        *,
+        actor_step: int,
+        horizon: int,
+    ) -> None:
+        """Keep the realized frontier at or above its exact success target."""
+        values = success.detach().to(torch.float32).reshape(-1)
+        if not int(values.numel()):
+            return
+        rate = float(values.mean())
+        decay = float(self.cfg.boundary_rate_ema)
+        if self.boundary_samples == 0:
+            self.boundary_manageable_ema = rate
+        else:
+            self.boundary_manageable_ema = (
+                decay * self.boundary_manageable_ema + (1.0 - decay) * rate
+            )
+        self.boundary_samples += int(values.numel())
+        period = int(self.cfg.boundary_floor_update_every)
+        if int(actor_step) - int(self.boundary_last_adjust_step) < period:
+            return
+        target = float(self.cfg.boundary_min_manageable)
+        margin = float(self.cfg.boundary_manageable_margin)
+        step_wp = max(1, int(self.cfg.coarse_step_knots))
+        if self.boundary_manageable_ema < target:
+            self.boundary_floor_wp = min(
+                int(horizon), int(self.boundary_floor_wp) + step_wp,
+            )
+            self.boundary_last_adjust_step = int(actor_step)
+        elif (
+            self.boundary_manageable_ema >= min(1.0, target + margin)
+            and self.boundary_floor_wp > 1
+        ):
+            self.boundary_floor_wp = max(
+                1, int(self.boundary_floor_wp) - step_wp,
+            )
+            self.boundary_last_adjust_step = int(actor_step)
+
     def observe_gate(
         self,
         features: torch.Tensor,
@@ -417,7 +507,9 @@ class OnlineDistributionalCriticTrainer:
         *,
         actor_step: int,
         anchor_mask: torch.Tensor | None = None,
+        batch_size_multiplier: int = 1,
     ) -> dict[str, float]:
+        multiplier = max(1, int(batch_size_multiplier))
         residual = residuals_from_gate(gate, self.cfg)
         target = robust_transform(residual, self.cfg.scales)
         with torch.no_grad():
@@ -437,7 +529,9 @@ class OnlineDistributionalCriticTrainer:
                 (anchor_truth <= self.cfg.acceptable_normalized_violation).float().mean()
             )
             count = int(anchor_truth.numel())
-            decay = float(self.cfg.anchor_rate_ema)
+            # One aggregated rate stands in for ``multiplier`` actor-label
+            # batches, so preserve the EMA's actor-step time constant.
+            decay = float(self.cfg.anchor_rate_ema) ** multiplier
             if self.anchor_samples == 0:
                 self.anchor_close_ema = rate
             else:
@@ -445,9 +539,40 @@ class OnlineDistributionalCriticTrainer:
             self.anchor_samples += count
 
         stats: dict[str, float] = {}
-        for _ in range(int(self.cfg.updates_per_step)):
-            stats = self._update_once()
-        if self.updates % int(self.cfg.risk_recalibrate_every) == 0:
+        lr_scale = (
+            float(self.cfg.interval_lr_scale) if multiplier > 1 else 1.0
+        )
+        original_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+        try:
+            for group, lr in zip(self.optimizer.param_groups, original_lrs):
+                group["lr"] = lr * lr_scale
+            for _ in range(int(self.cfg.updates_per_step)):
+                stats = self._update_once(
+                    batch_size=int(self.cfg.batch_size) * multiplier,
+                    ema_decay=float(self.cfg.ema_decay) ** multiplier,
+                )
+        finally:
+            for group, lr in zip(self.optimizer.param_groups, original_lrs):
+                group["lr"] = lr
+        stats["update_interval"] = float(multiplier)
+        stats["effective_batch_size"] = float(
+            int(self.cfg.batch_size) * multiplier
+        )
+        stats["interval_lr_scale"] = float(lr_scale)
+        for key in (
+            "update_interval", "effective_batch_size", "interval_lr_scale",
+        ):
+            self._metric_sum[key] = self._metric_sum.get(key, 0.0) + (
+                float(stats[key]) * int(self.cfg.updates_per_step)
+            )
+        # Keep calibration on its actor-step cadence even though the number of
+        # optimizer steps is reduced by consolidation.
+        period = int(self.cfg.risk_recalibrate_every)
+        crossed_calibration = (
+            (int(actor_step) + 1) // period
+            > (int(actor_step) + 1 - multiplier) // period
+        )
+        if crossed_calibration:
             self._recalibrate()
         if (
             self.cfg.anchor_curriculum
@@ -457,21 +582,30 @@ class OnlineDistributionalCriticTrainer:
             and math.isfinite(self.risk_threshold)
         ):
             self.curriculum_open = True
+            self.curriculum_open_actor_step = int(actor_step)
         return stats
 
-    def _update_once(self) -> dict[str, float]:
+    def _update_once(
+        self,
+        *,
+        batch_size: int | None = None,
+        ema_decay: float | None = None,
+    ) -> dict[str, float]:
+        sample_size = (
+            int(self.cfg.batch_size) if batch_size is None else int(batch_size)
+        )
         features = []
         targets = []
         unknowns = []
         unknown_n = int(round(
-            float(self.cfg.batch_size) * float(self.cfg.global_ood_fraction)
+            float(sample_size) * float(self.cfg.global_ood_fraction)
         ))
         use_ood = unknown_n > 0 and float(self.cfg.global_ood_weight) > 0.0
         # Keep the legacy per-head sample/OOD draw ordering so fusion changes
         # execution only, not the critic's stochastic training stream.
         for _head in self.live.heads:
             x, target = self.recent.sample(
-                self.cfg.batch_size, generator=self.generator, device=self.device,
+                sample_size, generator=self.generator, device=self.device,
                 manageable_fraction=self.cfg.replay_manageable_fraction,
                 near_failure_fraction=self.cfg.replay_near_failure_fraction,
                 boundary_band=self.cfg.replay_boundary_band,
@@ -508,7 +642,9 @@ class OnlineDistributionalCriticTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
-        decay = float(self.cfg.ema_decay)
+        decay = (
+            float(self.cfg.ema_decay) if ema_decay is None else float(ema_decay)
+        )
         with torch.no_grad():
             for ema, live in zip(self.ema.parameters(), self.live.parameters()):
                 ema.mul_(decay).add_(live, alpha=1.0 - decay)
@@ -520,6 +656,16 @@ class OnlineDistributionalCriticTrainer:
             "recent_size": float(len(self.recent)),
             "anchor_close_ema": float(self.anchor_close_ema),
             "curriculum_open": float(self.curriculum_open),
+            "terminal_band_samples": float(self.terminal_band_samples),
+            "terminal_band_success_ema": float(self.terminal_band_success_ema),
+            "terminal_band_unlocked": float(self.terminal_band_unlocked),
+            "boundary_samples": float(self.boundary_samples),
+            "boundary_manageable_ema": float(self.boundary_manageable_ema),
+            "boundary_floor_wp": float(self.boundary_floor_wp),
+            "curriculum_open_actor_step": float(
+                -1 if self.curriculum_open_actor_step is None
+                else self.curriculum_open_actor_step
+            ),
         }
         if ood_loss is not None and ood_entropy is not None:
             stats["loss_ood"] = float(ood_loss.detach())
@@ -625,6 +771,14 @@ class OnlineDistributionalCriticTrainer:
             "anchor_samples": self.anchor_samples,
             "anchor_close_ema": self.anchor_close_ema,
             "curriculum_open": self.curriculum_open,
+            "curriculum_open_actor_step": self.curriculum_open_actor_step,
+            "terminal_band_samples": self.terminal_band_samples,
+            "terminal_band_success_ema": self.terminal_band_success_ema,
+            "terminal_band_unlocked": self.terminal_band_unlocked,
+            "boundary_samples": self.boundary_samples,
+            "boundary_manageable_ema": self.boundary_manageable_ema,
+            "boundary_floor_wp": self.boundary_floor_wp,
+            "boundary_last_adjust_step": self.boundary_last_adjust_step,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -649,3 +803,24 @@ class OnlineDistributionalCriticTrainer:
         self.anchor_samples = int(state.get("anchor_samples", 0))
         self.anchor_close_ema = float(state.get("anchor_close_ema", 0.0))
         self.curriculum_open = bool(state.get("curriculum_open", False))
+        self.terminal_band_samples = int(state.get("terminal_band_samples", 0))
+        self.terminal_band_success_ema = float(
+            state.get("terminal_band_success_ema", 0.0)
+        )
+        self.terminal_band_unlocked = bool(state.get(
+            "terminal_band_unlocked", int(self.cfg.short_floor_wp) <= 1,
+        ))
+        self.boundary_samples = int(state.get("boundary_samples", 0))
+        self.boundary_manageable_ema = float(
+            state.get("boundary_manageable_ema", 0.0)
+        )
+        self.boundary_floor_wp = int(
+            state.get("boundary_floor_wp", self.cfg.short_floor_wp)
+        )
+        self.boundary_last_adjust_step = int(state.get(
+            "boundary_last_adjust_step", -int(self.cfg.boundary_floor_update_every),
+        ))
+        open_step = state.get("curriculum_open_actor_step")
+        self.curriculum_open_actor_step = (
+            None if open_step is None else int(open_step)
+        )

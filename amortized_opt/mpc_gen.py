@@ -153,6 +153,11 @@ class EpisodeResult:
     qd_hist: np.ndarray  # (T+1, 17)
     cmd_hist: np.ndarray  # (T, 17) commanded first waypoints
     hit_steps: list[tuple[int, str, int]]  # (step, hand, drum) as they fired
+    #: Pre-bounce state at each fire, aligned one-for-one with ``hit_steps``.
+    #: The regular history is intentionally post-bounce for next-step rollout;
+    #: contact and momentum-grace diagnostics need the state immediately before
+    #: that synthetic impulse instead.
+    hit_states: list[tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
     clip: str = ""
     #: True when the episode was cut short by the divergence guard (non-finite
     #: state, or a measured pose far outside the joint box).
@@ -189,6 +194,12 @@ class MPCGenConfig:
     minv_refresh: int = 1
     #: Re-draw the PD gains at the start of every episode.
     randomize_gains: bool = True
+    #: Diagnostic plant bypass.  Execute the finalized (lead/slew/box-clamped)
+    #: command exactly each tick and derive measured velocity by finite
+    #: difference.  This preserves the full receding-horizon loop while
+    #: removing PD tracking lag, so closed-loop misses can be attributed to the
+    #: plan/replanning logic rather than the servo model.
+    perfect_tracking: bool = False
     hit_radius_frac: float = 0.6
     speed_min: float = 1.0
     speed_max: float = 3.0
@@ -736,6 +747,7 @@ class MPCGenerator:
         qd_hist = [qd.copy()]
         cmd_hist: list[np.ndarray] = []
         hit_steps: list[tuple[int, str, int]] = []
+        hit_states: list[tuple[np.ndarray, np.ndarray]] = []
         Minv = None
         integral = np.zeros(n, dtype=float) if (cfg.ki > 0.0) else None
         # PID integral is normally disabled when the reference lead is active:
@@ -842,7 +854,10 @@ class MPCGenerator:
                     waist_frozen = True
                 n_frozen += int(hit_any)
 
-            if Minv is None or (step % max(int(cfg.minv_refresh), 1) == 0):
+            if (
+                not cfg.perfect_tracking
+                and (Minv is None or (step % max(int(cfg.minv_refresh), 1) == 0))
+            ):
                 Minv = frozen_minv(self.rnea, self._t(q)[None, None, :])[:, 0]
             # Reference lead: execute q_ref(t + delta), interpolated along the
             # plan.  Applied to the PLAN, before the slew/box clamp, so the
@@ -911,18 +926,22 @@ class MPCGenerator:
                 gs = imp.scales(torch.tensor(
                     [[float(hit_index["left"] - 1), float(hit_index["right"] - 1)]],
                     device=self.device))
-            qa, va, int_new = self.sim.step(
-                self._t(prev_cmd)[None, :], self._t(cmd)[None, :],
-                self._t(q)[None, :], self._t(qd)[None, :],
-                kp=kp, kd=kd, ki=ki, Minv=Minv,
-                integral=self._t(integral)[None, :] if integral is not None else None,
-                gain_scale=gs,
-            )
-            if integral is not None:
-                integral = int_new[0].detach().cpu().numpy()
+            if cfg.perfect_tracking:
+                qd = (cmd - prev_cmd) / dt
+                q = cmd.copy()
+            else:
+                qa, va, int_new = self.sim.step(
+                    self._t(prev_cmd)[None, :], self._t(cmd)[None, :],
+                    self._t(q)[None, :], self._t(qd)[None, :],
+                    kp=kp, kd=kd, ki=ki, Minv=Minv,
+                    integral=self._t(integral)[None, :] if integral is not None else None,
+                    gain_scale=gs,
+                )
+                if integral is not None:
+                    integral = int_new[0].detach().cpu().numpy()
+                q = qa[0].detach().cpu().numpy()
+                qd = va[0].detach().cpu().numpy()
             prev_cmd = cmd.copy()
-            q = qa[0].detach().cpu().numpy()
-            qd = va[0].detach().cpu().numpy()
             cmd_hist.append(cmd.copy())
             q_hist.append(q.copy())
             qd_hist.append(qd.copy())
@@ -942,6 +961,8 @@ class MPCGenerator:
             # ---- per-hand post-hit reset ----
             t_next = t_start + (step + 1) * dt
             fired = [h for h in HANDS if hit_index[h] == 0]
+            q_pre_bounce = q.copy()
+            qd_pre_bounce = qd.copy()
             if fired and self.cfg.bounce:
                 q, qd = self._bounce_fired(q, qd, fired, snap, rng)
                 q_hist[-1] = q.copy()
@@ -952,6 +973,7 @@ class MPCGenerator:
                     [["left" in fired, "right" in fired]], device=self.device))
             for h in fired:
                 hit_steps.append((step + 1, h, int(snap.goal[h].drum)))
+                hit_states.append((q_pre_bounce.copy(), qd_pre_bounce.copy()))
                 recent[h] = (int(snap.goal[h].drum), int(cfg.departure_exempt_wp))
                 # remember WHICH scheduled hit this was, so a lead that lands
                 # inside the final half tick cannot hand it back next tick
@@ -1017,6 +1039,7 @@ class MPCGenerator:
             qd_hist=np.stack(qd_hist),
             cmd_hist=np.stack(cmd_hist) if cmd_hist else np.zeros((0, n)),
             hit_steps=hit_steps,
+            hit_states=hit_states,
             clip=clip.name,
             diverged=diverged,
             diverged_step=diverged_step,

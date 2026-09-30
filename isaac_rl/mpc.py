@@ -36,8 +36,8 @@ of the standalone PD stand-in, which Isaac replaces.  ``record_min_sdf``,
 ``short_horizon_wp`` / ``extra_short_samples``, ``departure_exempt_wp`` --
 training-data bookkeeping that belongs to the offline generator; the RL reward
 recomputes clearance itself.  ``seed_slew_eta`` -- the numpy quintic seed is
-replaced by :func:`~amortized_opt.train_cost.ramp_seed`, which is monotone and
-already admissible.
+replaced by the shared velocity-matched strike seed; the executed command
+still passes through the slew and joint-box bounds.
 """
 
 from __future__ import annotations
@@ -54,8 +54,9 @@ from amortized_opt.ik import adjust_arm_terminal, correct_quintic_init_arms
 from amortized_opt.lead import LEAD_PRESETS, lead_fraction, lead_waypoints, resolve_lead
 from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from amortized_opt.model import ContextEncoding
-from amortized_opt.tokenizer import build_waypoint_masks
+from amortized_opt.tokenizer import ContextInputs, build_waypoint_masks
 from amortized_opt.train_cost import ramp_seed
+from amortized_opt.strike_seed import accelerating_path_torch
 from amortized_opt.warmstart import GoalPoseLibrary, arm_slice, seed_waist_pr_to_sp, waist_slice
 
 from .schedule import BatchedSchedule
@@ -214,6 +215,7 @@ class IsaacMPC:
         self.init = torch.zeros(self.B, self.H, self.n, device=self.device, dtype=dtype)
         self.prev_cmd = torch.zeros(self.B, self.n, device=self.device, dtype=dtype)
         self._enc: ContextEncoding | None = None
+        self._ctx: ContextInputs | None = None
         self.last_ref0 = torch.zeros(self.B, self.n, device=self.device, dtype=dtype)
         #: The ``yaw_cond="aim_ramp"`` BC state (fix A's planned yaw), rad.
         self.yaw_bc = torch.zeros(self.B, device=self.device, dtype=dtype)
@@ -295,6 +297,7 @@ class IsaacMPC:
         # measured one, so ``yaw_cond="aim_ramp"`` starts honest.
         self.yaw_bc.index_copy_(0, env_ids, q0.index_select(0, env_ids)[:, self.yaw_i])
         self._enc = None
+        self._ctx = None
         self._enc_key = None
         self._yaw_enc = None
         self._aim = None
@@ -331,6 +334,8 @@ class IsaacMPC:
         masks = self.masks(hit_index)
 
         enc, did_encode = self._encoding(hit_index, q)
+        core = self.model.module if hasattr(self.model, "module") else self.model
+        state = torch.cat([q, qd], dim=-1)
         if getattr(enc, "waist_pr_sp", None) is not None:
             self.init = seed_waist_pr_to_sp(
                 self.init, q, qd, enc.waist_pr_sp,
@@ -344,17 +349,29 @@ class IsaacMPC:
                 & gactive
                 & (hit_index >= 1)
             )
-            self.init = correct_quintic_init_arms(
-                self._chain_fk(), self.init, q, hit_index, gp,
-                active=live, steps=1,
-                q_bounds=(self.q_lo, self.q_hi),
-                joint_names=self.names, qd0=qd, dt=self.dt,
-            )
+            if core.terminal_initializer is not None:
+                seed = core.initial_trajectory(self._ctx, state, masks).to(self.dtype)
+                for h in (0, 1):
+                    rows = live[:, h]
+                    self.init[:, :, self.arm_cols[h]] = torch.where(
+                        rows[:, None, None], seed[:, :, self.arm_cols[h]],
+                        self.init[:, :, self.arm_cols[h]],
+                    )
+                any_live = live.any(dim=-1)
+                self.init[:, :, self.waist_cols] = torch.where(
+                    any_live[:, None, None], seed[:, :, self.waist_cols],
+                    self.init[:, :, self.waist_cols],
+                )
+            else:
+                self.init = correct_quintic_init_arms(
+                    self._chain_fk(), self.init, q, hit_index, gp,
+                    active=live, steps=1,
+                    q_bounds=(self.q_lo, self.q_hi),
+                    joint_names=self.names, qd0=qd, dt=self.dt,
+                )
             self._arm_dls_pending.zero_()
         init = self.init * masks.elem_mask
-        state = torch.cat([q, qd], dim=-1)
 
-        core = self.model.module if hasattr(self.model, "module") else self.model
         was = core.training
         core.eval()
         amp = (
@@ -478,6 +495,7 @@ class IsaacMPC:
                 else torch.autocast(device_type="cuda", enabled=False)
             )
             ctx = self.sched.context(yaw_now=yaw_now)
+            self._ctx = ctx
             if ramp and ctx.aim_yaw is not None:
                 self._aim = ctx.aim_yaw.to(self.yaw_bc.dtype)
             with amp:
@@ -534,7 +552,8 @@ class IsaacMPC:
 
     # ------------------------------------------------------------- commit --
     @torch.no_grad()
-    def commit(self, cmd: torch.Tensor, q: torch.Tensor, fired: torch.Tensor) -> None:
+    def commit(self, cmd: torch.Tensor, q: torch.Tensor, fired: torch.Tensor,
+               *, qd: torch.Tensor | None = None) -> None:
         """Shift the plan one waypoint and re-seed the hands that just fired.
 
         Call AFTER the plant has taken the step and AFTER
@@ -548,10 +567,10 @@ class IsaacMPC:
         self.init = torch.cat([traj[:, 1:], traj[:, -1:]], dim=1)
         new_index = self.sched.hit_index()
         if bool(fired.any()):
-            self._reseed(None, fired & (new_index >= 1), q.to(self.dtype), new_index)
+            self._reseed(None, fired & (new_index >= 1), q.to(self.dtype), new_index, qd=qd)
 
     def _reseed(self, env_ids, mask: torch.Tensor, q: torch.Tensor,
-                hit_index: torch.Tensor) -> None:
+                hit_index: torch.Tensor, *, qd: torch.Tensor | None = None) -> None:
         """Ramp arm columns of ``mask``'ed hands; rebuild waist from aim.
 
         Mirrors ``MPCRoller._regoal``: only the fired hand's arm columns move,
@@ -595,8 +614,11 @@ class IsaacMPC:
                 joint_names=self.names,
             )
             term = q_fix[:, cols]
-            L = k.view(-1, 1).expand(-1, len(cols))
-            sub = ramp_seed(q0r[:, cols], term, L, self.H)
+            v0r = (torch.zeros_like(q0r) if qd is None else
+                   qd.to(q0r).index_select(0, rows))
+            sub = accelerating_path_torch(
+                q0r[:, cols], v0r[:, cols], term, k, self.H, self.dt,
+            ).clamp(self.q_lo[cols], self.q_hi[cols])
             buf = buf.clone()
             buf[:, :, cols] = sub
             self.init.index_copy_(0, rows, buf)

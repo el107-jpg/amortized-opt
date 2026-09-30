@@ -41,9 +41,16 @@ def parse(argv=None) -> argparse.Namespace:
                    help="pretrained backbone; default resolves phase2d(accepted)"
                         " -> phase2b, never phase2c")
     p.add_argument("--resume", default=None, help="an isaac_rl_ppo checkpoint")
+    p.add_argument("--critic-ckpt", default=None,
+                   help="load only the value critic from an isaac_rl_ppo checkpoint")
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--noise-std", type=float, default=0.45)
     p.add_argument("--aux-weight", type=float, default=0.1)
+    p.add_argument("--aux-terms", default="default", choices=("default", "full"),
+                   help="full uses every FusedCost term, including terminal and waist")
+    p.add_argument("--aux-cost-source", default="phase2",
+                   choices=("phase2", "checkpoint"),
+                   help="checkpoint restores the backbone run's exact CostConfig")
     p.add_argument("--aux-gate", default="auto", choices=("auto", "on", "off"),
                    help="in-Isaac gate for the analytic FusedCost aux loss; "
                         "'auto' enables it when the pre-launch RNEA build "
@@ -75,6 +82,13 @@ def parse(argv=None) -> argparse.Namespace:
     p.add_argument("--micro-batch", type=int, default=128)
     p.add_argument("--clips", type=int, default=4)
     p.add_argument("--rhythm-split", default="train")
+    p.add_argument("--clip-index", type=int, default=None,
+                   help="train every env on one clip from the selected rhythm split")
+    p.add_argument("--reward-mode", default="continuous",
+                   choices=("continuous", "binary_hits"),
+                   help="binary_hits uses only correct versus wrong physical contacts")
+    p.add_argument("--correct-hit-weight", type=float, default=10.0)
+    p.add_argument("--wrong-hit-weight", type=float, default=5.0)
     p.add_argument("--save-interval", type=int, default=50)
     p.add_argument("--no-amp", action="store_true", default=True,
                    help="kept for symmetry with smoke_rl; PPO needs fp32")
@@ -135,6 +149,8 @@ def build_cfg(args) -> PpoRunConfig:
     cfg.ppo.num_steps_per_env = int(args.steps_per_env)
     cfg.ppo.micro_batch_size = int(args.micro_batch)
     cfg.aux.weight = float(args.aux_weight)
+    if args.aux_terms == "full":
+        cfg.aux.terms = None
     cfg.aux.in_isaac = args.aux_gate
     cfg.orth.enabled = not bool(args.no_orth)
     cfg.orth.rl_to_cost_norm = float(args.orth_scale)
@@ -295,6 +311,19 @@ def main(argv=None) -> int:
 
     actor = AmortizedPpoActor(model, cfg.actor, cfg.critic, num_future=mcfg.num_future,
                               device=dev)
+    if args.critic_ckpt:
+        critic_blob = torch.load(args.critic_ckpt, map_location=dev,
+                                 weights_only=False)
+        critic_state = critic_blob.get("actor", critic_blob)
+        critic_state = {
+            k.removeprefix("critic."): v for k, v in critic_state.items()
+            if k.startswith("critic.")
+        }
+        if not critic_state:
+            raise ValueError(f"{args.critic_ckpt} contains no critic parameters")
+        actor.critic.load_state_dict(critic_state, strict=True)
+        print(f"[critic] initialized from {args.critic_ckpt} "
+              f"({len(critic_state)} tensors)", flush=True)
     counts = actor.param_counts()
     print(f"[actor] trainable {counts['trainable']:,} "
           f"(lora {counts['lora']:,} + head {counts['gaussian_head']:,} + "
@@ -306,7 +335,14 @@ def main(argv=None) -> int:
     # ---- schedule / mpc / reward -------------------------------------------
     kit = A.DrumKit.from_layout()
     clips = A.load_rcc_pool(A.default_rcc_dir(cfg.env.rhythm_split), kit)
-    clips = clips[: max(int(args.clips), 1)]
+    if args.clip_index is not None:
+        if not 0 <= int(args.clip_index) < len(clips):
+            raise IndexError(f"clip index {args.clip_index} outside [0, {len(clips)})")
+        clips = [clips[int(args.clip_index)]]
+        print(f"[clip] fixed {cfg.env.rhythm_split} clip index {args.clip_index}: "
+              f"{clips[0].name}", flush=True)
+    else:
+        clips = clips[: max(int(args.clips), 1)]
     clips, pad_stats = pad_clip_pool(clips, cfg.env.first_hit_s)
     clips = ensure_clip_gap(clips, cfg.env.clip_gap_s)
     print(describe_clip_pad(pad_stats), flush=True)
@@ -375,7 +411,17 @@ def main(argv=None) -> int:
         # whose group means differ by ~1e3.
         rnea = (_rnea_cpu.to(dev, dtype) if _rnea_cpu is not None
                 else A.BatchedRNEA.from_urdf(device=dev).to(dev, dtype))
-        cost = A.FusedCost(phase2_cost_config(), rnea=rnea,
+        if args.aux_cost_source == "checkpoint":
+            saved_cost = (ck.get("train_cfg") or {}).get("cost")
+            if not isinstance(saved_cost, dict):
+                raise ValueError("--aux-cost-source checkpoint requested but "
+                                 "checkpoint has no train_cfg.cost")
+            cost_cfg = A.CostConfig(**saved_cost)
+            print("[aux] restored exact CostConfig from backbone checkpoint",
+                  flush=True)
+        else:
+            cost_cfg = phase2_cost_config()
+        cost = A.FusedCost(cost_cfg, rnea=rnea,
                            max_horizon=H, device=dev, dtype=dtype)
     print(f"[aux] analytic cost gate={gate!r} -> "
           f"{'ON' if cost is not None else 'OFF'} "
@@ -387,7 +433,12 @@ def main(argv=None) -> int:
 
     RewardConfig = surface.RewardConfig
     rcfg = RewardConfig()
+    rcfg.reward_mode = args.reward_mode
+    rcfg.w_correct_hit = float(args.correct_hit_weight)
+    rcfg.w_wrong_hit = float(args.wrong_hit_weight)
     rcfg.w_plan_cost = cfg.reward_plan_cost_weight
+    print(f"[reward] mode={rcfg.reward_mode} correct={rcfg.w_correct_hit:g} "
+          f"wrong={rcfg.w_wrong_hit:g}", flush=True)
     scorer = surface.ExecutedStrikeScorer(fk=fk, dt=float(env.step_dt), device=dev,
                                           dtype=dtype)
     reward = surface.ExecutedReward(rcfg, scorer=scorer, cost=cost, device=dev,
@@ -428,9 +479,25 @@ def main(argv=None) -> int:
               f"(missing={len(missing)} unexpected={len(unexpected)})", flush=True)
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2,
+    config_record = cfg.to_dict()
+    config_record["launch_args"] = vars(args)
+    (run_dir / "config.json").write_text(json.dumps(config_record, indent=2,
                                                     default=str))
     logger = JsonlLogger(run_dir / "metrics.jsonl")
+    from torch.utils.tensorboard import SummaryWriter
+    tb_dir = run_dir / "tb"
+    tb = SummaryWriter(str(tb_dir))
+    registry = ROOT / "runs" / "tensorboard_active"
+    registry.mkdir(parents=True, exist_ok=True)
+    link = registry / run_dir.name
+    if link.is_symlink() or link.exists():
+        if link.is_symlink() and link.resolve() == tb_dir.resolve():
+            pass
+        else:
+            raise FileExistsError(f"TensorBoard registry entry already exists: {link}")
+    else:
+        link.symlink_to(tb_dir.resolve())
+    print(f"[tensorboard] logdir={tb_dir} registered={link}", flush=True)
 
     def save(tag: str, it: int) -> None:
         torch.save({"actor": actor.policy_state_dict(),
@@ -468,6 +535,10 @@ def main(argv=None) -> int:
                **{f"train/{k}": v for k, v in stats.items()},
                **roll_log}
         logger.write(row)
+        for key, value in row.items():
+            if isinstance(value, (int, float)):
+                tb.add_scalar(key, value, it)
+        tb.flush()
         if it % cfg.log_interval == 0:
             print(f"[{it:5d}] R {roll_log.get('reward/total', float('nan')):+8.3f} "
                   f"| kl {stats['kl']:.5f} lr {stats['learning_rate']:.2e} "
@@ -490,6 +561,7 @@ def main(argv=None) -> int:
 
     save("last", cfg.max_iterations - 1)
     logger.close()
+    tb.close()
     # Isaac's ``app.close()`` HANGS in the carb tasking mutex (it serialised the
     # sibling's queued runs behind a 28-minute timeout), so teardown is a hard
     # exit after the artifacts are flushed -- the same thing their scripts do.

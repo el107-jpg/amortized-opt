@@ -530,7 +530,7 @@ class TorquePlant:
                 training = training + 0.5 * pen * live.square()
         pen_peak = self.weights.get("pen_torque_peak")
         if pen_peak is not None:
-            training = training + 0.5 * pen_peak * hard_peak.square()
+            training = training + 0.5 * pen_peak * peak.square()
         z = torch.zeros_like(qf)
         gravity = self.rnea.rnea(qf, z, z).reshape(B, S, D)
         velocity_bias = (

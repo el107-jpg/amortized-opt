@@ -220,6 +220,9 @@ class ActorConfig:
     #: Which decoder sub-matrices carry a delta.  The plan's "low-rank deltas on
     #: the decoder only": attention OUT-projections and the two FFN matrices.
     lora_targets: tuple[str, ...] = ("o_proj", "w12", "w3")
+    #: Optional output rows for LoRA-wrapped projection heads.  The forward
+    #: delta is structurally zero outside these rows.
+    lora_output_rows: tuple[int, ...] | None = None
     #: Restrict LoRA to the decoder body.  The encoder runs frozen and under
     #: ``no_grad`` at update time, which is most of the update's memory saving.
     lora_decoder_only: bool = True
@@ -360,6 +363,14 @@ class OrthGradConfig:
     #: knot that actually runs.
     wp0_leak: float = 0.0
     eps: float = 1e-8
+    #: Post-Adam LoRA trust region on the same minibatch's full analytic
+    #: constraint objective.  PPO's KL controls the executed Gaussian mean but
+    #: does not protect the unexecuted trajectory tail.
+    trust_region: bool = False
+    trust_rel_tol: float = 0.01
+    trust_abs_tol: float = 1.0e-6
+    trust_backtracks: int = 4
+    trust_shrink: float = 0.5
 
 
 @dataclass
@@ -627,6 +638,12 @@ class PpoRunConfig:
             raise ValueError("orth.traj_grad_scale must be >= 0")
         if not (0.0 <= self.orth.wp0_leak <= 1.0):
             raise ValueError("orth.wp0_leak must be in [0, 1]")
+        if self.orth.trust_rel_tol < 0.0 or self.orth.trust_abs_tol < 0.0:
+            raise ValueError("trust-region tolerances must be nonnegative")
+        if self.orth.trust_backtracks < 1:
+            raise ValueError("trust_backtracks must be positive")
+        if not 0.0 < self.orth.trust_shrink < 1.0:
+            raise ValueError("trust_shrink must be in (0, 1)")
 
     # --------------------------------------------------------------- paths ---
     def run_dir(self) -> Path:

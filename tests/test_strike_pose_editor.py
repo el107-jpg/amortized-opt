@@ -129,6 +129,8 @@ def test_clean_app_construction_is_cpu_only_and_config_is_canonical(tmp_path, mo
     assert cfg["seeds"] and cfg["drums"] and cfg["yaw_bins_rad"]
     assert set(cfg["hands"]) == {"left", "right"}
     assert cfg["sampling_mode"] == "random_il_teaching"
+    assert cfg["default_optimizer_backend"] in {"hpipm", "adam"}
+    assert {row["id"] for row in cfg["optimizer_backends"]} == {"hpipm", "adam"}
     assert torch.get_num_threads() == 1
     assert torch.cuda.is_initialized() == cuda_was_initialized
     assert app.state.store.root == (tmp_path / "runs" / "test_session").resolve()
@@ -149,6 +151,11 @@ def test_clean_app_construction_is_cpu_only_and_config_is_canonical(tmp_path, mo
     assert 'id="ik-azimuth"' in page.text
     assert 'id="ik-waist-yaw"' in page.text
     assert 'id="ik-solve"' in page.text
+    assert 'id="optimizer-backend"' in page.text
+    assert 'id="sqp-initialization"' in page.text
+    assert "HPIPM SQP" in page.text
+    assert "Adam fallback" in page.text
+    assert "Fresh terminal quintic" in page.text
     assert "dashed stick + bullseye show the unsolved IK target" in page.text
     assert "/task-ik" in script.text
     assert "function drawTaskTarget" in script.text
@@ -160,6 +167,8 @@ def test_clean_app_construction_is_cpu_only_and_config_is_canonical(tmp_path, mo
     assert "previewInFlight" in script.text
     assert "if (state.previewTimer || state.previewInFlight) return" in script.text
     assert "if (state.previewDirty) schedulePosePreview()" in script.text
+    assert "ui.optimizerBackend.value" in script.text
+    assert "ui.sqpInitialization.value" in script.text
     assert "torso/legs are a planted visual reference" in page.text
 
 
@@ -437,6 +446,7 @@ def test_actor_proposal_and_direct_teacher_round_trip_are_session_local(tmp_path
         json={
             "iterations": 1,
             "lr": 1.0e-4,
+            "backend": "adam",
             "task_constraint": {
                 "hand": "left",
                 "contact_position": contact_target,
@@ -451,6 +461,8 @@ def test_actor_proposal_and_direct_teacher_round_trip_are_session_local(tmp_path
     assert len(result["trajectories"]["teacher"]) == 50
     assert len(result["geometry"]["teacher"]["frames"]) == 50
     assert result["rounds"][-1]["iteration"] == 1
+    assert result["rounds"][-1]["backend"] == "adam"
+    assert result["optimizer_backend"] == "adam"
     assert result["task_constraint"]["hand"] == "left"
     assert result["diagnostics"]["teacher"]["task_space"]["left"]
 

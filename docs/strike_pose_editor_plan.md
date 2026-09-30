@@ -9,8 +9,9 @@ using the actor as the teacher:
    goal drums, and two time-to-hit values.
 2. Feed the existing analytic quintic to the current amortized actor as its
    normal hidden initialization input.
-3. Display the actor's resulting `50 x 17` proposal, then refine that waypoint
-   tensor directly through the differentiable `FusedCost` physics objective.
+3. Display the actor's resulting `50 x 17` proposal, then refine it with the
+   full-body HPIPM Gauss-Newton SQP. Adam over the differentiable `FusedCost`
+   remains available as an explicit fallback.
 4. Inspect every waypoint in an orbitable 3D view. Add hard or soft partial
    joint keyframes at any active waypoint and re-run the direct solve.
 5. Save the complete optimized tensor as an IL teacher.
@@ -34,6 +35,12 @@ SESSION=my_trajectory_session PORT=6010 scripts/run_strike_pose_editor.sh
 Open `http://localhost:6010`. The default actor checkpoint is
 `runs/rhythm_timing_direct_admission_gpu1_20k_20260918/step_020000.pt`; set
 `CHECKPOINT=/absolute/path/to/step.pt` before launching to choose another one.
+
+The HPIPM option discovers the normal sibling checkout at
+`../g1-drummer-lab-rythmic`. For another layout, set `G1_DRUMMER_REPO` to that
+repository root or `G1_DRUMMER_CONTROL` directly to its `control/` directory.
+If the checkout or native HPIPM libraries are unavailable, the app advertises
+only the Adam backend rather than silently changing solvers during a request.
 
 The server stays in the foreground and stops with Ctrl-C. Session data is
 written only below `runs/strike_pose_editor/<session>/`:
@@ -61,9 +68,18 @@ written only below `runs/strike_pose_editor/<session>/`:
 - Optional joint keyframes provide additional posture guidance. Soft keyframes
   add a weighted differentiable objective; hard keyframes are projected exactly
   after every optimizer update.
-- **Optimize** runs 60 direct Adam/augmented-Lagrangian refinement steps from
-  the actor proposal; **Reoptimize** runs another 30 from the current best
-  trajectory. The actor stays frozen and outside this objective.
+- **Optimize** defaults to 15 HPIPM SQP iterations from the current actor or
+  teacher trajectory; **Reoptimize** runs another 8 from the current best
+  trajectory. An **SQP initialization** selector can instead build a fresh,
+  velocity-matched quintic from the measured start state to the edited IK
+  terminal pose. It replaces the selected arm and waist while retaining the
+  other arm's analytic quintic, so the other strike is not seeded from an
+  unrelated pose. The SQP
+  repeatedly linearizes kinematics, collision and inverse dynamics and solves
+  a horizon-structured QP. Its output is rescored by the editor's `FusedCost`,
+  which remains authoritative for the newer fixed-leg geometry. The optimizer
+  selector can instead run the legacy 60/30-step direct Adam solve. The actor
+  stays frozen and outside either objective.
 - **Save teacher trajectory** is enabled only after the refined path passes the
   displayed terminal, impact-speed, collision, torque, velocity, joint-box,
   and signed approach-corridor checks; it then snapshots the path and context.
@@ -106,6 +122,11 @@ Trajectory endpoints are:
 
 The older terminal-pose endpoints remain available for compatibility, but the
 browser workflow no longer uses them.
+
+The optimize request accepts `backend: "hpipm" | "adam" | "auto"`. `auto`
+chooses HPIPM when the sibling drummer checkout and its native libraries are
+available, otherwise Adam. The browser sends the selected explicit backend;
+there is no silent fallback after an HPIPM solve starts.
 
 ## Verification
 

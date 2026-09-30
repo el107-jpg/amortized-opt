@@ -157,9 +157,40 @@ class LoRALinear(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Keep dropout on the ordinary adapter path.  ``weight`` below exists
+        # for projection heads that the backbone evaluates with ``F.linear``
+        # directly (TrajectoryDecoder's fp32 head path).
+        if isinstance(self.dropout, nn.Identity):
+            return F.linear(x, self.weight, self.bias)
         out = self.base(x)
         delta = F.linear(F.linear(self.dropout(x), self.lora_a), self.lora_b)
+        mask = getattr(self, "output_mask", None)
+        if mask is not None:
+            delta = delta * mask.to(device=delta.device, dtype=delta.dtype)
         return out + self.scaling * delta
+
+    @property
+    def weight(self) -> torch.Tensor:
+        delta = self.lora_b @ self.lora_a
+        mask = getattr(self, "output_mask", None)
+        if mask is not None:
+            delta = delta * mask.to(device=delta.device, dtype=delta.dtype).unsqueeze(-1)
+        return self.base.weight + self.scaling * delta
+
+    @property
+    def bias(self) -> torch.Tensor | None:
+        return self.base.bias
+
+    def restrict_output_rows(self, rows: tuple[int, ...]) -> None:
+        """Make the LoRA delta identically zero outside selected output rows."""
+        clean = tuple(sorted({int(row) for row in rows}))
+        if not clean or clean[0] < 0 or clean[-1] >= self.base.out_features:
+            raise ValueError(
+                f"LoRA output rows {clean} invalid for width {self.base.out_features}"
+            )
+        mask = torch.zeros(self.base.out_features)
+        mask[list(clean)] = 1.0
+        self.register_buffer("output_mask", mask, persistent=False)
 
     def extra_repr(self) -> str:
         return (f"in={self.base.in_features}, out={self.base.out_features}, "
@@ -428,6 +459,10 @@ class AmortizedPpoActor(nn.Module):
                 f"LoRA targets {cfg.lora_targets} matched nothing under "
                 f"{'decoder' if cfg.lora_decoder_only else 'model'}; the "
                 f"fine-tune would have no trainable backbone parameters.")
+        if cfg.lora_output_rows is not None:
+            for module in root.modules():
+                if isinstance(module, LoRALinear):
+                    module.restrict_output_rows(tuple(cfg.lora_output_rows))
 
         # ---- the Gaussian head ---------------------------------------------
         # ``std`` is the parameter (rsl_rl's "scalar" noise_std_type), not

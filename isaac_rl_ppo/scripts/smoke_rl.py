@@ -188,7 +188,8 @@ def main(argv=None) -> int:
     report["reward"] = log
     checks["2_batched_mpc_runs"] = bool(torch.isfinite(q).all())
     checks["3_reward_decomposes"] = all(
-        f"terms/{k}" in log for k in ("hit", "timing", "speed", "miss", "track"))
+        f"terms/{k}" in log
+        for k in ("hit_error", "impact_speed", "collision_avoidance"))
     print(f"[2] throughput: {thr['env_fps']:.0f} env-steps/s "
           f"({thr['realtime_factor']:.2f}x realtime), "
           f"plan {100*thr['share_plan']:.0f}% / plant {100*thr['share_plant']:.0f}% / "

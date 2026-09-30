@@ -1,18 +1,18 @@
-"""Phase-1 warm-start trajectories: the quintic straight line + its noise (section 5).
+"""Phase-1 warm-start trajectories: accelerating strike seeds + input noise.
 
-The plan's phase-1 curriculum is imitation of a *cheap* trajectory: "literally
-just a quintic straight line to the closest joint position out of a library per
-drum that satisfies terminal position conditions", with the waist following the
-pre-built aim system. This module builds exactly that, plus the input noise the
-model's initialization is fed with.
+The phase-1 curriculum imitates cheap trajectories to library terminal poses,
+with the waist following the pre-built aim system. Active arms use a short
+acceleration ramp followed by constant acceleration, matching measured initial
+velocity and leaving arrival velocity free. Waist and idle motion still use
+rest-at-target quintics.
 
 Three pieces:
 
 * :class:`GoalPoseLibrary` -- the per-(hand, drum, waist-yaw) terminal pose
   library, read from the vendored ``assets/drum_goal_poses.json``.
 * :func:`warmstart_trajectory` -- a dual-arm, waist-coupled (H+1, 17) command
-  trajectory on the 50 Hz grid. Each arm runs its own quintic straight line to
-  its own library pose, retimed to its own hit time and then holding; the waist
+  trajectory on the 50 Hz grid. Each active arm reaches its library pose at
+  its own hit time and continues moving through contact; the waist
   runs :func:`~amortized_opt.waist_aim.waist_reference_block`, which is a
   quintic yaw ramp with pitch and roll frozen. The two arms are therefore
   *decoupled in the seed* and coupled only through the shared waist -- which is
@@ -46,6 +46,7 @@ from .constants import (
 )
 from .limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from .spline import retime_joint_path
+from .strike_seed import accelerating_path_numpy
 from .waist_aim import WaistAimConfig, aim_yaw, waist_reference_block
 
 __all__ = [
@@ -503,7 +504,7 @@ def warmstart_trajectory(
     idle_settle_wp: int = 10,
     terminal_arm: dict[str, np.ndarray | None] | None = None,
 ) -> WarmStart:
-    """Quintic straight-line seed to each hand's library pose + the waist ramp.
+    """Velocity-matched accelerating strike seeds + settling waist/idle ramps.
 
     ``goals`` maps a hand to ``(drum_name, time_to_hit_seconds)`` or ``None``
     (idle). ``aim_targets`` are the per-hand tip targets the waist aims at
@@ -520,12 +521,12 @@ def warmstart_trajectory(
     ``aim_futures`` alone is enough to aim a hand whose goal the horizon cap
     demoted, which is why the ``aim_targets``-empty case still runs the law.
 
-    Each arm's path is the two-pose polyline ``[q_start_arm, q_goal_arm]``
-    retimed by :func:`~amortized_opt.spline.retime_joint_path` over that hand's
-    own horizon, with the start velocity projected onto the path tangent and
-    the terminal at rest; past its hit the arm holds its terminal pose (those
-    waypoints are masked out of the loss anyway, but a held pose keeps the
-    tensor finite and the FK aux targets meaningful).
+    Active arms use :func:`~amortized_opt.strike_seed.accelerating_path_numpy`:
+    match measured initial velocity, ramp acceleration over the first 10%
+    of the window, then hold acceleration through the strike. From rest the
+    path is straight; off-path initial velocities necessarily bend it. The
+    masked post-hit tail tapers acceleration to zero and coasts, subject to
+    the existing joint-box clamp. Idle arms still settle at rest.
 
     Waist-yaw safety (2026-08-10, phase-2 prerequisite fix A)
     --------------------------------------------------------
@@ -584,10 +585,8 @@ def warmstart_trajectory(
     fallback when no cylinder library is supplied.  ``None`` for both keeps
     hold-in-place.
 
-    ``slew_limit_eta`` (off by default, so phase-1 targets are unchanged bit for
-    bit) applies the same per-waypoint speed bound to **every** joint.  The
-    quintic seed is velocity-unlimited by construction -- ``retime_joint_path``
-    only uses ``v_limit`` to clip the start-velocity projection -- so an
+    ``slew_limit_eta`` (off by default) applies the same per-waypoint speed
+    bound to **every** joint. The seed is velocity-unlimited, so an
     aggressive hit spacing makes it command several times the rating.  Turn it
     on wherever the seed is *executed* rather than merely used as an init.
     """
@@ -695,7 +694,7 @@ def warmstart_trajectory(
                 col = _boundary_quintic(q_from, v_from, q_to, k_ease, H, float(dt))
             out[:, ci] = col
 
-    # ---- arms: independent quintic straight lines to the library pose ----
+    # ---- arms: independent velocity-matched strikes to the library pose ----
     for hand in ("left", "right"):
         idx = arm_slice(hand, names)
         goal = goals.get(hand)
@@ -778,19 +777,9 @@ def warmstart_trajectory(
         else:
             q_term = np.asarray(q_term, float).reshape(len(idx))
             used[hand] = f"{drum}@corrected"
-        Q = np.stack([q0[idx], q_term])
-        X, rate = retime_joint_path(
-            Q,
-            k_hit + 1,
-            float(dt),
-            v_start=v0[idx],
-            v_limit=v_lim[idx],
-            q_lower=lo[idx] if clamp else None,
-            q_upper=hi[idx] if clamp else None,
-        )
-        peak[hand] = float(rate)
-        out[: k_hit + 1, idx] = X
-        out[k_hit + 1 :, idx] = X[-1][None, :]
+        X = accelerating_path_numpy(q0[idx], v0[idx], q_term, k_hit, H, float(dt))
+        peak[hand] = float(np.linalg.norm(np.diff(X, axis=0) / float(dt), axis=1).max())
+        out[:, idx] = X
 
     if clamp:
         out = np.clip(out, lo[None, :], hi[None, :])

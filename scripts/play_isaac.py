@@ -543,9 +543,8 @@ def load_model(ckpt_path: Path, device: torch.device):
     * the older RL tree's (``rl2*``): same, but progress is under ``iter``;
     * ``isaac_rl_ppo`` PPO checkpoints: LoRA adapters (``actor``) over a frozen
       backbone referenced by path (``backbone_ckpt``).  The adapters are merged
-      into the backbone weights, which reproduces the fine-tuned policy MEAN up
-      to the actor's small ``mean_correction`` head (that head needs the
-      actor's own forward pass, which this player does not drive).
+      into the backbone weights and the small mean-correction head is retained
+      in ``cfg`` for :class:`AmortizedMPCAgent` to apply to the executed command.
     """
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if not isinstance(ck, dict):
@@ -560,9 +559,15 @@ def load_model(ckpt_path: Path, device: torch.device):
         n = _merge_lora(sd, ck["actor"], scaling)
         print(f"[ckpt] PPO LoRA checkpoint: merged {n} adapter pairs "
               f"(scaling {scaling:g}) into backbone {bb_path}")
-        if any(k.startswith("mean_correction.") for k in ck["actor"]):
-            print("[ckpt] NOTE: the actor's mean_correction head is NOT applied; "
-                  "playback is backbone + merged LoRA only.")
+        mean_state = {
+            k.removeprefix("mean_correction."): v
+            for k, v in ck["actor"].items()
+            if k.startswith("mean_correction.")
+        }
+        mean_scale = float(acfg.get("mean_correction_scale", 0.1))
+        if mean_state:
+            print(f"[ckpt] PPO mean-correction head retained "
+                  f"(scale {mean_scale:g})")
         step = ck.get("iteration", -1)
     elif "model" in ck and "model_cfg" in ck:
         src = ck
@@ -594,6 +599,12 @@ def load_model(ckpt_path: Path, device: torch.device):
         # IsaacMPC's reset seed follows it (None = hold the measured lean)
         "waist_upright_ease_wp": (
             (src.get("scenario_cfg") or {}).get("waist_upright_ease_wp")
+        ),
+        "ppo_mean_correction_state": (
+            mean_state if "actor" in ck and "model_cfg" not in ck else None
+        ),
+        "ppo_mean_correction_scale": (
+            mean_scale if "actor" in ck and "model_cfg" not in ck else 0.0
         ),
     }
     return model, cfg, ck, mcfg
@@ -654,6 +665,27 @@ class AmortizedMPCAgent:
         self._v_lim = torch.as_tensor(
             isaac_velocity_limits(self._joint_names), dtype=torch.float32,
         )
+
+        # PPO's deterministic policy is the merged-LoRA MPC command plus a
+        # small correction read from decoder waypoint-0 hidden state.  Capture
+        # the same final-norm output as AmortizedPpoActor and apply the offset
+        # after reference lead, then re-impose the deployed slew/box bounds.
+        self._ppo_hidden = None
+        self._ppo_mean_correction = None
+        self._ppo_mean_scale = float(cfg.get("ppo_mean_correction_scale", 0.0))
+        mean_state = cfg.get("ppo_mean_correction_state")
+        if mean_state:
+            head = torch.nn.Linear(int(model.cfg.d_model), len(self._joint_names))
+            head.load_state_dict(mean_state, strict=True)
+            head.to(device=dev, dtype=torch.float32).eval()
+            self._ppo_mean_correction = head
+
+            def _capture_ppo_hidden(_module, _inputs, output):
+                self._ppo_hidden = output
+
+            model.decoder.norm.register_forward_hook(_capture_ppo_hidden)
+            print(f"[agent] PPO mean correction ON "
+                  f"(scale {self._ppo_mean_scale:g})", flush=True)
 
         self._rnea = None
         self._vcmd_prev = torch.zeros(len(self._joint_names), dtype=torch.float32)
@@ -1063,7 +1095,23 @@ class AmortizedMPCAgent:
         )
 
         # Store command for the hook to pick up
-        cmd = result.cmd[0].cpu().to(torch.float32)
+        cmd_dev = result.cmd.to(device=dev, dtype=torch.float32)
+        if self._ppo_mean_correction is not None and self._ppo_hidden is not None:
+            hidden = self._ppo_hidden[:, 1].to(torch.float32)
+            correction = self._ppo_mean_scale * self._ppo_mean_correction(hidden)
+            cmd_dev = cmd_dev + correction
+            if self.mpc.step_max is not None:
+                prev = self.mpc.prev_cmd.to(cmd_dev)
+                step = self.mpc.step_max.to(cmd_dev)
+                cmd_dev = prev + torch.clamp(cmd_dev - prev, -step, step)
+            cmd_dev = torch.clamp(
+                cmd_dev, self.mpc.q_lo.to(cmd_dev), self.mpc.q_hi.to(cmd_dev)
+            )
+            # Keep TickResult diagnostics aligned with the command sent to the
+            # plant; the MPC's pending tail remains intentionally unchanged,
+            # matching executed-prefix PPO training.
+            result.cmd.copy_(cmd_dev.to(result.cmd))
+        cmd = cmd_dev[0].cpu().to(torch.float32)
         self._q_des_raw = cmd.clone()  # pre-lead reference for logging
 
         # --- dynamics lead: q_cmd = q_ref + Kp^-1 * M(q) * qdd_ref ---------
@@ -1266,6 +1314,7 @@ class AmortizedMPCAgent:
             self._q_des.unsqueeze(0).to(dev),  # the command we just executed
             q.unsqueeze(0).to(dev),
             fired,
+            qd=qd.unsqueeze(0).to(dev),
         )
 
     def _hit_geometry(self, q: torch.Tensor, hand: str, drum: int) -> dict:
@@ -1314,9 +1363,16 @@ class AmortizedMPCAgent:
     ) -> None:
         stats = self._plan_constraint_stats(result, q)
         _tth, drum_ids, goal_pos, goal_vel, _valid, _active = self.schedule.goal()
+        yaw_i = self._joint_names.index("waist_yaw_joint")
+        ctx = getattr(self.mpc, "_ctx", None)
+        aim_yaw = (
+            float(ctx.aim_yaw[0].detach().cpu().item())
+            if ctx is not None and getattr(ctx, "aim_yaw", None) is not None
+            else None
+        )
         for h, hand in enumerate(("left", "right")):
             k = int(result.hit_index[0, h].item())
-            if k < 1 or k > 20:
+            if k < 1 or k > 50:
                 continue
             cursor = int(self.schedule.cursor[0, h].item())
             key = (h, cursor)
@@ -1326,6 +1382,10 @@ class AmortizedMPCAgent:
                 # terminal tick retain the network's un-led proposal instead.
                 endpoint = self.mpc.last_ref0[0].detach().clone()
             drum = int(drum_ids[0, h].item())
+            span = min(k, int(result.traj.shape[1]))
+            init_yaw = self.mpc.init[0, :span, yaw_i].detach().cpu().float()
+            generated_yaw = result.traj[0, :span, yaw_i].detach().cpu().float()
+            goal_xy = goal_pos[0, h, :2].detach().cpu().float()
             row = {
                 "ticks_to_hit": k,
                 "time_s": now,
@@ -1335,11 +1395,22 @@ class AmortizedMPCAgent:
                 "qd": qd.detach().cpu().float().tolist(),
                 "goal_pos_env": goal_pos[0, h].detach().cpu().float().tolist(),
                 "goal_velocity_env": goal_vel[0, h].detach().cpu().float().tolist(),
+                "waist_yaw": {
+                    "measured_rad": float(q[yaw_i].detach().cpu().item()),
+                    "aim_yaw_rad": aim_yaw,
+                    "goal_azimuth_rad": float(torch.atan2(goal_xy[1], goal_xy[0]).item()),
+                    "init_rad": init_yaw.tolist(),
+                    "generated_rad": generated_yaw.tolist(),
+                    "init_delta_rad": float(init_yaw[-1] - q[yaw_i].detach().cpu()),
+                    "generated_delta_rad": float(
+                        generated_yaw[-1] - q[yaw_i].detach().cpu()
+                    ),
+                },
             }
             trace = self._hit_diag_trace.setdefault(key, [])
             trace.append(row)
-            if len(trace) > 20:
-                del trace[:-20]
+            if len(trace) > 50:
+                del trace[:-50]
             if k == 1:
                 event = {
                     "scheduled_time_s": float(now + self.dt),

@@ -307,3 +307,28 @@ def test_new_probe_does_not_report_an_existing_failed_probe_as_fresh():
 
     assert state._new_probe(50, np.random.default_rng(1), step=100) is None
     assert len(state.probes) == 1
+
+
+def test_new_probe_skips_position_cells_outside_joint_box():
+    parent = VoxelKey(9, 50, (0,) * N_DOF, (1,) * N_DOF)
+    child = VoxelKey(9, 50, (1,) + (0,) * (N_DOF - 1), (1,) * N_DOF)
+    proposal = ExpansionProposal(
+        parent=parent, key=child, parent_hit_pair=(15, 40),
+        hit_pair=(15, 40), finishing_hand=1,
+    )
+    state = object.__new__(_VoxelTrainingState)
+    from amortized_opt.voxel_pool import VoxelPool
+    state.pool = VoxelPool(q_cell_rad=0.02)
+    state.pool.ingest(parent, hit_pair=(15, 40), finishing_hand=1)
+    state.pool.expand_at = lambda _parent, **_kwargs: (proposal,)
+    state.source = SimpleNamespace(
+        q_lo=torch.full((N_DOF,), -0.5),
+        q_hi=torch.tensor([0.0] + [0.5] * (N_DOF - 1)),
+    )
+    state.templates = {parent: [(7, (15, 40))]}
+    state.probes = ProbeBuffer(capacity=4)
+    state.probe_templates = {}
+    state.probe_finishing_hands = {}
+
+    assert state._new_probe(50, np.random.default_rng(1), step=100) is None
+    assert len(state.probes) == 0

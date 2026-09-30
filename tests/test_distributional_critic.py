@@ -193,10 +193,11 @@ def test_online_distributional_anchor_curriculum_opens_and_checkpoints():
     gate[:, 6] = cfg.joint_limit
     gate[:, 7] = cfg.torque_limit
     trainer.observe_gate(
-        features, gate, actor_step=0,
+        features, gate, actor_step=17,
         anchor_mask=torch.ones(40, dtype=torch.bool),
     )
     assert trainer.curriculum_open
+    assert trainer.curriculum_open_actor_step == 17
     assert torch.isfinite(torch.tensor(trainer.risk_threshold))
     assert trainer.manageable(features).shape == (40,)
     metrics = trainer.metrics()
@@ -209,5 +210,92 @@ def test_online_distributional_anchor_curriculum_opens_and_checkpoints():
     restored = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=8)
     restored.load_state_dict(trainer.state_dict())
     assert restored.curriculum_open
+    assert restored.curriculum_open_actor_step == 17
     assert restored.anchor_samples == 40
     assert restored.risk_threshold == trainer.risk_threshold
+
+
+def test_terminal_band_success_latch_unlocks_and_checkpoints():
+    cfg = ViolationCriticConfig(
+        representation="distributional", short_floor_wp=8,
+        short_unlock_min_samples=8, short_unlock_success=0.5,
+        short_success_ema=0.0,
+    )
+    trainer = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=3)
+    assert not trainer.terminal_band_unlocked
+    trainer.observe_terminal_band(torch.tensor([True, False, True, False]))
+    assert not trainer.terminal_band_unlocked
+    trainer.observe_terminal_band(torch.tensor([True, True, False, True]))
+    assert trainer.terminal_band_unlocked
+    assert trainer.terminal_band_samples == 8
+    assert trainer.terminal_band_success_ema == pytest.approx(0.75)
+
+    restored = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=4)
+    restored.load_state_dict(trainer.state_dict())
+    assert restored.terminal_band_unlocked
+    assert restored.terminal_band_samples == 8
+
+
+def test_boundary_manageability_controller_backs_off_and_readvances():
+    cfg = ViolationCriticConfig(
+        representation="distributional", short_floor_wp=8,
+        coarse_step_knots=5, boundary_min_manageable=0.5,
+        boundary_manageable_margin=0.1, boundary_rate_ema=0.0,
+        boundary_floor_update_every=1,
+    )
+    trainer = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=5)
+    trainer.observe_boundary(
+        torch.tensor([True, False, False, False]), actor_step=10, horizon=50,
+    )
+    assert trainer.boundary_manageable_ema == pytest.approx(0.25)
+    assert trainer.boundary_floor_wp == 13
+    trainer.observe_boundary(
+        torch.tensor([True, True, True, False]), actor_step=11, horizon=50,
+    )
+    assert trainer.boundary_manageable_ema == pytest.approx(0.75)
+    assert trainer.boundary_floor_wp == 8
+
+    restored = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=6)
+    restored.load_state_dict(trainer.state_dict())
+    assert restored.boundary_floor_wp == 8
+    assert restored.boundary_manageable_ema == pytest.approx(0.75)
+
+
+def test_anchor_curriculum_ramp_checkpoint_and_legacy_open_resume():
+    cfg = ViolationCriticConfig(
+        mode="assist", representation="distributional", num_heads=3,
+        batch_size=16, updates_per_step=1, recent_capacity=128,
+        audit_capacity=16, risk_recalibrate_every=1,
+        global_ood_fraction=0.0,
+        anchor_curriculum=True, anchor_min_samples=32,
+        anchor_min_close_rate=0.5, anchor_curriculum_ramp_steps=100,
+    )
+    trainer = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=7)
+    features = torch.randn(40, 42)
+    gate = torch.zeros(40, 8)
+    gate[:, 4] = cfg.terminal_limit
+    gate[:, 5] = cfg.collision_sdf_limit
+    gate[:, 6] = cfg.joint_limit
+    gate[:, 7] = cfg.torque_limit
+    trainer.observe_gate(
+        features, gate, actor_step=40,
+        anchor_mask=torch.ones(40, dtype=torch.bool),
+    )
+    assert trainer.curriculum_open_actor_step == 40
+    assert trainer.curriculum_ramp_fraction(40) == 0.0
+    assert trainer.curriculum_ramp_fraction(90) == 0.5
+    assert trainer.curriculum_ramp_fraction(140) == 1.0
+
+    restored = OnlineDistributionalCriticTrainer(42, cfg, device="cpu", seed=8)
+    restored.load_state_dict(trainer.state_dict())
+    assert restored.curriculum_ramp_fraction(90) == 0.5
+
+    legacy = trainer.state_dict()
+    legacy.pop("curriculum_open_actor_step")
+    legacy_restored = OnlineDistributionalCriticTrainer(
+        42, cfg, device="cpu", seed=9,
+    )
+    legacy_restored.load_state_dict(legacy)
+    assert legacy_restored.curriculum_open
+    assert legacy_restored.curriculum_open_actor_step is None
+    assert legacy_restored.curriculum_ramp_fraction(40) == 1.0

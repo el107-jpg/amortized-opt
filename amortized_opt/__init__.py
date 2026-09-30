@@ -77,6 +77,7 @@ from .model import (
     model_config_from_checkpoint,
     param_counts,
 )
+from .terminal_initializer import TerminalInitializer
 from .impedance import (
     ContactAwareStrikeImpedance,
     ContactAwareStrikeImpedanceConfig,
@@ -371,6 +372,7 @@ __all__ = [
     "ModelConfig",
     "TrajectoryDecoder",
     "TrajectoryOutput",
+    "TerminalInitializer",
     "WaypointMasks",
     "build_waypoint_masks",
     "drum_tensors_from_scene",

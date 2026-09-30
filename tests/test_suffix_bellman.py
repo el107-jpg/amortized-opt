@@ -10,13 +10,12 @@ these tests pin:
 * the child's element mask IS the shifted parent mask on the overlap -- the
   property the tie mask relies on;
 * a child that echoes its init (== the shifted parent) ties at exactly zero;
-* the gradient topology: the tie couples child to parent, the child's COST
-  anchor does not reach the parent (the handoff is detached).
+* the gradient topology: the verified parent is a fully detached teacher and
+  only the child actor receives the suffix gradient.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -28,9 +27,6 @@ from amortized_opt.cost import CostConfig, FusedCost
 from amortized_opt.tokenizer import build_waypoint_masks
 from amortized_opt.train_cost import (
     Phase2Config,
-    _strike_rows,
-    effective_hits,
-    group_lengths,
     make_suffix_step,
     shift_plan,
     suffix_offsets,
@@ -89,6 +85,11 @@ def test_suffix_offsets_keep_strikes_ahead():
     assert (offs[2::4] == 0).all()
     assert (offs[3::4] <= H - 1).all() and offs[3::4].max() > 0
 
+    replay_offs = suffix_offsets(hit, active, H, min_offset=1)
+    assert (replay_offs[0::4] >= 1).all()
+    assert (replay_offs[1::4] >= 1).all()
+    assert (replay_offs[2::4] == 0).all()
+
 
 def test_shift_plan_matches_manual():
     torch.manual_seed(3)
@@ -114,7 +115,7 @@ def test_child_mask_is_shifted_parent_mask_on_overlap():
 
 
 def _run_fn(scene, delta: float):
-    cost, strike = scene
+    cost, _strike = scene
     cfg = Phase2Config(compile_model=False)
     hit, active, q0, v0, traj = _parent()
     traj = traj.clone().requires_grad_(True)
@@ -122,37 +123,38 @@ def _run_fn(scene, delta: float):
     hit_sf = torch.where(active, hit - offs.unsqueeze(1), hit)
     masks_p = _masks(hit, active)
     masks_s = _masks(hit_sf, active)
-    hit_eff = effective_hits(hit_sf, active, H)
-    strike_s = replace(_strike_rows(strike, slice(0, 4)), hit_index=hit_eff,
-                       active=active.to(torch.float32), waist_yaw_ref=None)
-    stub = lambda init, state, enc, masks: SimpleNamespace(traj=init + delta)
+    class Stub(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.delta = torch.nn.Parameter(torch.tensor(float(delta)))
+
+        def forward(self, init, state, enc, masks):
+            return SimpleNamespace(traj=init + self.delta)
+
+    stub = Stub()
     fn = make_suffix_step(stub, cost, cfg, compile_mode=None)
-    loss_cost, tie, gate, q0_s, v0_s, init_s = fn(
+    tie, tie_elems, q0_s, v0_s, init_s = fn(
         traj, q0, v0, None, masks_p.elem_mask, masks_s,
-        strike_s, group_lengths(hit_eff), None, offs,
+        offs,
     )
-    assert gate.shape == (traj.shape[0], 8)
+    assert tie_elems.item() > 0
     assert q0_s.shape == q0.shape
     assert v0_s.shape == v0.shape
     assert init_s.shape == traj.shape
-    assert not gate.requires_grad
-    return loss_cost, tie, traj
+    return tie, traj, stub.delta
 
 
 def test_echo_child_ties_at_zero(scene):
-    loss_cost, tie, _ = _run_fn(scene, delta=0.0)
-    assert torch.isfinite(loss_cost)
+    tie, _, _ = _run_fn(scene, delta=0.0)
     assert tie.item() == pytest.approx(0.0, abs=1e-12)
 
 
 def test_gradient_topology(scene):
-    """Tie couples child<->parent; the cost anchor must NOT reach the parent."""
-    loss_cost, tie, traj = _run_fn(scene, delta=0.01)
+    """The suffix tie updates the child but never drags its verified teacher."""
+    tie, traj, child_delta = _run_fn(scene, delta=0.01)
     assert tie.item() > 0.0
-    # The stub has no parameters, so the ONLY possible path from the child's
-    # cost back to the graph is through its init/state handoff -- which is
-    # detached.  A requires-grad cost here would mean the child drags the
-    # parent through its inputs.
-    assert not loss_cost.requires_grad
-    g_tie = torch.autograd.grad(tie, traj, allow_unused=True)[0]
-    assert g_tie is not None and g_tie.abs().sum() > 0.0
+    g_parent, g_child = torch.autograd.grad(
+        tie, (traj, child_delta), allow_unused=True,
+    )
+    assert g_parent is None
+    assert g_child is not None and g_child.abs().item() > 0.0

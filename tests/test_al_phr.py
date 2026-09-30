@@ -12,7 +12,7 @@ import torch
 from amortized_opt.constants import N_DOF
 from amortized_opt.cost import CostConfig, FusedCost, StrikeContext
 from amortized_opt.lagrangian import ALConfig, AugmentedLagrangian, CONSTRAINT_GROUPS
-from amortized_opt.train_cost import phase2_al_config
+from amortized_opt.train_cost import clamp_resumed_al_penalty, phase2_al_config
 
 DT = 0.02
 WRIST_COLS = (8, 9, 15, 16)
@@ -159,6 +159,15 @@ def test_pen_shrink_preserves_exactly_zero_disabled_penalty():
     assert "torque_waist" not in al.pen_weights()
 
 
+def test_resume_clamp_preserves_disabled_zero_penalty():
+    assert clamp_resumed_al_penalty(0.0, 1.0e-6, 200.0) == 0.0
+
+
+def test_resume_clamp_applies_bounds_to_enabled_penalty():
+    assert clamp_resumed_al_penalty(1.0e-9, 1.0e-6, 200.0) == 1.0e-6
+    assert clamp_resumed_al_penalty(300.0, 1.0e-6, 200.0) == 200.0
+
+
 def test_positive_penalty_still_shrinks_to_configured_floor():
     al = AugmentedLagrangian(_i_only(
         target=0.5, pen=3.0e-6, pen_min=1.0e-6,
@@ -285,18 +294,26 @@ def test_pen_torque_adds_half_pen_v_squared_and_has_grad_wrt_traj():
 
 def test_pen_key_does_not_leak_into_the_other_half_when_only_peak_is_priced():
     """``pen_torque_peak`` lands on ``terms['torque']`` (same term key) but
-    ``violations`` stay detached and the public dict is unchanged."""
-    b = _batch(amp=ONE_ELEMENT_AMP)
-    cost = _cost(w_torque_peak=1.0)
+    squares the smooth-max residual, not the detached hard max."""
+    b = _batch(amp=0.0, B=2)
+    # Two wrist knots, so the p-norm sits strictly above the hard max.
+    b["wp"][:, 4, 8] = 0.25
+    b["wp"][:, 7, 9] = -0.25
+    cost = _cost(w_torque_peak=1.0, torque_peak_p=2.0)
     ref = _fwd(b, cost)
     pen = 0.5
     hot = _fwd(b, cost, weights={
         "pen_torque_peak": torch.tensor(pen, dtype=torch.float64),
     })
-    extra = 0.5 * pen * ref.violations["torque_peak"].clamp_min(0.0).square()
+    extra = 0.5 * pen * ref.raw["torque_peak"].clamp_min(0.0).square()
+    hard = 0.5 * pen * ref.violations["torque_peak"].clamp_min(0.0).square()
     assert torch.allclose(hot.terms["torque"], ref.terms["torque"] + extra, atol=1e-12)
+    # Two violated cells make the p-norm strictly larger than ``amax``, so
+    # this locks the penalty onto the smooth residual rather than the hard max.
+    assert float((extra - hard).abs().max()) > 1e-8
     assert torch.equal(hot.violations["torque"], ref.violations["torque"])
     assert torch.equal(hot.violations["torque_peak"], ref.violations["torque_peak"])
+    assert not hot.violations["torque_peak"].requires_grad
 
 
 def test_wtensors_emits_nonzero_pen_keys_and_omits_zeros():

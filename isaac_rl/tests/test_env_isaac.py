@@ -140,7 +140,7 @@ def test_full_loop_runs_and_scores(isaac_env, request):
                        record=True)
     q, qd, log = loop.rollout(q, qd, 60)
     assert torch.isfinite(q).all()
-    assert "terms/hit" in log and "terms/track" in log
+    assert "terms/hit_error" in log and "terms/impact_speed" in log
     rep = latency_report(loop, kit, device="cpu")
     assert rep["n_strikes"] > 0, "no scheduled strike came due in 60 ticks"
     assert 0.0 <= rep["overall"]["miss_rate"] <= 1.0

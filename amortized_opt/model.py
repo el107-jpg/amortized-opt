@@ -98,10 +98,25 @@ class ModelConfig:
     num_drums: int = 8
     num_future: int = 3
 
+    #: Frozen start-aware IK head used before the decoder.  It predicts the
+    #: terminal joint pose from the current kit/goals and measured (q, qdot);
+    #: an analytic low-acceleration generator expands that pose into the
+    #: decoder initialization.  The weights are part of the main checkpoint,
+    #: but are always stop-gradient.
+    terminal_head: bool = False
+    terminal_head_num_drums: int = 7
+    terminal_head_width: int = 128
+    terminal_head_depth: int = 2
+
     d_ctx: int = 256
     ctx_layers: int = 2
     ctx_heads: int = 8
     ctx_ffn_mult: float = 4.0
+    #: Structurally include self-attention in each context block.  False keeps
+    #: the token projections, per-token SwiGLU residual, and final norm while
+    #: omitting the attention projections and their exclusive pre-norm.  This
+    #: is an encoder-mixing ablation; decoder cross-attention remains intact.
+    ctx_self_attn: bool = True
 
     d_model: int = 384
     #: 3 decoder layers (10.8 M total) is the section-8 ablation's sweet spot:
@@ -113,6 +128,17 @@ class ModelConfig:
     dec_layers: int = 3
     dec_heads: int = 8
     dec_ffn_mult: float = 4.0
+    #: Decoder layers which receive context cross-attention.  ``None`` means
+    #: every decoder layer, preserving the historical architecture and exact
+    #: state dict.  A tuple is an explicit positive mask: e.g. ``(0,)`` keeps
+    #: only the first layer's cross-attention and structurally omits it from
+    #: later layers (therefore saving both parameters and compute).
+    #:
+    #: This is deliberately not a runtime zero/gate.  The ablation asks whether
+    #: later blocks need fresh context reads at all; a missing module is the
+    #: only representation that makes the resulting checkpoint and parameter
+    #: count truthful.
+    dec_cross_attn_layers: tuple[int, ...] | None = None
 
     fourier_bands: int = 8
     fourier_t_min: float = 0.02
@@ -341,6 +367,15 @@ class ModelConfig:
         if isinstance(self.frozen_joints, str):
             self.frozen_joints = (self.frozen_joints,)
         self.frozen_joints = tuple(self.frozen_joints)
+        if self.dec_cross_attn_layers is not None:
+            self.dec_cross_attn_layers = tuple(int(i) for i in self.dec_cross_attn_layers)
+            if len(set(self.dec_cross_attn_layers)) != len(self.dec_cross_attn_layers):
+                raise ValueError("dec_cross_attn_layers must not contain duplicates")
+            bad = [i for i in self.dec_cross_attn_layers if not 0 <= i < self.dec_layers]
+            if bad:
+                raise ValueError(
+                    f"dec_cross_attn_layers outside [0, {self.dec_layers}): {bad}"
+                )
         unknown = [n for n in self.frozen_joints if n not in G1_UPPER_BODY_JOINTS]
         if unknown:
             raise ValueError(f"frozen_joints not in the joint order: {unknown}")
@@ -355,10 +390,20 @@ class ModelConfig:
                 f"dec_rope needs an even head dim, got {self.dec_head_dim} "
                 f"(d_model={self.d_model}, dec_heads={self.dec_heads})"
             )
+        if self.terminal_head_num_drums < 1:
+            raise ValueError("terminal_head_num_drums must be positive")
+        if self.terminal_head_num_drums > self.num_drums:
+            raise ValueError("terminal_head_num_drums cannot exceed encoder num_drums")
+        if self.terminal_head_width < 1 or self.terminal_head_depth < 1:
+            raise ValueError("terminal_head_width and terminal_head_depth must be positive")
 
     @property
     def dec_head_dim(self) -> int:
         return self.d_model // self.dec_heads
+
+    def decoder_cross_attn_enabled(self, layer: int) -> bool:
+        """Whether a decoder layer owns a structural context-attention block."""
+        return self.dec_cross_attn_layers is None or layer in self.dec_cross_attn_layers
 
     @property
     def fourier_width(self) -> int:
@@ -402,6 +447,7 @@ ARCH_FROM_WEIGHTS: dict[str, str] = {
     "waist_sp_head": "encoder.waist_sp_out.weight",
     "waist_pr_sp_head": "encoder.waist_pr_sp_out.weight",
     "dec_plant_feats": "decoder.wp_plant_proj.weight",
+    "terminal_head": "terminal_initializer.head.hidden.0.weight",
 }
 
 #: The same job for a flag that widens a projection that ALREADY EXISTS, so the
@@ -615,15 +661,25 @@ class Attention(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, d: int, heads: int, mult: float, dropout: float = 0.0):
+    def __init__(
+        self,
+        d: int,
+        heads: int,
+        mult: float,
+        dropout: float = 0.0,
+        self_attn: bool = True,
+    ):
         super().__init__()
-        self.n1, self.n2 = RMSNorm(d), RMSNorm(d)
-        self.attn = Attention(d, heads, dropout=dropout)
+        self.n1 = RMSNorm(d) if self_attn else None
+        self.n2 = RMSNorm(d)
+        self.attn = Attention(d, heads, dropout=dropout) if self_attn else None
         self.ffn = SwiGLU(d, mult)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        h = self.n1(x)
-        x = x + self.attn(h, h, mask)
+        if self.attn is not None:
+            assert self.n1 is not None
+            h = self.n1(x)
+            x = x + self.attn(h, h, mask)
         return x + self.ffn(self.n2(x))
 
 
@@ -637,13 +693,21 @@ class DecoderBlock(nn.Module):
         dropout: float = 0.0,
         rope: bool = False,
         rope_base: float = 10000.0,
+        cross_attn: bool = True,
     ):
         super().__init__()
-        self.n1, self.n2, self.n3 = RMSNorm(d), RMSNorm(d), RMSNorm(d)
+        self.n1 = RMSNorm(d)
+        # n2 belongs exclusively to the cross-attention residual.  Omit it
+        # along with the attention projections so a masked layer has no dead
+        # parameter or computation hiding behind the structural identity.
+        # Keep the legacy module-registration order when enabled: this makes
+        # default state-dict order and seeded initialization bit-identical.
+        self.n2 = RMSNorm(d) if cross_attn else None
+        self.n3 = RMSNorm(d)
         self.self_attn = Attention(
             d, heads, dropout=dropout, rope=rope, rope_base=rope_base
         )
-        self.cross_attn = Attention(d, heads, kv_dim=kv_dim, dropout=dropout)
+        self.cross_attn = Attention(d, heads, kv_dim=kv_dim, dropout=dropout) if cross_attn else None
         self.ffn = SwiGLU(d, mult)
 
     def forward(
@@ -655,7 +719,9 @@ class DecoderBlock(nn.Module):
     ) -> torch.Tensor:
         h = self.n1(x)
         x = x + self.self_attn(h, h, self_mask)
-        x = x + self.cross_attn(self.n2(x), memory, memory_mask)
+        if self.cross_attn is not None:
+            assert self.n2 is not None
+            x = x + self.cross_attn(self.n2(x), memory, memory_mask)
         return x + self.ffn(self.n3(x))
 
 
@@ -758,7 +824,16 @@ class ContextEncoder(nn.Module):
         self.drum_id_emb = nn.Embedding(cfg.num_drums, d)
         self.future_rank_emb = nn.Embedding(max(cfg.num_future, 1), d)
         self.blocks = nn.ModuleList(
-            [EncoderBlock(d, cfg.ctx_heads, cfg.ctx_ffn_mult, cfg.dropout) for _ in range(cfg.ctx_layers)]
+            [
+                EncoderBlock(
+                    d,
+                    cfg.ctx_heads,
+                    cfg.ctx_ffn_mult,
+                    cfg.dropout,
+                    self_attn=cfg.ctx_self_attn,
+                )
+                for _ in range(cfg.ctx_layers)
+            ]
         )
         self.norm = RMSNorm(d)
         freqs = fourier_frequencies(cfg.fourier_bands, cfg.fourier_t_min, cfg.fourier_t_max)
@@ -963,8 +1038,9 @@ class TrajectoryDecoder(nn.Module):
                 DecoderBlock(
                     d, cfg.dec_heads, cfg.dec_ffn_mult, cfg.d_ctx, cfg.dropout,
                     rope=cfg.dec_rope, rope_base=cfg.rope_base,
+                    cross_attn=cfg.decoder_cross_attn_enabled(i),
                 )
-                for _ in range(cfg.dec_layers)
+                for i in range(cfg.dec_layers)
             ]
         )
         self.norm = RMSNorm(d)
@@ -1290,9 +1366,34 @@ class AmortizedOptimizer(nn.Module):
         self.cfg = cfg if cfg is not None else ModelConfig(**kwargs)
         self.encoder = ContextEncoder(self.cfg)
         self.decoder = TrajectoryDecoder(self.cfg)
+        if self.cfg.terminal_head:
+            from .terminal_initializer import TerminalInitializer
+
+            self.terminal_initializer = TerminalInitializer(
+                self.cfg.terminal_head_num_drums,
+                width=self.cfg.terminal_head_width,
+                depth=self.cfg.terminal_head_depth,
+                dt=self.cfg.dt,
+            )
+        else:
+            self.terminal_initializer = None
 
     def encode_context(self, ctx: ContextInputs) -> ContextEncoding:
         return self.encoder(ctx)
+
+    def load_terminal_head(self, path, *, map_location="cpu") -> dict:
+        """Load and freeze the pretrained terminal MLP."""
+        if self.terminal_initializer is None:
+            raise RuntimeError("ModelConfig.terminal_head is disabled")
+        return self.terminal_initializer.load_pretrained(path, map_location=map_location)
+
+    def initial_trajectory(
+        self, ctx: ContextInputs, state: torch.Tensor, masks: WaypointMasks
+    ) -> torch.Tensor:
+        """Build the terminal-head low-acceleration decoder initialization."""
+        if self.terminal_initializer is None:
+            raise RuntimeError("ModelConfig.terminal_head is disabled")
+        return self.terminal_initializer(ctx, state, masks)
 
     def forward(
         self,
@@ -1352,4 +1453,11 @@ def param_counts(model: AmortizedOptimizer) -> dict[str, int]:
         if n.startswith(head_prefixes)
     )
     dec = sum(p.numel() for p in model.decoder.parameters()) - heads
-    return {"encoder": enc, "decoder": dec, "heads": heads, "total": enc + dec + heads}
+    terminal = (
+        sum(p.numel() for p in model.terminal_initializer.parameters())
+        if model.terminal_initializer is not None else 0
+    )
+    return {
+        "encoder": enc, "decoder": dec, "heads": heads, "terminal": terminal,
+        "total": enc + dec + heads + terminal,
+    }

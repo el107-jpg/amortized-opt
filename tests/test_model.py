@@ -663,6 +663,93 @@ def test_dec_rope_stored_flag_is_believed():
     AmortizedOptimizer(got).load_state_dict(ck["model"])
 
 
+# ------------------------------------- structural decoder cross-attention mask --
+def test_dec_cross_attn_default_is_explicit_none_and_bit_identical():
+    """The opt-in mask must not change legacy topology, keys, or outputs."""
+    kw = dict(d_model=64, dec_heads=4, dec_layers=2, d_ctx=32,
+              ctx_heads=2, ctx_layers=1)
+    torch.manual_seed(17)
+    legacy = make_model("cpu", **kw)
+    torch.manual_seed(17)
+    explicit = make_model("cpu", **kw, dec_cross_attn_layers=None)
+    assert legacy.cfg.dec_cross_attn_layers is None
+    assert legacy.state_dict().keys() == explicit.state_dict().keys()
+    assert all(b.cross_attn is not None for b in legacy.decoder.blocks)
+    ctx, init, state, masks = make_batch(2, "cpu", seed=8)
+    with torch.no_grad():
+        a = legacy(init, state, legacy.encode_context(ctx), masks).traj
+        b = explicit(init, state, explicit.encode_context(ctx), masks).traj
+    assert torch.equal(a, b)
+
+
+def test_dec_cross_attn_mask_omits_final_parameters_and_runs_forward():
+    cfg = dict(d_model=64, dec_heads=4, dec_layers=2, d_ctx=32,
+               ctx_heads=2, ctx_layers=1)
+    full = make_model("cpu", **cfg)
+    masked = make_model("cpu", **cfg, dec_cross_attn_layers=(0,))
+    # Attention has bias-free q/o (d*d each), k/v (d_ctx*d each), and
+    # a dedicated RMSNorm scale that disappears with the residual branch.
+    expected_saving = 2 * 64 * 64 + 2 * 32 * 64 + 64
+    assert param_counts(full)["total"] - param_counts(masked)["total"] == expected_saving
+    assert masked.decoder.blocks[0].cross_attn is not None
+    assert masked.decoder.blocks[1].cross_attn is None
+    assert not any(k.startswith("decoder.blocks.1.cross_attn")
+                   for k in masked.state_dict())
+    ctx, init, state, masks = make_batch(2, "cpu", seed=13)
+    with torch.no_grad():
+        out = masked(init, state, masked.encode_context(ctx), masks)
+    assert torch.isfinite(out.traj).all()
+
+
+def test_dec_cross_attn_mask_checkpoint_roundtrip():
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, cfg = _fake_ckpt(
+        idle_token=True, drop_cfg_key=False, d_model=64, dec_heads=4,
+        dec_layers=2, d_ctx=32, ctx_heads=2, ctx_layers=1,
+        dec_cross_attn_layers=(0,),
+    )
+    restored = model_config_from_checkpoint(ck)
+    assert restored.dec_cross_attn_layers == (0,)
+    assert restored.decoder_cross_attn_enabled(0)
+    assert not restored.decoder_cross_attn_enabled(1)
+    AmortizedOptimizer(restored).load_state_dict(ck["model"])
+
+
+# ------------------------------------------ structural encoder attention mask --
+def test_ctx_self_attn_mask_omits_parameters_and_runs_forward():
+    cfg = dict(d_model=64, dec_heads=4, dec_layers=2, d_ctx=32,
+               ctx_heads=2, ctx_layers=1, dec_cross_attn_layers=(0,))
+    full = make_model("cpu", **cfg)
+    ffn_only = make_model("cpu", **cfg, ctx_self_attn=False)
+    # Bias-free q/k/v/o projections plus the attention-exclusive RMSNorm.
+    assert param_counts(full)["total"] - param_counts(ffn_only)["total"] == 4 * 32 * 32 + 32
+    block = ffn_only.encoder.blocks[0]
+    assert block.attn is None
+    assert block.n1 is None
+    assert not any(k.startswith("encoder.blocks.0.attn") for k in ffn_only.state_dict())
+    assert "encoder.blocks.0.n1.weight" not in ffn_only.state_dict()
+    ctx, init, state, masks = make_batch(2, "cpu", seed=23)
+    with torch.no_grad():
+        out = ffn_only(init, state, ffn_only.encode_context(ctx), masks)
+    assert torch.isfinite(out.traj).all()
+
+
+def test_ctx_self_attn_mask_checkpoint_roundtrip():
+    from amortized_opt.model import model_config_from_checkpoint
+
+    ck, _ = _fake_ckpt(
+        idle_token=True, drop_cfg_key=False, d_model=64, dec_heads=4,
+        dec_layers=2, d_ctx=32, ctx_heads=2, ctx_layers=1,
+        dec_cross_attn_layers=(0,), ctx_self_attn=False,
+    )
+    restored = model_config_from_checkpoint(ck)
+    assert restored.ctx_self_attn is False
+    model = AmortizedOptimizer(restored)
+    assert model.encoder.blocks[0].attn is None
+    model.load_state_dict(ck["model"])
+
+
 # ----------------------------------------------------- plant features --
 _SMALL = dict(d_model=64, dec_heads=4, dec_layers=1, d_ctx=32, ctx_heads=2, ctx_layers=1)
 

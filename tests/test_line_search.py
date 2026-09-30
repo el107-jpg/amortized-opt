@@ -284,6 +284,27 @@ def test_force_search_on_al_change_defaults_off():
     assert LineSearchConfig().actual_update_diagnostic_every == 0
 
 
+def test_c1_cosine_curriculum():
+    cfg = LineSearchConfig(c1=0.5, c1_start=0.01, c1_ramp_updates=10_000)
+    assert cfg.c1_at(0) == pytest.approx(0.01)
+    assert cfg.c1_at(5_000) == pytest.approx(0.255)
+    assert cfg.c1_at(10_000) == pytest.approx(0.5)
+    assert cfg.c1_at(20_000) == pytest.approx(0.5)
+    assert LineSearchConfig(c1=0.3).c1_at(123) == pytest.approx(0.3)
+
+
+def test_epsilon_floor_cosine_curriculum():
+    cfg = LineSearchConfig(
+        epsilon_min=1e-10,
+        epsilon_min_start=1e-9,
+        epsilon_min_ramp_updates=10_000,
+    )
+    assert cfg.epsilon_min_at(0, 1e-10) == pytest.approx(1e-9)
+    assert cfg.epsilon_min_at(5_000, 1e-10) == pytest.approx(5.5e-10)
+    assert cfg.epsilon_min_at(10_000, 1e-10) == pytest.approx(1e-10)
+    assert cfg.epsilon_min_at(20_000, 1e-10) == pytest.approx(1e-10)
+
+
 def test_objective_change_reset_reseeds_epsilon_when_enabled():
     cfg = LineSearchConfig(
         epsilon_seed=1e-4,

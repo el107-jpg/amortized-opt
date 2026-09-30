@@ -11,6 +11,7 @@ from tools.strike_pose_editor.trajectory_opt import (
     DirectTrajectoryOptimizer,
     TaskSpaceConstraint,
     WaypointKeyframe,
+    quintic_terminal_initialization,
     sample_trajectory_scenario,
     warp_terminal_approach,
 )
@@ -161,6 +162,32 @@ def test_terminal_warp_spreads_endpoint_edit_with_minimum_jerk(scenario):
     # jump, unlike replacing only the hit row.
     edit = delta[0, first:hit, cols[0]]
     assert bool((edit[1:] >= edit[:-1]).all())
+
+
+@pytest.mark.parametrize("hand", ("left", "right"))
+def test_fresh_terminal_quintic_replaces_only_selected_side(scenario, hand):
+    hand_index = 0 if hand == "left" else 1
+    hit = int(scenario.hit_index[0, hand_index])
+    selected = [
+        index for index, name in enumerate(scenario.joint_names)
+        if name.startswith("waist_") or name.startswith(f"{hand}_")
+    ]
+    other = [
+        index for index, name in enumerate(scenario.joint_names)
+        if name.startswith(f"{'right' if hand == 'left' else 'left'}_")
+    ]
+    terminal = scenario.init[0, hit - 1].clone()
+    terminal[selected] += 0.03
+    fresh = quintic_terminal_initialization(scenario, terminal, hand=hand)
+
+    assert tuple(fresh.shape) == (1, 50, 17)
+    torch.testing.assert_close(fresh[0, hit - 1, selected], terminal[selected])
+    torch.testing.assert_close(
+        fresh[0, hit:, selected],
+        terminal[selected].expand(50 - hit, -1),
+    )
+    torch.testing.assert_close(fresh[0, :, other], scenario.init[0, :, other])
+    assert bool(torch.isfinite(fresh).all())
 
 
 @pytest.mark.parametrize("hand", ("left", "right"))

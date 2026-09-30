@@ -56,7 +56,7 @@ from amortized_opt.rhythm_chain_data import (
 from amortized_opt.rnea import BatchedRNEA
 from amortized_opt.sdf import SdfPenalty, q0_collision_clear
 from amortized_opt.tokenizer import ContextInputs
-from amortized_opt.train_cost import ramp_seed
+from amortized_opt.strike_seed import accelerating_path_numpy
 from amortized_opt.waist_aim import aim_yaw, waist_reference_block
 from amortized_opt.warmstart import GoalPoseLibrary, arm_slice, waist_slice
 from amortized_opt.warmstart_data import CONTEXT_FIELDS, bucket_for
@@ -384,15 +384,12 @@ def _promote_row(
     H = leftover_init.shape[0]
     dt = float(A.CONTROL_DT)
     hit_wp = int(max(2, min(H, round(new_tth / dt))))
-    q0_t = torch.as_tensor(q_new[None], dtype=torch.float32)
-    # Fired-arm ramp.
+    # Fired-arm seed retains the post-contact velocity.
     sl = arm_slice(hand, names)
-    term = q0_t.clone()
-    term[0, sl] = torch.as_tensor(term_arm, dtype=torch.float32)
-    L = torch.full((1, len(names)), float(hit_wp), dtype=torch.float32)
-    fired_seed = ramp_seed(q0_t, term, L, H).numpy()[0]
     init = leftover_init.copy()
-    init[:, sl] = fired_seed[:, sl]
+    init[:, sl] = accelerating_path_numpy(
+        q_new[sl], qd_new[sl], term_arm, hit_wp, H, dt,
+    )[1:]
     # Other arm: keep leftover columns.
     other = HANDS[1 - hand_i]
     osl = arm_slice(other, names)

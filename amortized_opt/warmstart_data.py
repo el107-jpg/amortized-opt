@@ -665,6 +665,7 @@ class WarmstartPool:
         aux_chunk: int = 131_072,
         stats: dict | None = None,
         aux_torque_tracking: bool = False,
+        trajectory_transform=None,
     ):
         #: ``True`` -> the stored ``aux_torque`` label is the DEMANDED PD
         #: tracking torque instead of the RNEA segment max.  Opt-in: ``False``
@@ -711,6 +712,20 @@ class WarmstartPool:
             masks = self.masks_for(d["hit"], d["active"], H)
             d["elem_mask"] = masks.elem_mask
             d["point_mask"] = masks.point_mask
+            if trajectory_transform is not None:
+                ctx = ContextInputs(
+                    **{f: d[f] for f in CONTEXT_FIELDS if f in d}
+                )
+                replacements = trajectory_transform(d, ctx, masks, int(H))
+                for key, value in replacements.items():
+                    if key not in ("target", "init_base"):
+                        raise ValueError(f"trajectory transform cannot replace {key!r}")
+                    if value.shape != d[key].shape:
+                        raise ValueError(
+                            f"trajectory transform {key} shape {tuple(value.shape)} "
+                            f"!= {tuple(d[key].shape)}"
+                        )
+                    d[key] = value.to(device=self.device, dtype=dtype)
             builder = TrajectorySplineBuilder(
                 max_segments=H, dt=cfg.dt, joint_names=names,
                 device=self.device, dtype=dtype,

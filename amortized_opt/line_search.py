@@ -62,6 +62,11 @@ class LineSearchConfig:
     grad_balance: str = ""
     beta_accept_per_update: float = 0.99
     c1: float = 0.5
+    #: Optional easy-to-strict Armijo curriculum. ``None`` or a non-positive
+    #: ramp preserves the fixed-``c1`` rule exactly. The schedule is keyed to
+    #: successful optimizer-update slots, not wall time or probe count.
+    c1_start: float | None = None
+    c1_ramp_updates: int = 0
     proposal_rule: str = "quadratic_with_safeguards"  # or "geometric"
     expansion_factor: float = 1.1
     backtrack_min_factor: float = 0.1
@@ -74,11 +79,19 @@ class LineSearchConfig:
     # Absolute bounds; if None, derived from seed * mult at resolve time.
     epsilon_max: float | None = None
     epsilon_min: float | None = None
+    #: Optional high-to-low cosine curriculum for the live epsilon floor.
+    #: ``epsilon_min`` remains the final floor and checkpoint/runtime bound.
+    epsilon_min_start: float | None = None
+    epsilon_min_ramp_updates: int = 0
     search_interval_mode: str = "adaptive"  # or "fixed"
     initial_interval: int = 1
     min_interval: int = 1
     max_interval: int = 10
     warmup_updates: int = 10
+    #: Keep Armijo completely inactive through this many successful updates.
+    #: The ordinary AdamW path follows ``epsilon_min_at`` during the delay;
+    #: the first search therefore starts from the completed cosine floor.
+    activate_after_updates: int = 0
     stable_searches_to_increase: int = 3
     stable_rate_ratio_bound: float = 1.15
     stable_max_trials: int = 2
@@ -126,6 +139,31 @@ class LineSearchConfig:
     #: ``gradient``: EMA ``m,v`` on clipped ``q`` (SaLSa transfer). ``step``: EMA on
     #: executed step ``u = ε p_probe + p_mom + p_decay`` (carry not scaled by ε).
     moment_on: str = "gradient"
+
+    def c1_at(self, update: int) -> float:
+        """Cosine-ramp Armijo ``c1`` from ``c1_start`` to the final ``c1``."""
+        if self.c1_start is None or int(self.c1_ramp_updates) <= 0:
+            return float(self.c1)
+        u = min(max(float(update) / float(self.c1_ramp_updates), 0.0), 1.0)
+        blend = 0.5 * (1.0 - math.cos(math.pi * u))
+        return float(self.c1_start) + (float(self.c1) - float(self.c1_start)) * blend
+
+    def epsilon_min_at(self, update: int, final_floor: float) -> float:
+        """Cosine-ramp the live epsilon floor to ``final_floor``."""
+        if self.epsilon_min_start is None or int(self.epsilon_min_ramp_updates) <= 0:
+            return float(final_floor)
+        u = min(
+            max(float(update) / float(self.epsilon_min_ramp_updates), 0.0),
+            1.0,
+        )
+        blend = 0.5 * (1.0 - math.cos(math.pi * u))
+        return float(self.epsilon_min_start) + (
+            float(final_floor) - float(self.epsilon_min_start)
+        ) * blend
+
+    def active_at(self, update: int) -> bool:
+        """Whether Armijo probing is active for proposed update ``update``."""
+        return int(update) > max(int(self.activate_after_updates), 0)
 
     def resolve_bounds(self, seed: float | None = None) -> tuple[float, float]:
         """Return ``(epsilon_min, epsilon_max)`` for a resolved seed."""

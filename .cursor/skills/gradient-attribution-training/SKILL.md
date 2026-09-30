@@ -127,7 +127,7 @@ grad the **sub-expressions** from `FusedCost.forward`, not the bucket:
 | Warning | `cfg.w_torque * raw["torque"]` (softplus mean) | none |
 | Peak | `λ_peak * w_peak * raw["torque_peak"]` (smooth max) | `torque_peak` |
 | Segment hard | `λ_seg * live[seg]` per class | `torque_waist`, … |
-| PHR | `0.5 * pen_g * live²` | same segment / peak keys |
+| PHR | `0.5 * pen_g * live²`; peak groups use `0.5 * pen_g * raw[peak]²` | same segment / peak keys |
 
 Probe each additive term in `forward` if you need “51% segment λ vs 36% peak”
 style numbers. `measure_cost_term_grad_norms` only splits **top-level** `TERM_KEYS`.

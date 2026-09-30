@@ -60,11 +60,20 @@ class ViolationCriticConfig:
     # away from support, the distinct priors preserve epistemic disagreement.
     randomized_prior_scale: float = 0.0
     batch_size: int = 256
-    # Effective reuse depends on actor-label influx. The actor now supplies
-    # hundreds of fresh exact labels per outer step, so one
-    # online update keeps pace without serializing four tiny optimizer steps on
-    # the actor's critical path.
+    # Effective reuse depends on actor-label influx. The actor supplies
+    # hundreds of fresh exact labels per outer step, so one online update is
+    # sufficient when update_interval=1. Larger intervals consolidate that
+    # per-step sample budget into a single wider update.
     updates_per_step: int = 1
+    # Cache this many actor-label batches before training.  The eventual critic
+    # update samples ``batch_size * update_interval`` replay rows, so every
+    # actor step contributes the same sample budget but the small critic pays
+    # optimizer/launch overhead only once per interval.
+    update_interval: int = 1
+    # Optional linear-scaling-rule ablation for the consolidated optimizer
+    # step.  1.0 is the conservative default; 4.0 approximates the parameter
+    # travel of four sequential same-LR AdamW updates.
+    interval_lr_scale: float = 1.0
     recent_capacity: int = 8192
     audit_capacity: int = 1024
     huber_delta: float = 1.0
@@ -107,8 +116,10 @@ class ViolationCriticConfig:
     primary_anchor_per_task: int = 1
     primary_boundary_per_task: int = 1
     primary_interior_per_task: int = 4
-    # Exact physical ingress limits for the previous-generation MPC ring.
-    # Joint and torque retain the ordinary close-feasibility rule below.
+    # Historical close-feasibility limits retained as the Bellman-admission
+    # reference. The critic MPC parent pool itself accepts every actor row;
+    # Bellman replay uses half these terminal/collision allowances and half the
+    # joint/torque allowance implied by the manageable limits below.
     primary_mpc_terminal_limit: float = 0.040
     primary_mpc_collision_sdf_limit: float = -0.010
 
@@ -143,6 +154,24 @@ class ViolationCriticConfig:
     anchor_min_samples: int = 2048
     anchor_min_close_rate: float = 0.50
     anchor_rate_ema: float = 0.95
+    # Keep the legacy binary transition by default.  A positive value instead
+    # ramps in complete timing-task groups after the calibration latch opens.
+    anchor_curriculum_ramp_steps: int = 0
+    # Keep critic-selected fresh timing rows out of the final terminal band
+    # until exact actor evaluations show that band is learnable. MPC/Bellman
+    # suffixes still train inside it from the beginning.
+    short_floor_wp: int = 8
+    short_unlock_min_samples: int = 2048
+    short_unlock_success: float = 0.50
+    short_success_ema: float = 0.95
+    # Closed-loop guard on the *freshly selected* frontier. Global replay
+    # calibration still requires ``risk_min_precision``; this independently
+    # backs the TTH floor away when exact boundary manageability falls below
+    # the requested rate.
+    boundary_min_manageable: float = 0.50
+    boundary_manageable_margin: float = 0.10
+    boundary_rate_ema: float = 0.90
+    boundary_floor_update_every: int = 25
 
     def __post_init__(self) -> None:
         if self.representation not in {"regression", "distributional"}:
@@ -182,8 +211,17 @@ class ViolationCriticConfig:
             or self.randomized_prior_scale < 0.0
         ):
             raise ValueError("randomized_prior_scale must be finite and nonnegative")
-        if self.batch_size < 1 or self.updates_per_step < 1:
+        if (
+            self.batch_size < 1
+            or self.updates_per_step < 1
+            or self.update_interval < 1
+        ):
             raise ValueError("critic batch/update counts must be positive")
+        if (
+            not math.isfinite(float(self.interval_lr_scale))
+            or float(self.interval_lr_scale) <= 0.0
+        ):
+            raise ValueError("interval_lr_scale must be finite and positive")
         if self.recent_capacity < 1 or self.audit_capacity < 0:
             raise ValueError("invalid critic replay capacities")
         if self.huber_delta <= 0.0:
@@ -227,6 +265,8 @@ class ViolationCriticConfig:
             raise ValueError("primary_boundary_per_task must be positive")
         if self.primary_interior_per_task < 1:
             raise ValueError("primary_interior_per_task must be positive")
+        if self.anchor_curriculum_ramp_steps < 0:
+            raise ValueError("anchor_curriculum_ramp_steps must be nonnegative")
         if self.primary_mpc_terminal_limit < 0.0:
             raise ValueError("primary_mpc_terminal_limit must be nonnegative")
         if not math.isfinite(float(self.primary_mpc_collision_sdf_limit)):
@@ -252,6 +292,20 @@ class ViolationCriticConfig:
             raise ValueError("global OOD fraction/weight must be nonnegative")
         if self.risk_recalibrate_every < 1 or self.anchor_min_samples < 1:
             raise ValueError("risk/anchor sample intervals must be positive")
+        if int(self.short_floor_wp) < 1 or int(self.short_unlock_min_samples) < 1:
+            raise ValueError("short timing floor/sample count must be positive")
+        if not 0.0 <= float(self.short_unlock_success) <= 1.0:
+            raise ValueError("short_unlock_success must be in [0, 1]")
+        if not 0.0 <= float(self.short_success_ema) < 1.0:
+            raise ValueError("short_success_ema must be in [0, 1)")
+        if not 0.0 <= float(self.boundary_min_manageable) <= 1.0:
+            raise ValueError("boundary_min_manageable must be in [0, 1]")
+        if not 0.0 <= float(self.boundary_manageable_margin) <= 1.0:
+            raise ValueError("boundary_manageable_margin must be in [0, 1]")
+        if not 0.0 <= float(self.boundary_rate_ema) < 1.0:
+            raise ValueError("boundary_rate_ema must be in [0, 1)")
+        if int(self.boundary_floor_update_every) < 1:
+            raise ValueError("boundary_floor_update_every must be positive")
         if not 0.0 <= float(self.anchor_min_close_rate) <= 1.0:
             raise ValueError("anchor_min_close_rate must be in [0, 1]")
         if not 0.0 <= float(self.anchor_rate_ema) < 1.0:
@@ -961,6 +1015,7 @@ class ViolationCriticTrainer:
         gate: torch.Tensor,
         *,
         actor_step: int,
+        batch_size_multiplier: int = 1,
     ) -> dict[str, float]:
         residual = residuals_from_gate(gate, self.cfg)
         target = robust_transform(residual, self.cfg.scales)
@@ -976,11 +1031,44 @@ class ViolationCriticTrainer:
             actor_step=actor_step,
         )
         stats: dict[str, float] = {}
-        for _ in range(int(self.cfg.updates_per_step)):
-            stats = self._update_once()
+        multiplier = max(1, int(batch_size_multiplier))
+        lr_scale = (
+            float(self.cfg.interval_lr_scale) if multiplier > 1 else 1.0
+        )
+        original_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+        try:
+            for group, lr in zip(self.optimizer.param_groups, original_lrs):
+                group["lr"] = lr * lr_scale
+            for _ in range(int(self.cfg.updates_per_step)):
+                stats = self._update_once(
+                    batch_size=int(self.cfg.batch_size) * multiplier,
+                    ema_decay=float(self.cfg.ema_decay) ** multiplier,
+                )
+        finally:
+            for group, lr in zip(self.optimizer.param_groups, original_lrs):
+                group["lr"] = lr
+        stats["update_interval"] = float(multiplier)
+        stats["effective_batch_size"] = float(
+            int(self.cfg.batch_size) * multiplier
+        )
+        stats["interval_lr_scale"] = float(lr_scale)
+        for key in (
+            "update_interval", "effective_batch_size", "interval_lr_scale",
+        ):
+            self._metric_sum[key] = self._metric_sum.get(key, 0.0) + (
+                float(stats[key]) * int(self.cfg.updates_per_step)
+            )
         return stats
 
-    def _update_once(self) -> dict[str, float]:
+    def _update_once(
+        self,
+        *,
+        batch_size: int | None = None,
+        ema_decay: float | None = None,
+    ) -> dict[str, float]:
+        sample_size = (
+            int(self.cfg.batch_size) if batch_size is None else int(batch_size)
+        )
         sample_kw = dict(
             generator=self.generator, device=self.device,
             manageable_fraction=self.cfg.replay_manageable_fraction,
@@ -991,14 +1079,14 @@ class ViolationCriticTrainer:
         if timescale:
             batches = [
                 self.recent.sample(
-                    self.cfg.batch_size, newest_fraction=fraction, **sample_kw,
+                    sample_size, newest_fraction=fraction, **sample_kw,
                 )
                 for fraction in (0.25, 0.50, 1.0)
             ]
             # Metrics use the full-window batch, evaluated by every EMA head.
             x, target = batches[-1]
         else:
-            x, target = self.recent.sample(self.cfg.batch_size, **sample_kw)
+            x, target = self.recent.sample(sample_size, **sample_kw)
 
         def forward_and_loss():
             if not timescale:
@@ -1054,7 +1142,7 @@ class ViolationCriticTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
-        self._update_ema()
+        self._update_ema(decay=ema_decay)
         self.updates += 1
 
         with torch.no_grad():
@@ -1105,8 +1193,8 @@ class ViolationCriticTrainer:
         return stats
 
     @torch.no_grad()
-    def _update_ema(self) -> None:
-        decay = float(self.cfg.ema_decay)
+    def _update_ema(self, *, decay: float | None = None) -> None:
+        decay = float(self.cfg.ema_decay) if decay is None else float(decay)
         for ema, live in zip(self.ema.parameters(), self.live.parameters()):
             ema.mul_(decay).add_(live, alpha=1.0 - decay)
 

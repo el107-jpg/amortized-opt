@@ -82,8 +82,8 @@ def test_terminal_waypoint_matches_the_library_pose(library, capsys):
             assert k == round({"left": tl, "right": tr}[hand] / C.CONTROL_DT)
             want = library.select(hand, drum, ws.yaw_target).arm_q
             worst = max(worst, float(np.abs(ws.q[k, arm_slice(hand)] - want).max()))
-            # ...and the arm HOLDS after its hit rather than drifting.
-            assert np.allclose(ws.q[k:, arm_slice(hand)], ws.q[k, arm_slice(hand)])
+            # The strike arrives moving and continues beyond contact.
+            assert not np.allclose(ws.q[k + 1, arm_slice(hand)], ws.q[k, arm_slice(hand)])
             cases += 1
     with capsys.disabled():
         print(f"\n[warmstart terminal, {cases} arm-cases] max |q_terminal - library| = {worst:.2e} rad")

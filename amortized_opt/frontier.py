@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS
+from .strike_seed import strike_seed
 from .warmstart_data import bucket_for
 
 N_MODE = 8
@@ -92,19 +93,19 @@ def quintic_init(
     hit: torch.Tensor,
     active: torch.Tensor,
     H: int,
+    *, qd0: torch.Tensor | None = None, dt: float = CONTROL_DT,
 ) -> torch.Tensor:
-    """Rest-to-rest quintic ``q0 → terminal`` over per-joint horizons, then hold.
+    """Strike initialization (legacy name), preserving the initial velocity.
 
     Same shape as ``WarmStart.init_traj`` / roller ``ramp_seed``: ``(B, H, 17)``.
     Terminal is gathered from the *parent* strike knot by the caller.
     """
     hit_eff = _effective_hits(hit, active, H)
     lengths = _group_lengths(hit_eff).index_select(1, _element_group(q0.device))
-    k = torch.arange(1, H + 1, device=q0.device, dtype=q0.dtype).view(1, H, 1)
-    L = lengths.clamp_min(1).to(q0.dtype).unsqueeze(1)
-    s = (k / L).clamp(0.0, 1.0)
-    ease = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
-    return q0.unsqueeze(1) + ease * (terminal - q0).unsqueeze(1)
+    return strike_seed(
+        q0, torch.zeros_like(q0) if qd0 is None else qd0,
+        terminal, lengths, H, dt, active=active,
+    )
 
 
 def parent_terminal(init: torch.Tensor, hit: torch.Tensor, active: torch.Tensor, H: int) -> torch.Tensor:
@@ -923,6 +924,7 @@ class FrontierCloud:
         child["init"] = quintic_init(
             child["q0"], term.index_select(0, sel),
             child["hit"], child["active"], H,
+            qd0=child["qd0"], dt=float(self.cfg.dt),
         )
         child = rebuild_clocks(child, dt=float(self.cfg.dt))
         d["n_children"].index_add_(
@@ -1066,6 +1068,7 @@ def steal_q0(
         cols["hit"].index_select(0, src),
         cols["active"].index_select(0, src),
         H,
+        qd0=cols["qd0"].index_select(0, src), dt=float(cloud.cfg.dt),
     )
     cols["init"].index_copy_(0, src, new_init.to(cols["init"].dtype))
     if "yaw_now" in cols:

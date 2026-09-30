@@ -601,6 +601,27 @@ python scripts/eval_phase1.py --ckpt runs/<run>/best.pt --device cuda:1
 
 ### The data
 
+Current strike timing (2026-09-23): phase-1 standard targets and fresh strike
+initializations use `amortized_opt/strike_seed.py`. Each joint starts at its
+measured velocity with zero acceleration, ramps acceleration linearly over
+the first 10% of its hand's strike window, then holds acceleration through
+contact. With `r = 0.1`, `T = hit_steps * dt`, and `d = q_goal - q0`, the
+plateau is `(d - v0*T) / (T*T*(1/2 - r/2 + r*r/6))`. Arrival velocity is free;
+an excessive or oppositely directed initial velocity can require braking or
+an initial move away from the goal. From rest the joint-space path stays
+straight; an off-path initial velocity necessarily bends it. Peak acceleration
+from rest is about 62% below the old rest-to-rest quintic for the same move.
+This is an acceleration comparison, not a torque-feasibility guarantee.
+
+The post-hit padding tapers acceleration to zero over another `r*T`, then
+coasts; it is masked out beyond each hand's strike and is not a rebound model.
+Existing joint-box/slew clamps still apply where enabled and can alter the
+analytic boundary conditions. Waist settling and idle-arm parking retain
+their quintics. Apex teachers retain their apex paths; their standard init
+and no-apex fallback use the new strike seed. Historical measurements below
+describe the earlier quintic teacher; regenerate pools and retrain phase 1 to
+learn the new timing. Existing checkpoints are not modified.
+
 One scenario = a `StartSampler` start state (90 % drum-departure, both hands
 placed on a drum) + a `goal_snapshot` taken at a random instant of a random RCC
 clip against a **randomized** kit + the `warmstart_trajectory` target (per-arm

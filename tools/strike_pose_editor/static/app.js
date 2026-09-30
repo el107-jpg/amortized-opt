@@ -21,7 +21,7 @@ const ui = {
   baseOverlayLabel: $("#base-overlay-label"), baseLegendLabel: $("#base-legend-label"),
   keyframeWeight: $("#keyframe-weight"), keyframeWeightValue: $("#keyframe-weight-value"),
   keyframeButton: $("#keyframe-button"), keyframes: $("#keyframe-list"), optimize: $("#optimize-button"),
-  reoptimize: $("#reoptimize-button"), saveTeacher: $("#save-teacher-button"), trainButtons: [...document.querySelectorAll(".train-button")],
+  optimizerBackend: $("#optimizer-backend"), sqpInitialization: $("#sqp-initialization"), reoptimize: $("#reoptimize-button"), saveTeacher: $("#save-teacher-button"), trainButtons: [...document.querySelectorAll(".train-button")],
   jobCard: $("#job-card"), jobTitle: $("#job-title"), jobPercent: $("#job-percent"), jobProgress: $("#job-progress"),
   jobDetail: $("#job-detail"), actionMessage: $("#action-message"), metricTemplate: $("#metric-template"),
 };
@@ -358,6 +358,7 @@ function setScenario(raw, { resetRounds = false } = {}) {
   if (resetRounds) state.localRounds = [];
   const serverRounds = raw.rounds || raw.optimization_rounds;
   if (Array.isArray(serverRounds)) state.localRounds = serverRounds.slice();
+  if (raw.optimizer_backend && ui.optimizerBackend.querySelector(`option[value="${raw.optimizer_backend}"]`)) ui.optimizerBackend.value = raw.optimizer_backend;
   const entries = trajectoryEntries();
   if (!entries.some((entry) => entry.key === state.selectedKey)) state.selectedKey = entries.some((entry) => entry.key === "teacher") ? "teacher" : entries[0]?.key || "base";
   if (resetRounds) {
@@ -430,7 +431,10 @@ function renderRounds() {
     const cost = round.diagnostics?.cost?.total ?? round.cost?.total ?? round.total;
     const accepted = round.feasibility?.accepted ?? round.diagnostics?.feasibility?.accepted;
     const feasibilityText = accepted === true ? "accepted" : accepted === false ? "rejected" : "not certified";
-    card.innerHTML = `<div class="round-title"><span>Round ${round.iteration ?? index + 1}</span><span>${Number.isFinite(Number(cost)) ? finite(cost).toFixed(3) : "—"}</span></div><p class="round-meta">${round.keyframes?.length ?? state.scenario?.keyframes?.length ?? 0} keyframes · ${round.status || "complete"} · ${feasibilityText}</p>`;
+    const backend = round.backend === "hpipm" ? "HPIPM SQP" : round.backend === "adam" ? "Adam" : "optimizer";
+    const initialization = round.backend_diagnostics?.sqp_initialization === "quintic" ? "fresh quintic" : round.backend === "hpipm" ? "current path" : null;
+    const initializationText = initialization ? ` · ${initialization}` : "";
+    card.innerHTML = `<div class="round-title"><span>Round ${round.iteration ?? index + 1}</span><span>${Number.isFinite(Number(cost)) ? finite(cost).toFixed(3) : "—"}</span></div><p class="round-meta">${backend}${initializationText} · ${round.keyframes?.length ?? state.scenario?.keyframes?.length ?? 0} keyframes · ${round.status || "complete"} · ${feasibilityText}</p>`;
     if (combineTrajectory("probe", round.trajectory || round.q || round.teacher, round.geometry)) card.addEventListener("click", () => selectTrajectory(`round:${index}`));
     return card;
   }));
@@ -575,7 +579,10 @@ async function optimize(reoptimize = false) {
     const terminalQ = state.taskTerminalQ[hand]
       || (state.waypoint === hit ? state.pendingQ.slice() : entry?.q?.[hit]?.map(Number));
     if (!Array.isArray(terminalQ) || terminalQ.length !== jointNames().length) throw new Error("Solve the selected hand's terminal IK before optimizing.");
-    const payload = await api(`/api/scenarios/${encodeURIComponent(scenarioId())}/optimize`, { method: "POST", mutate: true, body: { iterations: reoptimize ? 30 : 60, lr: 1e-3, task_constraint: { hand, ...readTaskTarget(), terminal_q: terminalQ } } });
+    const backend = ui.optimizerBackend.value;
+    const iterations = backend === "hpipm" ? (reoptimize ? 8 : 15) : (reoptimize ? 30 : 60);
+    const sqpInitialization = backend === "hpipm" ? ui.sqpInitialization.value : "current";
+    const payload = await api(`/api/scenarios/${encodeURIComponent(scenarioId())}/optimize`, { method: "POST", mutate: true, body: { iterations, lr: 1e-3, backend, sqp_initialization: sqpInitialization, task_constraint: { hand, ...readTaskTarget(), terminal_q: terminalQ } } });
     if (payload.job_id || (payload.id && payload.status && !payload.trajectory && !payload.scenario)) { await monitorJob(payload.job_id || payload.id, "Teacher optimization"); }
     else mergeOptimization(payload);
     const feasibility = teacherFeasibility();
@@ -600,7 +607,7 @@ function mergeOptimization(payload) {
     if (payload.keyframes) state.scenario.keyframes = payload.keyframes;
     if (payload.diagnostics) { state.scenario.diagnostics ||= {}; state.scenario.diagnostics.teacher = payload.diagnostics; }
     if (payload.feasibility) state.scenario.feasibility = payload.feasibility;
-    state.localRounds.push({ iteration: payload.iteration ?? state.localRounds.length + 1, trajectory, geometry: payload.geometry, diagnostics: payload.diagnostics, feasibility: payload.feasibility, keyframes: payload.keyframes, status: "complete" });
+    state.localRounds.push({ iteration: payload.iteration ?? state.localRounds.length + 1, trajectory, geometry: payload.geometry, diagnostics: payload.diagnostics, feasibility: payload.feasibility, keyframes: payload.keyframes, backend: payload.backend || payload.diagnostics?.optimizer_backend?.backend, backend_diagnostics: payload.backend_diagnostics || payload.diagnostics?.optimizer_backend, status: "complete" });
     state.selectedKey = "teacher"; renderScenario(); loadWaypoint();
   }
 }
@@ -644,7 +651,7 @@ function mergeJobResult(result) {
 function setBusy(busy, label = "") {
   state.busy = busy; ui.scenarioStatus.className = `mini-status ${busy ? "busy" : state.scenario ? "good" : ""}`; ui.scenarioStatus.textContent = busy ? label : state.scenario ? (state.scenario.saved ? "saved" : "active") : "none";
   const teacherAccepted = teacherFeasibility()?.accepted === true;
-  ui.sample.disabled = busy; ui.optimize.disabled = busy || !state.scenario; ui.reoptimize.disabled = busy || !trajectoryEntries().some((entry) => entry.key === "teacher"); ui.keyframeButton.disabled = busy || !state.scenario; ui.saveTeacher.disabled = busy || !trajectoryEntries().some((entry) => entry.key === "teacher") || !teacherAccepted; updateTeachingHandUI();
+  ui.sample.disabled = busy; ui.optimizerBackend.disabled = busy; ui.sqpInitialization.disabled = busy || ui.optimizerBackend.value !== "hpipm"; ui.optimize.disabled = busy || !state.scenario; ui.reoptimize.disabled = busy || !trajectoryEntries().some((entry) => entry.key === "teacher"); ui.keyframeButton.disabled = busy || !state.scenario; ui.saveTeacher.disabled = busy || !trajectoryEntries().some((entry) => entry.key === "teacher") || !teacherAccepted; updateTeachingHandUI();
 }
 
 function updateTeachingHandUI() {
@@ -1015,6 +1022,7 @@ function bindEvents() {
   ui.resetWaypoint.addEventListener("click", resetWaypoint); ui.blend.addEventListener("click", blendNeighbors); ui.keyframeButton.addEventListener("click", addKeyframe);
   ui.keyframeWeight.addEventListener("input", () => { ui.keyframeWeightValue.textContent = `${finite(ui.keyframeWeight.value, 1).toFixed(1)}×`; });
   document.querySelectorAll('input[name="keyframe-mode"]').forEach((input) => input.addEventListener("change", () => { ui.keyframeWeight.disabled = keyframeMode() === "hard"; }));
+  ui.optimizerBackend.addEventListener("change", () => { ui.sqpInitialization.disabled = state.busy || ui.optimizerBackend.value !== "hpipm"; });
   ui.optimize.addEventListener("click", () => optimize(false)); ui.reoptimize.addEventListener("click", () => optimize(true)); ui.saveTeacher.addEventListener("click", saveTeacher);
   ui.trainButtons.forEach((button) => button.addEventListener("click", () => train(Number(button.dataset.steps))));
   ui.canvas.addEventListener("pointerdown", (event) => { state.camera.dragging = true; state.camera.x = event.clientX; state.camera.y = event.clientY; ui.canvas.classList.add("dragging"); ui.canvas.setPointerCapture(event.pointerId); });
@@ -1026,7 +1034,7 @@ function bindEvents() {
 
 async function initialize() {
   bindEvents();
-  try { const [health, config] = await Promise.all([api("/healthz"), api("/api/config")]); state.config = config; ui.session.textContent = `session ${config.session || health?.session || "local"}`; setConnection("online", "Local · isolated"); renderDiagnostics(); draw(); }
+  try { const [health, config] = await Promise.all([api("/healthz"), api("/api/config")]); state.config = config; ui.optimizerBackend.replaceChildren(...(config.optimizer_backends || []).filter((row) => row.available).map((row) => new Option(row.label, row.id))); ui.optimizerBackend.value = config.default_optimizer_backend || "adam"; ui.sqpInitialization.disabled = ui.optimizerBackend.value !== "hpipm"; ui.session.textContent = `session ${config.session || health?.session || "local"}`; setConnection("online", "Local · isolated"); renderDiagnostics(); draw(); }
   catch (error) { setConnection("error", "Backend unavailable"); setMessage(`Start the isolated teaching server and reload: ${error.message}`, "error"); }
 }
 

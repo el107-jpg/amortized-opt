@@ -7,8 +7,8 @@ into their public functions.
 
 The idea
 --------
-Phase 1's imitation target is a *straight line* in joint space from the start
-pose to a library terminal pose, walked by a quintic timing law.  That target is
+Phase 1's original imitation target was a *straight line* in joint space from
+the start pose to a library terminal pose, walked by a quintic timing law. It is
 obstacle-unaware by construction: it drives the stick through whatever sits
 between the two poses, and it arrives at the head from an arbitrary direction.
 
@@ -23,25 +23,25 @@ centred ``seed_apex_height = 0.30 m`` above the strike position
 (``seed_apex_radius = 0.15 m``, ``seed_apex_half_height = 0.10 m``), chosen as
 close as possible **in joint space to the start pose alone** (apex-first
 ordering), and the terminal strike pose is then chosen **nearest that apex**.
-The cubic through those three knots is already descending when it reaches the
-head -- which is the shape a strike has.
+The two low-acceleration legs through those knots are already descending when
+the path reaches the head, which is the shape a strike has.
 
 This module mirrors that convention standalone, so phase 1 can be A/B'd on
-"straight line" vs "apex spline" imitation targets.
+"direct low-acceleration" vs "two-segment apex" imitation targets.
 
 What one sample looks like
 --------------------------
-Per Eric's 2026-08-10 clarification, the **input initialization stays the
-noised straight-line quintic**; only the imitation *target* becomes the apex
-spline:
+The input initialization uses the shared velocity-matched accelerating seed;
+the imitation target applies the same law to both apex legs:
 
-* target  = ``retime_joint_path([q_start, q_apex, q_terminal])``  (apex spline)
-* init    = ``retime_joint_path([q_start, q_terminal])`` + OU/white noise
-            (the straight quintic, to the *same* terminal pose)
+* target  = ``accelerating(q_start -> q_apex)`` followed by
+            ``accelerating(q_apex -> q_terminal)``
+* init    = ``accelerating_path_numpy(q_start, v_start, q_terminal, ...)``
+            + OU/white noise, to the *same* terminal pose
 
-The model therefore learns to bend a straight-line guess into the apex shape,
-which is exactly what deployment asks of it: a fresh MPC init is a straight
-quintic.  Both legs share the terminal pose, so the A/B isolates path *shape*.
+The model learns to refine the standard strike initializer into the apex
+trajectory. Both share the terminal pose. Without an apex, the target also
+uses the standard strike initializer.
 
 Deviations from the repo's apex machinery (deliberate, measured)
 ----------------------------------------------------------------
@@ -103,7 +103,12 @@ from .rhythm import (
     load_rcc_pool,
 )
 from .sdf import DrumSceneSpec, SdfPenalty
-from .spline import joint_path_spline, retime_joint_path
+from .spline import joint_path_spline
+from .strike_seed import (
+    accelerating_apex_path_numpy,
+    accelerating_apex_path_torch,
+    accelerating_path_numpy,
+)
 from .warmstart import GoalPoseLibrary, LibraryEntry, arm_slice, warmstart_trajectory
 from .warmstart_data import (
     CONTEXT_FIELDS,
@@ -469,7 +474,7 @@ def apex_warmstart_trajectory(
     q_bounds: tuple[np.ndarray, np.ndarray] | None = None,
     **warmstart_kwargs,
 ) -> ApexWarmStart:
-    """Apex-spline target + straight-quintic init, sharing one terminal pose.
+    """Two-segment low-acceleration apex target and matching direct init.
 
     The **waist** column and ``yaw_target`` come from
     :func:`~amortized_opt.warmstart.warmstart_trajectory` called with both hands
@@ -534,22 +539,29 @@ def apex_warmstart_trajectory(
             apex_used[hand] = qa
         knots.append(q_term)
         Q = np.stack(knots)
-        X, _rate = retime_joint_path(
-            Q, k_hit + 1, float(dt), v_start=v0[idx], v_limit=v_lim[idx],
-            q_lower=lo[idx], q_upper=hi[idx],
-        )
+        if len(knots) == 3:
+            # ApexSolver was conditioned on the waist at the midpoint of this
+            # strike window.  Put the arm apex at that same waypoint so the
+            # full-body FK pose actually visits the solved cylinder.
+            ka = int(np.clip(round(0.5 * k_hit), 1, k_hit - 1))
+            X = accelerating_apex_path_numpy(
+                q0[idx], v0[idx], qa, q_term, ka, k_hit, k_hit, float(dt),
+            )
+        else:
+            X = accelerating_path_numpy(
+                q0[idx], v0[idx], q_term, k_hit, k_hit, float(dt),
+            )
         tgt[: k_hit + 1, idx] = X
         tgt[k_hit + 1 :, idx] = X[-1][None, :]
         if len(knots) == 3:
-            apex_wp[hand] = _apex_waypoint(Q, k_hit)
+            apex_wp[hand] = ka
 
-        # the straight-line companion, to the SAME terminal pose
-        Y, _r2 = retime_joint_path(
-            np.stack([q0[idx], q_term]), k_hit + 1, float(dt),
-            v_start=v0[idx], v_limit=v_lim[idx], q_lower=lo[idx], q_upper=hi[idx],
-        )
-        ini[: k_hit + 1, idx] = Y
-        ini[k_hit + 1 :, idx] = Y[-1][None, :]
+        # The shared velocity-matched strike initializer to the SAME terminal.
+        Y = accelerating_path_numpy(q0[idx], v0[idx], q_term, k_hit, H, float(dt))
+        ini[:, idx] = Y
+        if len(knots) == 2:
+            # No apex: use the standard phase-1 target as well.
+            tgt[:, idx] = Y
 
     tgt = np.clip(tgt, lo[None, :], hi[None, :])
     ini = np.clip(ini, lo[None, :], hi[None, :])
@@ -611,7 +623,10 @@ def _draw_time(clip: RhythmClip, rng: np.random.Generator, cfg: ScenarioConfig) 
     return float(rng.uniform(0.0, max(clip.duration, cfg.dt)))
 
 
-_APEX_KEYS = ("q0", "qd0", "target", "init_base", "hit", "active", "drum")
+_APEX_KEYS = (
+    "q0", "qd0", "target", "init_base", "hit", "active", "drum",
+    "apex_arm", "apex_wp",
+)
 
 
 def generate_apex_scenarios(
@@ -962,6 +977,13 @@ def generate_apex_scenarios(
             rec["drum"].append(np.array(
                 [r["snap"].goal[h].drum if hit[h] >= 0 else -1 for h in HANDS], dtype=np.int64
             ))
+            rec["apex_arm"].append(np.stack([
+                np.asarray(ws.apex_arm.get(h, np.full(7, np.nan)), dtype=np.float32)
+                for h in HANDS
+            ]))
+            rec["apex_wp"].append(np.asarray(
+                [ws.apex_wp.get(h, -1) for h in HANDS], dtype=np.int64
+            ))
             for f in CONTEXT_FIELDS:
                 v = getattr(ctx, f)[0].numpy()
                 rec[f].append(v.astype(np.int64) if f in _LONG_FIELDS
@@ -1053,9 +1075,9 @@ def generate_apex_parallel(
 class ApexWarmstartPool(WarmstartPool):
     """:class:`~amortized_opt.warmstart_data.WarmstartPool` with a separate init.
 
-    The stored ``target`` is the **apex spline** (and every auxiliary label is
-    computed from it, unchanged, by the parent constructor).  The stored
-    ``init_base`` is the **straight-line quintic to the same terminal pose**,
+    The stored ``target`` is the **two-segment apex path** (and every auxiliary
+    label is computed from it by the parent constructor).  The stored
+    ``init_base`` is the **direct accelerating path to the same terminal pose**,
     and that -- not the target -- is what gets the OU + white perturbation at
     batch time.  So the model always sees a straight-line warm start and is
     asked to bend it into the apex shape, which is what deployment looks like.
@@ -1064,14 +1086,14 @@ class ApexWarmstartPool(WarmstartPool):
 
     * ``"mix"`` -- **the default and the trained regime** (Eric, 2026-08-10,
       update 1): a per-sample coin flip, ``init_mix`` of the batch gets the
-      noised APEX spline (the refine/denoise mapping) and the rest the noised
-      straight-line quintic (the bend mapping).  Pure straight->apex would make
+      noised APEX path (the refine/denoise mapping) and the rest the noised
+      direct path (the bend mapping).  Pure direct->apex would make
       the target a deterministic function of the context alone, and the model
       is free to learn to ignore its init -- which destroys exactly the
       refinement-operator property an MPC warm start depends on.  The mix keeps
       the init informative.
     * ``"straight"`` / ``"apex"`` -- one channel only (probes and ablations);
-    * ``"straight_clean"`` -- the un-noised straight quintic;
+    * ``"straight_clean"`` -- the un-noised direct accelerating path;
     * ``"hold"`` -- zero-motion hold at the start pose.
 
     ``white_noise`` (Eric, update 2) replaces the OU kernel with the identity,
@@ -1081,7 +1103,7 @@ class ApexWarmstartPool(WarmstartPool):
 
     #: default channel for callers that do not pass ``init_mode`` (the trainer)
     default_init_mode: str = "mix"
-    #: fraction of a batch initialized from the apex spline under ``"mix"``
+    #: fraction of a batch initialized from the apex path under ``"mix"``
     init_mix: float = 0.5
     #: drop the OU correlation, keep the total variance (the section-2 ablation)
     white_noise: bool = False
@@ -1194,6 +1216,7 @@ def generate_apex_pool(
     init_mix: float = 0.5,
     white_noise: bool = False,
     aux_torque_tracking: bool = False,
+    terminal_initializer=None,
 ) -> ApexWarmstartPool:
     cfg = cfg or ScenarioConfig()
     acfg = apex_cfg or ApexConfig()
@@ -1207,11 +1230,60 @@ def generate_apex_pool(
         raw["buckets"], cfg=cfg, noise=noise, device=device, dtype=dtype,
         fk=fk, rnea=rnea, stats=stats,
         aux_torque_tracking=bool(aux_torque_tracking),
+        trajectory_transform=(
+            None if terminal_initializer is None
+            else _terminal_head_transform(terminal_initializer, cfg)
+        ),
     )
     pool.default_init_mode = str(init_mode)
     pool.init_mix = float(init_mix)
     pool.white_noise = bool(white_noise)
     return pool
+
+
+def _terminal_head_transform(initializer, cfg: ScenarioConfig):
+    """Retarget an apex pool before its FK/RNEA auxiliary labels are built."""
+    names = tuple(cfg.joint_names)
+    q_lo_np, q_hi_np = urdf_position_limits(names)
+    q_lo = torch.as_tensor(q_lo_np, device=initializer.nominal_axis.device)
+    q_hi = torch.as_tensor(q_hi_np, device=initializer.nominal_axis.device)
+    arm_cols = {
+        hand: torch.as_tensor(
+            np.arange(len(names))[arm_slice(hand, names)],
+            device=initializer.nominal_axis.device, dtype=torch.long,
+        )
+        for hand in HANDS
+    }
+
+    @torch.no_grad()
+    def transform(d, ctx, masks, H):
+        state = torch.cat([d["q0"], d["qd0"]], dim=-1)
+        terminal = initializer.terminal_pose(ctx, state, masks)
+        seed = initializer(ctx, state, masks)
+        target = seed.clone()
+        # Active trajectories visit the pre-solved apex, but both legs now use
+        # exactly the same low-acceleration law as the direct initializer.
+        for hi, hand in enumerate(HANDS):
+            cols = arm_cols[hand].to(d["q0"].device)
+            active = d["active"][:, hi] & (d["apex_wp"][:, hi] >= 1)
+            if not bool(active.any()):
+                continue
+            rows = active.nonzero(as_tuple=True)[0]
+            path = accelerating_apex_path_torch(
+                d["q0"].index_select(0, rows).index_select(1, cols),
+                d["qd0"].index_select(0, rows).index_select(1, cols),
+                d["apex_arm"].index_select(0, rows)[:, hi],
+                terminal.index_select(0, rows).index_select(1, cols),
+                d["apex_wp"].index_select(0, rows)[:, hi],
+                d["hit"].index_select(0, rows)[:, hi],
+                int(H), float(cfg.dt),
+            )
+            target[rows[:, None, None], torch.arange(H, device=target.device)[None, :, None],
+                   cols[None, None, :]] = path
+        target = target.clamp(q_lo.to(target), q_hi.to(target))
+        return {"target": target * masks.elem_mask, "init_base": seed}
+
+    return transform
 
 
 # ================================================================ planners ===

@@ -112,6 +112,16 @@ def parse_args(argv=None):
     p.add_argument("--device", default="cuda:1")
     p.add_argument("--steps", type=int, default=60_000)
     p.add_argument("--batch", type=int, default=512)
+    p.add_argument(
+        "--token-budget", type=int, default=None,
+        help="maximum B*H actor tokens per update (default: 25600); use "
+             "51200 with --batch 1024 at horizon 50",
+    )
+    p.add_argument(
+        "--actor-superbatch-factor", type=int, default=1,
+        help="draw/shuffle this many actor minibatches together before "
+             "consuming non-overlapping slices (timing curriculum only)",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup-steps", type=int, default=300)
     p.add_argument("--min-lr-frac", type=float, default=0.05)
@@ -223,6 +233,15 @@ def parse_args(argv=None):
     )
     p.add_argument("--timing-critic-batch", type=int, default=256)
     p.add_argument("--timing-critic-updates", type=int, default=1)
+    p.add_argument(
+        "--timing-critic-update-interval", type=int, default=1,
+        help="cache actor labels for N steps, then make one critic update with "
+             "N times the critic batch",
+    )
+    p.add_argument(
+        "--timing-critic-interval-lr-scale", type=float, default=1.0,
+        help="critic LR multiplier on consolidated updates (1 is conservative)",
+    )
     p.add_argument("--timing-critic-bootstrap-prob", type=float, default=0.8)
     p.add_argument("--timing-critic-prior-scale", type=float, default=0.0)
     p.add_argument("--timing-critic-dropout", type=float, default=0.0)
@@ -258,6 +277,18 @@ def parse_args(argv=None):
         "--timing-primary-mpc-collision-sdf-limit", type=float, default=-0.010,
     )
     p.add_argument(
+        "--timing-mpc-q-noise", type=float, default=0.01,
+        help="joint-position noise (rad) on random trajectory-suffix handoffs",
+    )
+    p.add_argument(
+        "--timing-mpc-qd-noise", type=float, default=0.05,
+        help="joint-velocity noise (rad/s) on random trajectory-suffix handoffs",
+    )
+    p.add_argument(
+        "--timing-mpc-parent-capacity", type=int, default=2048,
+        help="certified full parent trajectories retained per horizon",
+    )
+    p.add_argument(
         "--timing-critic-representation",
         choices=("regression", "distributional"), default="regression",
     )
@@ -269,6 +300,11 @@ def parse_args(argv=None):
     p.add_argument("--timing-anchor-curriculum", action="store_true")
     p.add_argument("--timing-anchor-min-samples", type=int, default=2048)
     p.add_argument("--timing-anchor-min-close-rate", type=float, default=0.50)
+    p.add_argument("--timing-anchor-ramp-steps", type=int, default=0)
+    p.add_argument("--timing-short-floor-wp", type=int, default=8)
+    p.add_argument("--timing-short-unlock-min-samples", type=int, default=2048)
+    p.add_argument("--timing-short-unlock-success", type=float, default=0.50)
+    p.add_argument("--timing-boundary-min-manageable", type=float, default=0.50)
     p.add_argument("--timing-terminal-limit", type=float, default=0.020)
     p.add_argument("--timing-collision-sdf-limit", type=float, default=-0.005)
     p.add_argument("--timing-joint-limit", type=float, default=0.020)
@@ -312,8 +348,18 @@ def parse_args(argv=None):
     p.add_argument("--dec-layers", type=int, default=None, help="decoder depth (default 3)")
     p.add_argument("--d-ctx", type=int, default=None, help="encoder width (default 256)")
     p.add_argument("--ctx-layers", type=int, default=None, help="encoder depth (default 2)")
+    p.add_argument(
+        "--no-ctx-self-attn", action="store_true",
+        help="omit encoder self-attention but retain its per-token FFN",
+    )
     p.add_argument("--dec-ffn-mult", type=float, default=None,
                    help="decoder FFN multiplier (default 4.0)")
+    p.add_argument(
+        "--dec-cross-attn-layers", type=int, nargs="+", default=None,
+        metavar="LAYER",
+        help="decoder layers that retain context cross-attention (default: "
+             "checkpoint architecture, or all layers for a fresh model)",
+    )
     p.add_argument("--dec-rope", action="store_true",
                    help="rotary position on decoder SELF-attention (Llama RoPE "
                         "on the [state]+waypoint grid).  No extra parameters; "
@@ -348,12 +394,32 @@ def parse_args(argv=None):
                    help="masked Huber weight tying each sampled MPC replay "
                         "output to its stored shifted-parent initialization; "
                         "fresh/quintic rows are excluded (default 0)")
+    p.add_argument("--w-waist-yaw-mpc-tie", type=float, default=None,
+                   help="waist-yaw-only time-aligned MPC parent consistency "
+                        "weight; not diluted over the other 16 joints")
     p.add_argument("--suffix-frac", type=float, default=None,
-                   help="fraction of the batch that also solves a random "
-                        "suffix of the main solve's own plan (suffix-Bellman "
-                        "term; 0 = off, the default)")
+                   help="enable verified-parent suffix replay when positive "
+                        "(legacy fraction retained as the off switch)")
+    p.add_argument("--suffix-replay-batch", type=int, default=None,
+                   help="fixed verified-parent suffix distillation batch "
+                        "(default 64)")
+    p.add_argument("--suffix-replay-capacity", type=int, default=None,
+                   help="global FIFO capacity for verified suffix parents "
+                        "(default 256)")
+    p.add_argument("--suffix-replay-min-parents", type=int, default=None,
+                   help="unique verified parents required before suffix "
+                        "distillation starts (default 16)")
+    p.add_argument("--suffix-microbatch", type=int, default=None,
+                   help="maximum suffix-decoder rows per differentiable call; "
+                        "0 keeps the full suffix subset in one call")
+    p.add_argument("--terminal-suffix-peak-frac", type=float, default=0.55)
+    p.add_argument("--terminal-suffix-long-frac", type=float, default=0.42)
+    p.add_argument("--terminal-suffix-low-frac", type=float, default=0.03)
+    p.add_argument("--terminal-suffix-peak-wp", type=int, default=5)
+    p.add_argument("--terminal-suffix-tail-tau", type=float, default=8.0)
     p.add_argument("--w-suffix-cost", type=float, default=None,
-                   help="FusedCost weight on the suffix solve (default 1.0)")
+                   help="legacy compatibility field; verified suffix replay "
+                        "does not evaluate a child FusedCost")
     p.add_argument("--w-suffix-tie", type=float, default=None,
                    help="Huber weight tying the suffix solve to the parent "
                         "plan's tail (default 50, the w_tc scale)")
@@ -417,6 +483,12 @@ def parse_args(argv=None):
                         "RNEA (default 0)")
     p.add_argument("--bptt-start-frac", type=float, default=None)
     p.add_argument("--bptt-max-frac", type=float, default=None)
+    p.add_argument("--bptt-batch", type=int, default=None)
+    p.add_argument("--bptt-decoder-passes", type=int, default=None,
+                   help="total decoder applications across the two-solve BPTT chain")
+    p.add_argument("--w-bptt", type=float, default=None)
+    p.add_argument("--decoder-only", action="store_true",
+                   help="freeze encoder and terminal initializer; optimize decoder only")
     p.add_argument("--n-sub", type=int, default=1)
     p.add_argument("--w-torque", type=float, default=None,
                    help="override phase2_cost_config's torque price "
@@ -579,6 +651,14 @@ def parse_args(argv=None):
                         "(CostConfig.w_waist_yaw_vel).  Stops the planner buying "
                         "impact speed by winding up the torso.  A steady 1 rad/s "
                         "turn pays exactly this weight")
+    p.add_argument("--w-waist-yaw-monotonic", type=float, default=None,
+                   help="target-directed wrong-way yaw-step penalty across "
+                        "the complete spline")
+    p.add_argument("--w-waist-yaw-accel-direction", type=float, default=None,
+                   help="penalize waist-yaw acceleration whose sign points "
+                        "away from the nearest active hit's analytic yaw")
+    p.add_argument("--w-waist-yaw-initial-accel-direction", type=float, default=None,
+                   help="strong boundary-only wrong-sign waist-yaw acceleration penalty")
     p.add_argument("--waist-upright-ease-wp", type=int, default=None,
                    help="pool seeds' pitch/roll ease from the sampled lean to "
                         "upright over this many waypoints "
@@ -958,6 +1038,11 @@ def parse_args(argv=None):
                         "fixed_epsilon = constant ε, no probe trials")
     p.add_argument("--line-search-c1", type=float, default=None,
                    help="Armijo c1 for smoothed probe acceptance (default 0.5)")
+    p.add_argument("--line-search-c1-start", type=float, default=None,
+                   help="optional initial Armijo c1 for a cosine curriculum")
+    p.add_argument("--line-search-c1-ramp-updates", type=int, default=0,
+                   help="successful updates over which c1 cosine-ramps to "
+                        "--line-search-c1 (0 disables)")
     p.add_argument("--line-search-beta", type=float, default=None,
                    help="beta_accept_per_update EMA retention (default 0.99)")
     p.add_argument("--line-search-max-trials", type=int, default=None,
@@ -976,11 +1061,19 @@ def parse_args(argv=None):
     p.add_argument("--line-search-warmup-updates", type=int, default=None,
                    help="search every update for N successful commits "
                         "(default 10)")
+    p.add_argument("--line-search-activate-after-updates", type=int, default=0,
+                   help="perform ordinary AdamW updates at the live cosine "
+                        "epsilon floor for N commits, then activate Armijo")
     p.add_argument("--line-search-epsilon-seed", type=float, default=None,
                    help="explicit epsilon seed; default uses --lr / resume "
                         "migration")
     p.add_argument("--line-search-epsilon-min", type=float, default=None,
                    help="absolute ε floor (default epsilon_min_mult × seed)")
+    p.add_argument("--line-search-epsilon-min-start", type=float, default=None,
+                   help="optional initial epsilon floor for a cosine curriculum")
+    p.add_argument("--line-search-epsilon-min-ramp-updates", type=int, default=0,
+                   help="successful updates over which the epsilon floor cosine-"
+                        "ramps to --line-search-epsilon-min")
     p.add_argument("--line-search-epsilon-max", type=float, default=None,
                    help="absolute ε ceiling (default epsilon_max_mult × seed)")
     p.add_argument("--line-search-fresh", action="store_true",
@@ -1011,6 +1104,12 @@ def parse_args(argv=None):
                    action="store_true",
                    help="skip the update instead of floor-committing when no "
                         "probe candidate is accepted")
+    p.add_argument("--terminal-init-noise", action="store_true",
+                   help="apply phase-1-matched OU+white noise to fresh frozen-"
+                        "terminal-head seeds after reseeding")
+    p.add_argument("--terminal-init-noise-ramp-steps", type=int, default=5,
+                   help="knots used by the zero-position/zero-velocity cubic "
+                        "noise envelope (default 5)")
     p.add_argument("--optimizer", default="adamw", choices=["adamw", "lbfgs"],
                    help="line-search direction: AdamW preconditioner or L-BFGS")
     p.add_argument("--lbfgs-history", type=int, default=10,
@@ -1147,6 +1246,9 @@ def _validate_voxel_cli(args) -> None:
     }
     forbidden_values = {
         "--w-waist-aim": args.w_waist_aim,
+        "--w-waist-yaw-monotonic": args.w_waist_yaw_monotonic,
+        "--w-waist-yaw-accel-direction": args.w_waist_yaw_accel_direction,
+        "--w-waist-yaw-initial-accel-direction": args.w_waist_yaw_initial_accel_direction,
         "--w-waist-sp-tether": args.w_waist_sp_tether,
         "--w-waist-pr-sp-tether": args.w_waist_pr_sp_tether,
         "--w-waist-pr-sp-hold": args.w_waist_pr_sp_hold,
@@ -1586,6 +1688,9 @@ def main(argv=None) -> int:
         if val is not None:
             setattr(model_cfg, attr, val)
             overridden = True
+    if args.no_ctx_self_attn:
+        model_cfg.ctx_self_attn = False
+        overridden = True
     if getattr(args, "no_aux_heads", False):
         model_cfg.predict_aux = False
         overridden = True
@@ -1658,6 +1763,13 @@ def main(argv=None) -> int:
         overridden = True
         print("[model] decoder plant features ON "
               "(Cartesian + knot-RNEA of init_traj, zero-init no-op)", flush=True)
+    if args.dec_cross_attn_layers is not None:
+        layers = tuple(args.dec_cross_attn_layers)
+        if layers != model_cfg.dec_cross_attn_layers:
+            model_cfg.dec_cross_attn_layers = layers
+            model_cfg.__post_init__()
+            overridden = True
+            print(f"[model] decoder cross-attention layers={layers}", flush=True)
     if args.traj_head_fp32 and not getattr(model_cfg, "traj_head_fp32", False):
         # Behaviour-only: no tensor shape or state-dict key changes.
         model_cfg.traj_head_fp32 = True
@@ -1727,6 +1839,30 @@ def main(argv=None) -> int:
         print("[cfg] line_search=1 (cosine LR ownership gated once executor "
               "is wired — plan §7; commit-gate/viol_acc: plan §14)",
               flush=True)
+        if args.line_search_c1_start is not None:
+            final_c1 = 0.5 if args.line_search_c1 is None else args.line_search_c1
+            print(f"[cfg] line_search c1 cosine: "
+                  f"{float(args.line_search_c1_start):g} -> "
+                  f"{float(final_c1):g} over "
+                  f"{int(args.line_search_c1_ramp_updates)} updates", flush=True)
+        if args.line_search_epsilon_min_start is not None:
+            final_floor = (
+                "derived" if args.line_search_epsilon_min is None
+                else f"{float(args.line_search_epsilon_min):g}"
+            )
+            print(f"[cfg] line_search epsilon floor cosine: "
+                  f"{float(args.line_search_epsilon_min_start):g} -> "
+                  f"{final_floor} over "
+                  f"{int(args.line_search_epsilon_min_ramp_updates)} updates",
+                  flush=True)
+        if int(args.line_search_activate_after_updates) > 0:
+            print(f"[cfg] line_search delayed until after update "
+                  f"{int(args.line_search_activate_after_updates)}; ordinary "
+                  "AdamW follows the live epsilon floor before activation",
+                  flush=True)
+    if args.terminal_init_noise:
+        print(f"[cfg] fresh terminal init noise ON: OU+white, start-anchored "
+              f"over {int(args.terminal_init_noise_ramp_steps)} knots", flush=True)
     if float(args.torque_grad_cap) > 0.0:
         print(f"[cfg] torque_grad_cap={float(args.torque_grad_cap):g} "
               f"(LS-compatible; no PCGrad)", flush=True)
@@ -1782,10 +1918,24 @@ def main(argv=None) -> int:
         else:
             model.load_state_dict(ck["model"])
         print(f"[init] {args.resume or args.init} @ step {ck.get('step')}", flush=True)
+    if args.decoder_only:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("decoder."))
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(
+            f"[cfg] decoder-only training: trainable={trainable} frozen={frozen} "
+            "(encoder and terminal initializer detached)",
+            flush=True,
+        )
     print(f"[model] {A.param_counts(model)}", flush=True)
 
     cfg = Phase2Config(
         max_steps=int(args.steps), batch_size=int(args.batch), lr=float(args.lr),
+        token_budget=(
+            512 * 50 if args.token_budget is None else int(args.token_budget)
+        ),
+        actor_superbatch_factor=int(args.actor_superbatch_factor),
         warmup_steps=int(args.warmup_steps),
         min_lr_frac=float(args.min_lr_frac),
         amp_dtype="float32" if args.no_amp else "bfloat16",
@@ -1820,6 +1970,8 @@ def main(argv=None) -> int:
             ema_decay=float(args.timing_critic_ema_decay),
             batch_size=int(args.timing_critic_batch),
             updates_per_step=int(args.timing_critic_updates),
+            update_interval=int(args.timing_critic_update_interval),
+            interval_lr_scale=float(args.timing_critic_interval_lr_scale),
             bootstrap_probability=float(args.timing_critic_bootstrap_prob),
             randomized_prior_scale=float(args.timing_critic_prior_scale),
             dropout_probability=float(args.timing_critic_dropout),
@@ -1875,11 +2027,28 @@ def main(argv=None) -> int:
             anchor_curriculum=bool(args.timing_anchor_curriculum),
             anchor_min_samples=int(args.timing_anchor_min_samples),
             anchor_min_close_rate=float(args.timing_anchor_min_close_rate),
+            anchor_curriculum_ramp_steps=int(args.timing_anchor_ramp_steps),
+            short_floor_wp=int(args.timing_short_floor_wp),
+            short_unlock_min_samples=int(
+                args.timing_short_unlock_min_samples
+            ),
+            short_unlock_success=float(args.timing_short_unlock_success),
+            boundary_min_manageable=float(
+                args.timing_boundary_min_manageable
+            ),
             terminal_limit=float(args.timing_terminal_limit),
             collision_sdf_limit=float(args.timing_collision_sdf_limit),
             joint_limit=float(args.timing_joint_limit),
             torque_limit=float(args.timing_torque_limit),
         ),
+        timing_mpc_q_noise=float(args.timing_mpc_q_noise),
+        timing_mpc_qd_noise=float(args.timing_mpc_qd_noise),
+        timing_mpc_parent_capacity=int(args.timing_mpc_parent_capacity),
+        terminal_suffix_peak_frac=float(args.terminal_suffix_peak_frac),
+        terminal_suffix_long_frac=float(args.terminal_suffix_long_frac),
+        terminal_suffix_low_frac=float(args.terminal_suffix_low_frac),
+        terminal_suffix_peak_wp=int(args.terminal_suffix_peak_wp),
+        terminal_suffix_tail_tau=float(args.terminal_suffix_tail_tau),
         al=phase2_al_config(
             rho_scale=float(args.rho_scale),
             **({} if args.rho_terminal is None
@@ -1943,6 +2112,16 @@ def main(argv=None) -> int:
                else {"w_waist_aim": float(args.w_waist_aim)}),
             **({} if args.w_waist_yaw_vel is None
                else {"w_waist_yaw_vel": float(args.w_waist_yaw_vel)}),
+            **({} if args.w_waist_yaw_monotonic is None
+               else {"w_waist_yaw_monotonic": float(args.w_waist_yaw_monotonic)}),
+            **({} if args.w_waist_yaw_accel_direction is None
+               else {"w_waist_yaw_accel_direction": float(
+                   args.w_waist_yaw_accel_direction
+               )}),
+            **({} if args.w_waist_yaw_initial_accel_direction is None
+               else {"w_waist_yaw_initial_accel_direction": float(
+                   args.w_waist_yaw_initial_accel_direction
+               )}),
             **({} if args.w_waist_pr_vel is None
                else {"w_waist_pr_vel": float(args.w_waist_pr_vel)}),
             **(
@@ -2009,6 +2188,9 @@ def main(argv=None) -> int:
                else {"mode": str(args.line_search_mode)}),
             **({} if args.line_search_c1 is None
                else {"c1": float(args.line_search_c1)}),
+            **({} if args.line_search_c1_start is None
+               else {"c1_start": float(args.line_search_c1_start)}),
+            **({"c1_ramp_updates": int(args.line_search_c1_ramp_updates)}),
             **({} if args.line_search_beta is None
                else {"beta_accept_per_update": float(args.line_search_beta)}),
             **({} if args.line_search_max_trials is None
@@ -2027,10 +2209,17 @@ def main(argv=None) -> int:
                else {"expansion_factor": float(args.line_search_expansion)}),
             **({} if args.line_search_warmup_updates is None
                else {"warmup_updates": int(args.line_search_warmup_updates)}),
+            **({"activate_after_updates":
+                int(args.line_search_activate_after_updates)}),
             **({} if args.line_search_epsilon_seed is None
                else {"epsilon_seed": float(args.line_search_epsilon_seed)}),
             **({} if args.line_search_epsilon_min is None
                else {"epsilon_min": float(args.line_search_epsilon_min)}),
+            **({} if args.line_search_epsilon_min_start is None
+               else {"epsilon_min_start":
+                     float(args.line_search_epsilon_min_start)}),
+            **({"epsilon_min_ramp_updates":
+                int(args.line_search_epsilon_min_ramp_updates)}),
             **({} if args.line_search_epsilon_max is None
                else {"epsilon_max": float(args.line_search_epsilon_max)}),
             **({} if not args.line_search_reseed_epsilon_on_objective_change
@@ -2051,6 +2240,8 @@ def main(argv=None) -> int:
         ),
         optimizer=str(args.optimizer),
         lbfgs_history=int(args.lbfgs_history),
+        terminal_init_noise=bool(args.terminal_init_noise),
+        terminal_init_noise_ramp_steps=int(args.terminal_init_noise_ramp_steps),
         short_wp=int(args.short_wp), short_boost=float(args.short_boost),
         rhythm_idle_frac=float(args.rhythm_idle_frac),
         post_hit_frac=float(args.post_hit_frac),
@@ -2103,8 +2294,18 @@ def main(argv=None) -> int:
         cfg.tc_frac = float(args.tc_frac)
     if args.w_mpc_init_tie is not None:
         cfg.w_mpc_init_tie = float(args.w_mpc_init_tie)
+    if args.w_waist_yaw_mpc_tie is not None:
+        cfg.w_waist_yaw_mpc_tie = float(args.w_waist_yaw_mpc_tie)
     if args.suffix_frac is not None:
         cfg.suffix_frac = float(args.suffix_frac)
+    if args.suffix_replay_batch is not None:
+        cfg.suffix_replay_batch = int(args.suffix_replay_batch)
+    if args.suffix_replay_capacity is not None:
+        cfg.suffix_replay_capacity = int(args.suffix_replay_capacity)
+    if args.suffix_replay_min_parents is not None:
+        cfg.suffix_replay_min_parents = int(args.suffix_replay_min_parents)
+    if args.suffix_microbatch is not None:
+        cfg.suffix_microbatch = int(args.suffix_microbatch)
     if args.w_suffix_cost is not None:
         cfg.w_suffix_cost = float(args.w_suffix_cost)
     if args.w_suffix_tie is not None:
@@ -2222,6 +2423,18 @@ def main(argv=None) -> int:
         cfg.bptt_start_frac = float(args.bptt_start_frac)
     if args.bptt_max_frac is not None:
         cfg.bptt_max_frac = float(args.bptt_max_frac)
+    if args.bptt_batch is not None:
+        cfg.bptt_batch = int(args.bptt_batch)
+    if args.bptt_decoder_passes is not None:
+        cfg.bptt_decoder_passes = int(args.bptt_decoder_passes)
+    if args.w_bptt is not None:
+        cfg.w_bptt = float(args.w_bptt)
+    if args.decoder_only:
+        # A decoder-only checkpoint has optimizer groups matching this frozen
+        # parameter set and may retain its moments.  Resuming a full-model
+        # checkpoint without --reset-optimizer fails naturally at optimizer
+        # state loading because its groups do not match.
+        pass
     if args.waist_sp_head:
         cfg.waist_sp_from_head = True
         if args.w_waist_aim is None or float(args.w_waist_aim) <= 0.0:
@@ -2452,6 +2665,7 @@ def main(argv=None) -> int:
 
     al_state = opt_state = line_search_state = voxel_train_state = None
     timing_critic_state = None
+    suffix_replay_state = None
     start_step = 0
     if args.reset_optimizer and not args.resume:
         raise SystemExit("--reset-optimizer requires --resume")
@@ -2488,6 +2702,7 @@ def main(argv=None) -> int:
                 + ("restored" if voxel_train_state else "missing; re-bootstrap"),
                 flush=True,
             )
+        suffix_replay_state = (ck.get("extra") or {}).get("suffix_replay")
         al_state, opt_state, start_step, line_search_state = (
             _resume_training_states(
                 ck,
@@ -2542,11 +2757,13 @@ def main(argv=None) -> int:
         model=model, pool=pool, cfg=cfg, model_cfg=model_cfg, run_dir=run_dir,
         scenario_cfg=scen, eval_cases=cases, scorer=scorer, kit=kit, library=library,
         al_state=al_state, opt_state=opt_state, probe_fn=probe_fn,
+        rng_state=ck if args.resume else None,
         stage_a_init=bool(args.stage_a_open), max_hours=args.max_hours,
         start_step=start_step,
         line_search_state=line_search_state,
         voxel_train_state=voxel_train_state,
         timing_critic_state=timing_critic_state,
+        suffix_replay_state=suffix_replay_state,
     )
     summary["args"] = vars(args)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))

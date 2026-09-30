@@ -219,7 +219,7 @@ def main(argv=None) -> int:
         _d_ex, _s_ex, p_ex = scorer.best_contact(q, ctx)
         ax_plan, ip_plan = scorer.head_frame(p_plan, ctx)
         ax_ex, ip_ex = scorer.head_frame(p_ex, ctx)
-        mpc.commit(cmd, q, fired)
+        mpc.commit(cmd, q, fired, qd=qd)
         done = sched.done()
         if bool(done.any()):
             q, qd = on_done(done.nonzero(as_tuple=True)[0], q, qd)

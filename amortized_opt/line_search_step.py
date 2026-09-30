@@ -132,17 +132,14 @@ def assert_replayable_extras_or_raise(
         )
     if (
         float(getattr(cfg_phase2, "suffix_frac", 0.0) or 0.0) > 0.0
-        and (
-            float(getattr(cfg_phase2, "w_suffix_cost", 0.0) or 0.0) > 0.0
-            or float(getattr(cfg_phase2, "w_suffix_tie", 0.0) or 0.0) > 0.0
-        )
+        and float(getattr(cfg_phase2, "w_suffix_tie", 0.0) or 0.0) > 0.0
         and not has_sfx_samples
     ):
         # Suffix may be inactive when sfx_ramp==0; caller should only require
         # samples when the baseline actually ran the suffix term.
         raise ReplayIncompleteError(
-            "line search probe: suffix term ran on baseline but suffix_offs "
-            "were not recorded"
+            "line search probe: suffix replay ran on baseline but its frozen "
+            "batch/offsets were not recorded"
         )
     if include_bptt and not has_bptt_payload:
         raise ReplayIncompleteError(
@@ -261,6 +258,42 @@ def build_objective_direction_fingerprint(
         ),
         "w_dls_terminal_tie": float(
             getattr(phase2_cfg, "w_dls_terminal_tie", 0.0) or 0.0
+        ),
+        # Verified suffix replay replaced the former online child-FusedCost.
+        # Persist its semantics so an old selector cannot carry acceptance
+        # history across that objective change on resume.
+        "suffix_mode": (
+            "verified_parent_replay_v1"
+            if float(getattr(phase2_cfg, "suffix_frac", 0.0) or 0.0) > 0.0
+            and float(getattr(phase2_cfg, "w_suffix_tie", 0.0) or 0.0) > 0.0
+            else "off"
+        ),
+        "w_suffix_tie": float(
+            getattr(phase2_cfg, "w_suffix_tie", 0.0) or 0.0
+        ),
+        "suffix_replay_batch": int(
+            getattr(phase2_cfg, "suffix_replay_batch", 64) or 64
+        ),
+        "suffix_replay_capacity": int(
+            getattr(phase2_cfg, "suffix_replay_capacity", 256) or 256
+        ),
+        "suffix_replay_min_parents": int(
+            getattr(phase2_cfg, "suffix_replay_min_parents", 16) or 16
+        ),
+        "terminal_suffix_peak_frac": float(
+            getattr(phase2_cfg, "terminal_suffix_peak_frac", 0.55)
+        ),
+        "terminal_suffix_long_frac": float(
+            getattr(phase2_cfg, "terminal_suffix_long_frac", 0.42)
+        ),
+        "terminal_suffix_low_frac": float(
+            getattr(phase2_cfg, "terminal_suffix_low_frac", 0.03)
+        ),
+        "terminal_suffix_peak_wp": int(
+            getattr(phase2_cfg, "terminal_suffix_peak_wp", 5) or 5
+        ),
+        "terminal_suffix_tail_tau": float(
+            getattr(phase2_cfg, "terminal_suffix_tail_tau", 8.0)
         ),
         "dls_terminal_steps": int(
             getattr(phase2_cfg, "dls_terminal_steps", 1) or 1
@@ -532,6 +565,8 @@ def fixed_epsilon_rate(rt: LineSearchRuntime) -> float:
 def resolve_known_search(rt: LineSearchRuntime) -> tuple[bool, list[str], int]:
     """Return ``(known_search, reasons, j)`` for proposed update ``j = u+1``."""
     j = int(rt.ctrl.successful_update_count) + 1
+    if not rt.cfg.active_at(j):
+        return False, [], j
     if rt.cfg.mode == "fixed_epsilon":
         return False, [], j
     run, reasons = should_search(rt.ctrl, rt.cfg, j)
@@ -555,6 +590,11 @@ def needs_line_search_direction(
     diagnostic_due = bool(
         diagnostic_every > 0 and int(j) % diagnostic_every == 0
     )
+    if not rt.cfg.active_at(j):
+        return bool(
+            rt.optimizer_kind == "lbfgs"
+            or getattr(rt.adapter, "moment_on", "gradient") == "step"
+        )
     return bool(
         known_search
         or rt.cfg.search_on_early_triggers
@@ -585,8 +625,15 @@ def run_search_or_ordinary(
     not advance live RNG or write MPC/frontier state.
     """
     objective_grad = g_preclip if g_objective is None else g_objective
-    floor = float(rt.epsilon_min)
-    if rt.cfg.mode == "fixed_epsilon":
+    floor = rt.cfg.epsilon_min_at(j, float(rt.epsilon_min))
+    delayed_activation = not rt.cfg.active_at(j)
+    if delayed_activation:
+        # Before activation the cosine floor is the deterministic optimizer
+        # schedule. Keep the retained selector rate synchronized so the first
+        # post-delay search starts exactly at the completed floor.
+        eps_cur = float(floor)
+        rt.ctrl.last_selected_epsilon = float(eps_cur)
+    elif rt.cfg.mode == "fixed_epsilon":
         eps_cur = fixed_epsilon_rate(rt)
         rt.ctrl.last_selected_epsilon = float(eps_cur)
     else:
@@ -638,7 +685,7 @@ def run_search_or_ordinary(
                     next_actual = _next_actual_epsilon(
                         epsilon,
                         cfg=rt.cfg,
-                        epsilon_min=float(rt.epsilon_min),
+                        epsilon_min=floor,
                         epsilon_max=float(rt.epsilon_max),
                     )
                     if next_actual is None:
@@ -657,7 +704,7 @@ def run_search_or_ordinary(
                         rt.accept,
                         last_tried_epsilon=float(epsilon),
                         fallback_shrink=float(rt.cfg.fallback_shrink),
-                        epsilon_min=float(rt.epsilon_min),
+                        epsilon_min=floor,
                     )
                     log = logging_dict_from_search(
                         F0=F0,
@@ -761,6 +808,8 @@ def run_search_or_ordinary(
             accepted=None,
             grad_balance="",
             fixed_epsilon=(rt.cfg.mode == "fixed_epsilon"),
+            ls_delayed_activation=int(delayed_activation),
+            ls_activation_update=int(rt.cfg.activate_after_updates),
             **u_breakdown,
         )
         rt.last_log = log
@@ -786,7 +835,7 @@ def run_search_or_ordinary(
             rt.ctrl, rt.accept,
             last_tried_epsilon=eps_cur,
             fallback_shrink=float(rt.cfg.fallback_shrink),
-            epsilon_min=float(rt.epsilon_min),
+            epsilon_min=floor,
         )
         log = logging_dict_from_search(
             F0=F0, a=stats.a, P2=stats.P2, s_exec=stats.s_exec,
@@ -813,12 +862,13 @@ def run_search_or_ordinary(
     # legacy armijo_a_cap_gnorm_sq field is intentionally diagnostic-only.
     a_armijo = float(stats.a)
     Bc = B_candidate(B0, a_armijo, beta_eff)
+    c1_eff = rt.cfg.c1_at(j)
 
     seed_choice = choose_search_seed(
         rt.ctrl,
         rt.cfg,
         epsilon_max=rt.epsilon_max,
-        epsilon_min=float(rt.epsilon_min),
+        epsilon_min=floor,
         reasons=search_reasons,
     )
     epsilon = float(seed_choice.epsilon)
@@ -850,12 +900,12 @@ def run_search_or_ordinary(
                 A_prev=A0,
                 B_cand=Bc,
                 beta_eff=beta_eff,
-                c1=float(rt.cfg.c1),
+                c1=float(c1_eff),
                 proposal_rule=str(rt.cfg.proposal_rule),
                 backtrack_min_factor=float(rt.cfg.backtrack_min_factor),
                 backtrack_max_factor=float(rt.cfg.backtrack_max_factor),
                 fallback_shrink=float(rt.cfg.fallback_shrink),
-                epsilon_min=float(rt.epsilon_min),
+                epsilon_min=floor,
                 trial_index=trial_index,
                 max_trials=int(rt.cfg.max_trials),
                 reject_current_probe_increase=bool(
@@ -893,7 +943,7 @@ def run_search_or_ordinary(
                     next_actual = _next_actual_epsilon(
                         epsilon,
                         cfg=rt.cfg,
-                        epsilon_min=float(rt.epsilon_min),
+                        epsilon_min=floor,
                         epsilon_max=float(rt.epsilon_max),
                     )
                     if next_actual is None:
@@ -918,7 +968,7 @@ def run_search_or_ordinary(
                 rt.ctrl, rt.accept,
                 last_tried_epsilon=last_tried_epsilon,
                 fallback_shrink=float(rt.cfg.fallback_shrink),
-                epsilon_min=float(rt.epsilon_min),
+                epsilon_min=floor,
             )
             skip_exhausted = bool(
                 rt.cfg.strict_actual_update or rt.cfg.skip_on_probe_exhaustion
@@ -996,7 +1046,7 @@ def run_search_or_ordinary(
                 rt.ctrl, rt.accept,
                 last_tried_epsilon=last_tried_epsilon,
                 fallback_shrink=float(rt.cfg.fallback_shrink),
-                epsilon_min=float(rt.epsilon_min),
+                epsilon_min=floor,
             )
             latch_triggers(rt.ctrl, ["nonfinite_exec_params"])
             log = logging_dict_from_search(
@@ -1084,6 +1134,8 @@ def run_search_or_ordinary(
             ls_actual_veto=0,
             **u_breakdown,
         )
+        log["ls_c1"] = float(c1_eff)
+        log["ls_epsilon_floor"] = float(floor)
         rt.last_log = log
         return SearchStepResult(
             executed=True, searched=True, epsilon=float(epsilon), log=log,

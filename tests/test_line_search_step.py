@@ -134,6 +134,52 @@ def test_fixed_interval_ordinary_update_skips_transactional_direction():
     assert result.log["ls_fast_ordinary"] == 1.0
 
 
+def test_delayed_activation_follows_cosine_floor_then_searches():
+    model = _Tiny()
+    cfg = Phase2Config(line_search=True, lr=1e-3, grad_balance="")
+    cfg.line_search_cfg = LineSearchConfig(
+        epsilon_seed=1e-3,
+        epsilon_min=1e-5,
+        epsilon_min_start=1e-3,
+        epsilon_min_ramp_updates=10,
+        activate_after_updates=10,
+        warmup_updates=0,
+        search_interval_mode="fixed",
+        initial_interval=3,
+        search_on_early_triggers=False,
+    )
+    opt = build_adamw_like_train_cost(model.named_parameters(), lr=cfg.lr)
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
+
+    known, reasons, j = resolve_known_search(rt)
+    assert (known, reasons, j) == (False, [], 1)
+    assert not needs_line_search_direction(rt, known_search=known, j=j)
+
+    x = torch.randn(2)
+    opt.zero_grad(set_to_none=True)
+    loss = model(x)
+    loss.backward()
+    result = run_search_or_ordinary(
+        rt,
+        j=j,
+        run_search=False,
+        search_reasons=[],
+        F0=float(loss.detach()),
+        g_preclip=None,
+        g_objective=None,
+        probe_F=lambda: (_ for _ in ()).throw(AssertionError("probe ran")),
+    )
+    expected = cfg.line_search_cfg.epsilon_min_at(1, 1e-5)
+    assert result.executed and not result.searched
+    assert result.epsilon == expected
+    assert result.log["ls_delayed_activation"] == 1
+
+    rt.ctrl.successful_update_count = 10
+    known, reasons, j = resolve_known_search(rt)
+    assert known and j == 11
+    assert "never_searched" in reasons
+
+
 def test_fast_ordinary_update_is_bit_exact_native_adamw():
     torch.manual_seed(91)
     fast = _Tiny()

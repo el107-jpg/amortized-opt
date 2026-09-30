@@ -250,7 +250,8 @@ def test_one_step_beats_raw_library_median(rig):
     assert np.median(e1) < 0.5 * np.median(e0) or np.median(e1) < 0.08
 
 
-def test_quintic_rebuild_uses_corrected_terminal(rig):
+@pytest.mark.parametrize("moving", [False, True])
+def test_quintic_rebuild_uses_corrected_terminal(rig, moving):
     """``correct_quintic_init_arms`` writes ``terminal_arm`` and still starts at q0."""
     fk, kit, lib, qb = rig
     hand = "left"
@@ -262,9 +263,10 @@ def test_quintic_rebuild_uses_corrected_terminal(rig):
     q0 = np.zeros(n)
     q0[_YAW] = 0.0
     q0[arm_joint_indices(hand, JOINTS)] = e.arm_q * 0.3
+    v0 = np.linspace(-0.3, 0.4, n) if moving else np.zeros(n)
     H, k_hit = 20, 10
     ws = warmstart_trajectory(
-        q0, np.zeros(n), horizon=H,
+        q0, v0, horizon=H,
         goals={hand: (drum, k_hit * 0.02), "right": None},
         library=lib, aim_targets={hand: aim}, dt=0.02,
         joint_names=JOINTS, q_bounds=qb,
@@ -276,6 +278,7 @@ def test_quintic_rebuild_uses_corrected_terminal(rig):
     aims[0, 0] = torch.as_tensor(aim, dtype=DT)
     out = correct_quintic_init_arms(
         fk, init, q0t, hit, aims, steps=1, q_bounds=qb, joint_names=JOINTS,
+        qd0=torch.as_tensor(v0, dtype=DT)[None] if moving else None,
     )
     acols = arm_slice(hand, JOINTS)
     q_seed = torch.zeros(1, n, dtype=DT)
@@ -286,10 +289,10 @@ def test_quintic_rebuild_uses_corrected_terminal(rig):
     )[0, acols]
     assert torch.allclose(out[0, k_hit - 1, acols], want, atol=1e-8)
     assert not torch.allclose(out[0, k_hit - 1, acols], init[0, k_hit - 1, acols])
-    # Rebuilt quintic: knot 0 of the path is q0 (init is knots 1..H).
-    from amortized_opt.train_cost import ramp_seed
-    rebuilt = ramp_seed(
-        q0t[:, acols], out[:, k_hit - 1, acols],
-        torch.full((1, len(acols)), float(k_hit), dtype=DT), H,
-    )
+    # Rebuilt strike seed: knot 0 of the path is q0 (init is knots 1..H).
+    from amortized_opt.strike_seed import accelerating_path_torch
+    rebuilt = accelerating_path_torch(
+        q0t[:, acols], torch.as_tensor(v0[acols], dtype=DT)[None], out[:, k_hit - 1, acols],
+        torch.tensor([k_hit]), H,
+    ).clamp(torch.as_tensor(qb[0], dtype=DT)[acols], torch.as_tensor(qb[1], dtype=DT)[acols])
     assert torch.allclose(out[0, :, acols], rebuilt[0], atol=1e-8)

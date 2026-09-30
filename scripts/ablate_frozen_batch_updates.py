@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--device", default="cpu",
+                   help="torch device for the ablation, e.g. cpu or cuda:0")
     p.add_argument("--eval-grid", action="store_true",
                    help="run the fixed 81-case rolling eval after each arm")
     p.add_argument("--score-every-updates", type=int,
@@ -120,9 +122,9 @@ def _score_batch(model, cost, batch, bucket, weights):
         model.train(was_training)
 
 
-def _grid_cases(cfg, pool):
+def _grid_cases(cfg, pool, device):
     scorer = A.TrajectoryScorer(
-        device="cpu",
+        device=str(device),
         track_torque=bool(
             cfg.cost.w_track_torque > 0.0 or cfg.cost.w_track_torque_peak > 0.0
         ),
@@ -148,9 +150,13 @@ def main():
         raise SystemExit("--score-every-updates must be positive")
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
-    device = torch.device("cpu")
-    ck = torch.load(args.ckpt, map_location=device, weights_only=False)
-    cfg = phase2_config_from_checkpoint(ck, device="cpu", compile_model=False)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit(f"CUDA unavailable for --device {args.device}")
+        torch.cuda.manual_seed_all(args.seed)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    cfg = phase2_config_from_checkpoint(ck, device=str(device), compile_model=False)
     cfg.compile_cost = False
     cfg.compile_aux = False
     cfg.grad_balance = ""
@@ -162,11 +168,11 @@ def main():
     buckets, stats = _load_npz_buckets(str(args.pool_cache))
     pool = Phase2Pool(
         buckets, cfg=_scenario_from_ckpt(ck), noise=Phase2Noise(),
-        device="cpu", stats=stats,
+        device=str(device), stats=stats,
     )
     if args.bucket not in pool.buckets:
         raise SystemExit(f"bucket {args.bucket} not in {pool.buckets}")
-    cost = build_costs([args.bucket], cfg.cost, device="cpu",
+    cost = build_costs([args.bucket], cfg.cost, device=str(device),
                        dtype=torch.float32)[args.bucket]
     idle_lib = resolve_idle_cylinder_library(
         cfg.resolved_idle_cylinder_path(), joint_names=pool.cfg.joint_names,
@@ -186,7 +192,8 @@ def main():
     )
     if args.bank_in is not None:
         frozen_data = torch.load(args.bank_in, map_location="cpu", weights_only=False)
-        bank, heldout = frozen_data["batches"], frozen_data["heldout"]
+        bank = [_detach_batch(b, device=device) for b in frozen_data["batches"]]
+        heldout = _detach_batch(frozen_data["heldout"], device=device)
         if len(bank) != args.unique_batches:
             raise SystemExit("--unique-batches does not match --bank-in")
         if any(int(b["q0"].shape[0]) != args.batch_size for b in bank):
@@ -194,20 +201,21 @@ def main():
         if int(heldout["q0"].shape[0]) != args.heldout_size:
             raise SystemExit("--heldout-size does not match --bank-in")
     else:
-        gen = torch.Generator(device="cpu").manual_seed(args.seed + 7919)
+        gen = torch.Generator(device=device).manual_seed(args.seed + 7919)
         bank = [_freeze_batch(pool, cost, cfg, args.bucket, args.batch_size, gen)
                 for _ in range(args.unique_batches)]
         heldout = _freeze_batch(pool, cost, cfg, args.bucket, args.heldout_size, gen)
     model_cfg = A.model_config_from_checkpoint(ck)
     cases = scorer = kit = library = None
     if args.eval_grid:
-        cases, scorer, kit, library = _grid_cases(cfg, pool)
+        cases, scorer, kit, library = _grid_cases(cfg, pool, device)
     result = {
         "checkpoint": str(args.ckpt), "checkpoint_step": start_step,
         "pool_cache": str(args.pool_cache), "seed": args.seed,
         "unique_batches": args.unique_batches, "batch_size": args.batch_size,
         "heldout_size": args.heldout_size, "bucket": args.bucket,
         "learning_rate": args.lr, "repeats": args.repeats,
+        "device": str(device),
         "exposures_per_batch": args.exposures_per_batch,
         "score_every_updates": args.score_every_updates,
         "loss_scope": (

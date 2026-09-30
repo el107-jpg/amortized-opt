@@ -103,10 +103,17 @@ if [[ "$TIMING_CRITIC_MODE" == "assist" || "$TIMING_CRITIC_MODE" == "control" ]]
     --timing-critic-representation distributional
     --timing-critic-heads "${TIMING_CRITIC_HEADS:-3}"
     --timing-critic-updates "${TIMING_CRITIC_UPDATES:-1}"
+    --timing-critic-update-interval "${TIMING_CRITIC_UPDATE_INTERVAL:-1}"
+    --timing-critic-interval-lr-scale "${TIMING_CRITIC_INTERVAL_LR_SCALE:-1.0}"
     --timing-critic-ema-decay "${TIMING_CRITIC_EMA_DECAY:-0.95}"
     --timing-anchor-curriculum
     --timing-anchor-min-samples "${TIMING_ANCHOR_MIN_SAMPLES:-2048}"
     --timing-anchor-min-close-rate "${TIMING_ANCHOR_MIN_CLOSE_RATE:-0.50}"
+    --timing-anchor-ramp-steps "${TIMING_ANCHOR_RAMP_STEPS:-0}"
+    --timing-short-floor-wp "${TIMING_SHORT_FLOOR_WP:-8}"
+    --timing-short-unlock-min-samples "${TIMING_SHORT_UNLOCK_MIN_SAMPLES:-2048}"
+    --timing-short-unlock-success "${TIMING_SHORT_UNLOCK_SUCCESS:-0.50}"
+    --timing-boundary-min-manageable "${TIMING_BOUNDARY_MIN_MANAGEABLE:-0.50}"
     --timing-acceptable-normalized-violation "${TIMING_ACCEPTABLE_NORMALIZED_VIOLATION:-0.2}"
     # Online fork sweep (2026-09-18): 0.70 gave the highest exact-verified
     # shorter-row yield while removing nearly all catastrophic selections.
@@ -117,6 +124,9 @@ if [[ "$TIMING_CRITIC_MODE" == "assist" || "$TIMING_CRITIC_MODE" == "control" ]]
     --timing-primary-interior-per-task "${TIMING_PRIMARY_INTERIOR_PER_TASK:-4}"
     --timing-primary-mpc-terminal-limit "${TIMING_PRIMARY_MPC_TERMINAL_LIMIT:-0.040}"
     --timing-primary-mpc-collision-sdf-limit "${TIMING_PRIMARY_MPC_COLLISION_SDF_LIMIT:--0.010}"
+    --timing-mpc-q-noise "${TIMING_MPC_Q_NOISE:-0.01}"
+    --timing-mpc-qd-noise "${TIMING_MPC_QD_NOISE:-0.05}"
+    --timing-mpc-parent-capacity "${TIMING_MPC_PARENT_CAPACITY:-2048}"
   )
 fi
 if [[ -n "${TIMING_CRITIC_RECENT_CAPACITY:-}" ]]; then
@@ -148,8 +158,29 @@ elif [[ "$TIMING_CRITIC_MODE" == "assist" || "$TIMING_CRITIC_MODE" == "control" 
 else
   TAG="${TAG:-rhythm_bellman_nf1_direct}"
 fi
+BPTT_MAX_FRAC="${BPTT_MAX_FRAC:-}"
+BPTT_BATCH="${BPTT_BATCH:-}"
+BPTT_DECODER_PASSES="${BPTT_DECODER_PASSES:-}"
+W_BPTT="${W_BPTT:-}"
+BPTT_EXTRA_FLAGS=()
+[[ -n "$BPTT_MAX_FRAC" ]] && BPTT_EXTRA_FLAGS+=(--bptt-max-frac "$BPTT_MAX_FRAC")
+[[ -n "$BPTT_BATCH" ]] && BPTT_EXTRA_FLAGS+=(--bptt-batch "$BPTT_BATCH")
+[[ -n "$BPTT_DECODER_PASSES" ]] && BPTT_EXTRA_FLAGS+=(--bptt-decoder-passes "$BPTT_DECODER_PASSES")
+[[ -n "$W_BPTT" ]] && BPTT_EXTRA_FLAGS+=(--w-bptt "$W_BPTT")
+DECODER_ONLY_FLAGS=()
+[[ "${DECODER_ONLY:-0}" == "1" ]] && DECODER_ONLY_FLAGS+=(--decoder-only)
 P1="${P1:-runs/phase1_${TAG}}"
 OUT="${OUT:-runs/${TAG}}"
+# Keep every launched training run discoverable by the shared TensorBoard.
+# The server watches this registry, so adding a symlink does not require a
+# restart. Set TB_AUTO_REGISTER=0 only for disposable startup smokes.
+TB_AUTO_REGISTER="${TB_AUTO_REGISTER:-1}"
+TB_REGISTRY="${TB_REGISTRY:-runs/tensorboard_active}"
+if [[ "$TB_AUTO_REGISTER" == "1" ]]; then
+  mkdir -p "$OUT/tb" "$TB_REGISTRY"
+  ln -sfn "$(realpath "$OUT/tb")" "$TB_REGISTRY/$(basename "$OUT")"
+  echo "[tensorboard] registered $OUT/tb" >&2
+fi
 # SKIP_P1=1 reuses "$P1/best.pt" (or INIT) and jumps to phase 2.
 SKIP_P1="${SKIP_P1:-0}"
 INIT="${INIT:-}"
@@ -169,6 +200,8 @@ if [[ -z "${BATCH+x}" ]]; then
     BATCH=512
   fi
 fi
+TOKEN_BUDGET="${TOKEN_BUDGET:-$((BATCH * 50))}"
+ACTOR_SUPERBATCH_FACTOR="${ACTOR_SUPERBATCH_FACTOR:-1}"
 D_MODEL="${D_MODEL:-384}"
 DEC_LAYERS="${DEC_LAYERS:-6}"
 # Compilation remains opt-in with SaLSa: candidate parameter writes work, but
@@ -237,17 +270,22 @@ TERMINAL_AIM_DEADBAND_M="${TERMINAL_AIM_DEADBAND_M:-0.005}"
 GRAD_TERM_EVERY="${GRAD_TERM_EVERY:-250}"
 TORQUE_CURVATURE_ROWS="${TORQUE_CURVATURE_ROWS:-8}"
 LINE_SEARCH_C1="${LINE_SEARCH_C1:-0.5}"
+LINE_SEARCH_C1_START="${LINE_SEARCH_C1_START:-}"
+LINE_SEARCH_C1_RAMP_UPDATES="${LINE_SEARCH_C1_RAMP_UPDATES:-0}"
 LINE_SEARCH_BETA="${LINE_SEARCH_BETA:-0.99}"
 LINE_SEARCH_MAX_TRIALS="${LINE_SEARCH_MAX_TRIALS:-6}"
 LINE_SEARCH_INTERVAL="${LINE_SEARCH_INTERVAL:-fixed}"
 LINE_SEARCH_INITIAL_INTERVAL="${LINE_SEARCH_INITIAL_INTERVAL:-3}"
 LINE_SEARCH_WARMUP_UPDATES="${LINE_SEARCH_WARMUP_UPDATES:-0}"
+LINE_SEARCH_ACTIVATE_AFTER_UPDATES="${LINE_SEARCH_ACTIVATE_AFTER_UPDATES:-0}"
 LINE_SEARCH_EARLY_TRIGGERS="${LINE_SEARCH_EARLY_TRIGGERS:-0}"
 LINE_SEARCH_MODE="${LINE_SEARCH_MODE:-salsa_transfer}"
 LINE_SEARCH_MOMENT_ON="${LINE_SEARCH_MOMENT_ON:-gradient}"
 # Initial SaLSa ε (below --lr); selector expands on stable success, shrinks on reject.
 LINE_SEARCH_EPSILON_SEED="${LINE_SEARCH_EPSILON_SEED:-1e-6}"
 LINE_SEARCH_EPSILON_MIN="${LINE_SEARCH_EPSILON_MIN:-}"
+LINE_SEARCH_EPSILON_MIN_START="${LINE_SEARCH_EPSILON_MIN_START:-}"
+LINE_SEARCH_EPSILON_MIN_RAMP_UPDATES="${LINE_SEARCH_EPSILON_MIN_RAMP_UPDATES:-0}"
 LINE_SEARCH_EPSILON_MAX="${LINE_SEARCH_EPSILON_MAX:-}"
 LINE_SEARCH_FRESH="${LINE_SEARCH_FRESH:-0}"
 # Production SaLSa-transfer defaults from the completed ablation: select on
@@ -351,16 +389,25 @@ if [[ "$LINE_SEARCH" == "1" ]]; then
     --line-search-interval "$LINE_SEARCH_INTERVAL"
     --line-search-initial-interval "$LINE_SEARCH_INITIAL_INTERVAL"
     --line-search-warmup-updates "$LINE_SEARCH_WARMUP_UPDATES"
+    --line-search-activate-after-updates "$LINE_SEARCH_ACTIVATE_AFTER_UPDATES"
     --line-search-mode "$LINE_SEARCH_MODE"
     --line-search-moment-on "$LINE_SEARCH_MOMENT_ON"
     --line-search-epsilon-seed "$LINE_SEARCH_EPSILON_SEED"
     --line-search-actual-diagnostic-every "$LINE_SEARCH_ACTUAL_DIAGNOSTIC_EVERY"
   )
+  if [[ -n "$LINE_SEARCH_C1_START" ]]; then
+    LINE_SEARCH_FLAGS+=(--line-search-c1-start "$LINE_SEARCH_C1_START")
+    LINE_SEARCH_FLAGS+=(--line-search-c1-ramp-updates "$LINE_SEARCH_C1_RAMP_UPDATES")
+  fi
   if [[ "$LINE_SEARCH_EARLY_TRIGGERS" != "1" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-disable-early-triggers)
   fi
   if [[ -n "$LINE_SEARCH_EPSILON_MIN" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-epsilon-min "$LINE_SEARCH_EPSILON_MIN")
+  fi
+  if [[ -n "$LINE_SEARCH_EPSILON_MIN_START" ]]; then
+    LINE_SEARCH_FLAGS+=(--line-search-epsilon-min-start "$LINE_SEARCH_EPSILON_MIN_START")
+    LINE_SEARCH_FLAGS+=(--line-search-epsilon-min-ramp-updates "$LINE_SEARCH_EPSILON_MIN_RAMP_UPDATES")
   fi
   if [[ -n "$LINE_SEARCH_EPSILON_MAX" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-epsilon-max "$LINE_SEARCH_EPSILON_MAX")
@@ -382,6 +429,15 @@ if [[ "$LINE_SEARCH" == "1" ]]; then
   fi
   GRAD_BALANCE=""
   GRAD_BALANCE_FLAG=(--grad-balance=)
+fi
+TERMINAL_INIT_NOISE="${TERMINAL_INIT_NOISE:-0}"
+TERMINAL_INIT_NOISE_RAMP_STEPS="${TERMINAL_INIT_NOISE_RAMP_STEPS:-5}"
+TERMINAL_INIT_NOISE_FLAGS=()
+if [[ "$TERMINAL_INIT_NOISE" == "1" ]]; then
+  TERMINAL_INIT_NOISE_FLAGS=(
+    --terminal-init-noise
+    --terminal-init-noise-ramp-steps "$TERMINAL_INIT_NOISE_RAMP_STEPS"
+  )
 fi
 if [[ "$VOXEL_POOL" == "1" ]]; then
   # Probe rows intentionally carry zero dual price.  The current gradient
@@ -489,6 +545,9 @@ SOFT_WRIST_SCALE="${SOFT_WRIST_SCALE:-1}"
 W_IDLE_CYLINDER="${W_IDLE_CYLINDER:-1.0}"
 # Waist momentum well (rad/s)^-2 -- torso wind-up is the cheap torque loophole.
 W_WAIST_YAW_VEL="${W_WAIST_YAW_VEL:-80}"
+W_WAIST_YAW_MONOTONIC="${W_WAIST_YAW_MONOTONIC:-0}"
+W_WAIST_YAW_ACCEL_DIRECTION="${W_WAIST_YAW_ACCEL_DIRECTION:-0}"
+W_WAIST_YAW_INITIAL_ACCEL_DIRECTION="${W_WAIST_YAW_INITIAL_ACCEL_DIRECTION:-0}"
 # Waist P/R rate well (rad/s)^-2 -- the lean complement of yaw rate.
 W_WAIST_PR_VEL="${W_WAIST_PR_VEL:-80}"
 # Decoder P/R band around stopgrad(ref) / upright.  Off by default: the
@@ -505,7 +564,15 @@ WAIST_PR_BOX="${WAIST_PR_BOX:-0.2}"
 # policy, plant-differentiable reference while the replay approximation proves
 # itself.
 W_MPC_INIT_TIE="${W_MPC_INIT_TIE:-50}"
+W_WAIST_YAW_MPC_TIE="${W_WAIST_YAW_MPC_TIE:-0}"
 TC_FRAC="${TC_FRAC:-0.05}"
+SUFFIX_FRAC="${SUFFIX_FRAC:-0.25}"
+TERMINAL_SUFFIX_PEAK_FRAC="${TERMINAL_SUFFIX_PEAK_FRAC:-0.55}"
+TERMINAL_SUFFIX_LONG_FRAC="${TERMINAL_SUFFIX_LONG_FRAC:-0.42}"
+TERMINAL_SUFFIX_LOW_FRAC="${TERMINAL_SUFFIX_LOW_FRAC:-0.03}"
+TERMINAL_SUFFIX_PEAK_WP="${TERMINAL_SUFFIX_PEAK_WP:-5}"
+TERMINAL_SUFFIX_TAIL_TAU="${TERMINAL_SUFFIX_TAIL_TAU:-8.0}"
+SUFFIX_MICROBATCH="${SUFFIX_MICROBATCH:-0}"
 # One-step terminal IK lookahead on a quarter of actor rows.  The actor still
 # emits the deployed trajectory directly; this is a training-only teacher and
 # full-physics lookahead, with a bounded local step and smooth approach warp.
@@ -724,6 +791,13 @@ DEC_ROPE_FLAG=()
 if [[ "$DEC_ROPE" == "1" ]]; then
   DEC_ROPE_FLAG=(--dec-rope)
 fi
+# Optional explicit decoder layers with context cross-attention, space-separated
+# (for example ``DEC_CROSS_ATTN_LAYERS="0 1"``). Empty preserves checkpoint/default.
+DEC_CROSS_ATTN_FLAG=()
+if [[ -n "${DEC_CROSS_ATTN_LAYERS:-}" ]]; then
+  read -r -a DEC_CROSS_ATTN_LAYER_VALUES <<< "$DEC_CROSS_ATTN_LAYERS"
+  DEC_CROSS_ATTN_FLAG=(--dec-cross-attn-layers "${DEC_CROSS_ATTN_LAYER_VALUES[@]}")
+fi
 # Analytic Cartesian + knot-RNEA of init_traj on decoder tokens.  1 = on.
 DEC_PLANT_FEATS="${DEC_PLANT_FEATS:-1}"
 DEC_PLANT_FLAG=()
@@ -772,7 +846,7 @@ else
   LOAD_FLAGS=(--init "$P1/best.pt")
 fi
 
-echo "[run] DEV=$DEV SKIP_P1=$SKIP_P1 P1=$P1 INIT=${INIT:-$P1/best.pt} RESUME=${RESUME:-} OUT=$OUT POOL=$POOL BATCH=$BATCH D_MODEL=$D_MODEL DEC_LAYERS=$DEC_LAYERS VOXEL_POOL=$VOXEL_POOL" >&2
+echo "[run] DEV=$DEV SKIP_P1=$SKIP_P1 P1=$P1 INIT=${INIT:-$P1/best.pt} RESUME=${RESUME:-} OUT=$OUT POOL=$POOL BATCH=$BATCH TOKEN_BUDGET=$TOKEN_BUDGET ACTOR_SUPERBATCH_FACTOR=$ACTOR_SUPERBATCH_FACTOR D_MODEL=$D_MODEL DEC_LAYERS=$DEC_LAYERS VOXEL_POOL=$VOXEL_POOL" >&2
 echo "[run] resume controls: reset_optimizer=${RESET_OPTIMIZER} " \
      "line_search_fresh=${LINE_SEARCH_FRESH} load_flags=${LOAD_FLAGS[*]}" >&2
 echo "[run] kit DR: tilt=${TILT_DEG}deg radius_frac=${RADIUS_FRAC} " \
@@ -790,6 +864,7 @@ echo "[run] line-search safety: strict_actual=${LINE_SEARCH_STRICT_ACTUAL_UPDATE
      "skip_probe_exhaustion=${LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION} " \
      "force_al_reset=${LINE_SEARCH_FORCE_AL_RESET} " \
      "actual_diagnostic_every=${LINE_SEARCH_ACTUAL_DIAGNOSTIC_EVERY}" >&2
+echo "[run] line-search activation: after_updates=${LINE_SEARCH_ACTIVATE_AFTER_UPDATES}" >&2
 if [[ "$LINE_SEARCH" == "1" ]]; then
   printf '[run] line-search CLI:' >&2
   printf ' %q' "${LINE_SEARCH_FLAGS[@]}" >&2
@@ -805,9 +880,9 @@ echo "[run] full_weights=${FULL_WEIGHTS} dec_rope=${DEC_ROPE} " \
      "w_waist_pr_terminal=${W_WAIST_PR_TERMINAL} " \
      "w_waist_pr_band=${W_WAIST_PR_BAND:-default} waist_pr_band_rad=${WAIST_PR_BAND_RAD:-0.15} " \
      "waist_pr_box=${WAIST_PR_BOX} " \
-     "w_waist_yaw_vel=${W_WAIST_YAW_VEL} " \
+     "w_waist_yaw_vel=${W_WAIST_YAW_VEL} w_waist_yaw_monotonic=${W_WAIST_YAW_MONOTONIC} w_waist_yaw_accel_direction=${W_WAIST_YAW_ACCEL_DIRECTION} w_waist_yaw_initial_accel_direction=${W_WAIST_YAW_INITIAL_ACCEL_DIRECTION} " \
      "w_waist_pr_vel=${W_WAIST_PR_VEL} " \
-     "w_mpc_init_tie=${W_MPC_INIT_TIE} tc_frac=${TC_FRAC} " \
+     "w_mpc_init_tie=${W_MPC_INIT_TIE} w_waist_yaw_mpc_tie=${W_WAIST_YAW_MPC_TIE} tc_frac=${TC_FRAC} " \
      "dls_terminal=${DLS_TERMINAL_FRAC}/${W_DLS_TERMINAL_COST}/${W_DLS_TERMINAL_TIE} lookahead_mode=${TERMINAL_LOOKAHEAD_MODE} curvature_direct=${CURVATURE_DIRECT_FRAC}/${CURVATURE_DIRECT_MIX} " \
      "w_waist_pr_distill=${W_WAIST_PR_DISTILL:-0} " \
      "w_waist_pr_hold_band=${W_WAIST_PR_HOLD_BAND:-default} " \
@@ -860,6 +935,7 @@ if [[ "$SKIP_P1" != "1" ]]; then
       --device "$DEV" \
       --d-model "$D_MODEL" \
       --dec-layers "$DEC_LAYERS" \
+      "${DEC_CROSS_ATTN_FLAG[@]}" \
       "${DEC_ROPE_FLAG[@]}" \
       "${DEC_PLANT_FLAG[@]}" \
       --steps 20000 \
@@ -898,6 +974,8 @@ python scripts/train_phase2.py \
     --out "$OUT" \
     --steps "$STEPS" \
     --batch "$BATCH" \
+    --token-budget "$TOKEN_BUDGET" \
+    --actor-superbatch-factor "$ACTOR_SUPERBATCH_FACTOR" \
     --d-model "$D_MODEL" \
     --dec-layers "$DEC_LAYERS" \
     --lr "$LR" \
@@ -942,6 +1020,7 @@ python scripts/train_phase2.py \
     --grad-term-every "$GRAD_TERM_EVERY" \
     --torque-curvature-rows "$TORQUE_CURVATURE_ROWS" \
     "${LINE_SEARCH_FLAGS[@]}" \
+    "${TERMINAL_INIT_NOISE_FLAGS[@]}" \
     "${OPTIMIZER_FLAGS[@]}" \
     "${TORQUE_PHYSICS_FLAGS[@]}" \
     "${TORQUE_STATIC_FLAGS[@]}" \
@@ -958,7 +1037,8 @@ python scripts/train_phase2.py \
     --w-stick-stick 100 \
     --w-tip-crossover "$W_TIP_CROSSOVER" \
     "${ARM_COMPACT_FLAGS[@]}" \
-    --w-mpc-init-tie "$W_MPC_INIT_TIE" --tc-frac "$TC_FRAC" \
+    --w-mpc-init-tie "$W_MPC_INIT_TIE" \
+    --w-waist-yaw-mpc-tie "$W_WAIST_YAW_MPC_TIE" --tc-frac "$TC_FRAC" \
     --dls-terminal-frac "$DLS_TERMINAL_FRAC" \
     --w-dls-terminal-cost "$W_DLS_TERMINAL_COST" \
     --w-dls-terminal-tie "$W_DLS_TERMINAL_TIE" \
@@ -973,21 +1053,33 @@ python scripts/train_phase2.py \
     --curvature-max-step-rad "$CURVATURE_MAX_STEP_RAD" \
     --curvature-direct-frac "$CURVATURE_DIRECT_FRAC" \
     --curvature-direct-mix "$CURVATURE_DIRECT_MIX" \
-    --suffix-frac 0.25 \
+    --suffix-frac "$SUFFIX_FRAC" \
+    --suffix-microbatch "$SUFFIX_MICROBATCH" \
+    --terminal-suffix-peak-frac "$TERMINAL_SUFFIX_PEAK_FRAC" \
+    --terminal-suffix-long-frac "$TERMINAL_SUFFIX_LONG_FRAC" \
+    --terminal-suffix-low-frac "$TERMINAL_SUFFIX_LOW_FRAC" \
+    --terminal-suffix-peak-wp "$TERMINAL_SUFFIX_PEAK_WP" \
+    --terminal-suffix-tail-tau "$TERMINAL_SUFFIX_TAIL_TAU" \
     --w-suffix-cost 1.0 --w-suffix-tie 50.0 --suffix-warmup 1000 \
     --w-waist-aim 0 \
     "${WAIST_PR_FLAG[@]}" \
     --waist-aim-future-tau "$AIM_TAU" \
     --w-waist-upright 100 --waist-pr-box "$WAIST_PR_BOX" --w-waist-yaw-vel "$W_WAIST_YAW_VEL" \
+    --w-waist-yaw-monotonic "$W_WAIST_YAW_MONOTONIC" \
+    --w-waist-yaw-accel-direction "$W_WAIST_YAW_ACCEL_DIRECTION" \
+    --w-waist-yaw-initial-accel-direction "$W_WAIST_YAW_INITIAL_ACCEL_DIRECTION" \
     --w-waist-pr-vel "$W_WAIST_PR_VEL" \
     "${WAIST_EASE_FLAG[@]}" \
     "${FULL_WEIGHTS_FLAG[@]}" \
     "${FRONTIER_FLAG[@]}" \
     "${FRONTIER_AUTO_FLAG[@]}" \
     "${DEC_ROPE_FLAG[@]}" \
+    "${DEC_CROSS_ATTN_FLAG[@]}" \
     "${DEC_PLANT_FLAG[@]}" \
     "${TRAJ_HEAD_FP32_FLAG[@]}" \
     --bptt-start-frac "$BPTT_START_FRAC" \
+    "${BPTT_EXTRA_FLAGS[@]}" \
+    "${DECODER_ONLY_FLAGS[@]}" \
     --cmd-lead fit_kd4 \
     --log-every "$LOG_EVERY" \
     --eval-every "$EVAL_EVERY" --eval-cases 81 --ckpt-every "$CKPT_EVERY" \

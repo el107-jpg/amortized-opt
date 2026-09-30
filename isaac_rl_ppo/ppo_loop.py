@@ -49,6 +49,7 @@ are marked ``DEVIATION`` at the point they occur.
 from __future__ import annotations
 
 import math
+import copy
 import time
 from dataclasses import dataclass, field
 
@@ -76,9 +77,25 @@ __all__ = [
     "combine_wp0_orth",
     "clone_encoding",
     "compute_gae",
+    "terminal_waist_reward",
     "index_dataclass",
     "stack_dataclass",
 ]
+
+
+def terminal_waist_reward(
+    q_after: torch.Tensor,
+    target: torch.Tensor,
+    due: torch.Tensor,
+    *,
+    yaw_index: int,
+    weight: float,
+    scale_rad: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sparse endpoint reward against the first plan's terminal waist yaw."""
+    error = (q_after[:, int(yaw_index)] - target).abs()
+    quality = 1.0 / (1.0 + (error / float(scale_rad)).square())
+    return float(weight) * quality * due.to(q_after.dtype), error
 
 
 # ============================================================== dataclass ops =
@@ -130,6 +147,8 @@ class PpoStorage:
     values: list = field(default_factory=list)        # (B,)
     rewards: list = field(default_factory=list)       # (B,)
     dones: list = field(default_factory=list)         # (B,) bool
+    waist_anchor: list = field(default_factory=list)  # (B, H), time-aligned
+    waist_anchor_mask: list = field(default_factory=list)  # (B, H) bool
 
     # filled by compute_gae
     returns: torch.Tensor | None = None
@@ -148,7 +167,7 @@ class PpoStorage:
         for k in ("init", "state", "hit_index", "ctx", "encoding", "strike",
                   "critic_obs",
                   "actions", "log_probs", "mu", "sigma", "values", "rewards",
-                  "dones"):
+                  "dones", "waist_anchor", "waist_anchor_mask"):
             getattr(self, k).clear()
         self.returns = None
         self.advantages = None
@@ -158,8 +177,9 @@ class PpoStorage:
     def finalize(self) -> None:
         """Stack ``(T, B, ...)`` and flatten to ``(T * B, ...)``."""
         cat = lambda xs: torch.stack(xs, 0).flatten(0, 1)   # noqa: E731
+        init = cat(self.init)
         self.flat = {
-            "init": cat(self.init),
+            "init": init,
             "state": cat(self.state),
             "hit_index": cat(self.hit_index),
             "critic_obs": cat(self.critic_obs),
@@ -170,6 +190,15 @@ class PpoStorage:
             "values": cat(self.values),
             "returns": self.returns.flatten(0, 1),
             "advantages": self.advantages.flatten(0, 1),
+            "waist_anchor": (
+                cat(self.waist_anchor)
+                if self.waist_anchor else init.new_zeros(init.shape[:2])
+            ),
+            "waist_anchor_mask": (
+                cat(self.waist_anchor_mask)
+                if self.waist_anchor_mask
+                else torch.zeros(init.shape[:2], device=init.device, dtype=torch.bool)
+            ),
         }
         self.flat["ctx"] = stack_dataclass(self.ctx)
         self.flat["encoding"] = stack_dataclass(self.encoding)
@@ -329,15 +358,29 @@ class PpoUpdater:
         *,
         device: torch.device | str,
         cost: FusedCost | None = None,
+        cost_weights: dict[str, float] | None = None,
+        critic_only: bool = False,
+        waist_consistency_weight: float = 0.0,
+        waist_consistency_beta: float = 0.02,
+        actor_loss_weight: float = 1.0,
     ):
         self.actor = actor
         self.cfg = cfg
         self.p = cfg.ppo
         self.device = torch.device(device)
         self.learning_rate = float(self.p.learning_rate)
-        self.optimizer = torch.optim.Adam(actor.trainable_parameters(),
-                                          lr=self.learning_rate)
+        self.critic_only = bool(critic_only)
+        owned = (
+            list(actor.critic.parameters())
+            if self.critic_only else actor.trainable_parameters()
+        )
+        self.optimizer = torch.optim.Adam(owned, lr=self.learning_rate)
         self.cost = cost
+        self.cost_weights = cost_weights
+        self.waist_consistency_weight = float(waist_consistency_weight)
+        self.waist_consistency_beta = float(waist_consistency_beta)
+        self.actor_loss_weight = float(actor_loss_weight)
+        self.yaw_i = G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
         self._checked_frozen = False
         self.lr_floor_hits = 0
 
@@ -355,7 +398,10 @@ class PpoUpdater:
         n = self.actor.n
         q0, v0 = state[:, :n], state[:, n:]
         lengths = group_lengths(strike.hit_index).to(traj.dtype)
-        ct = self.cost(q0, traj, v0, strike, lengths=lengths, elem_mask=elem_mask)
+        ct = self.cost(
+            q0, traj, v0, strike, lengths=lengths, elem_mask=elem_mask,
+            weights=self.cost_weights,
+        )
         terms = self.cfg.aux.terms
         if terms is None:
             return ct.total.mean()
@@ -366,8 +412,52 @@ class PpoUpdater:
                 f"{sorted(ct.terms)}")
         return torch.stack(picked, 0).sum(0).mean()
 
+    def _waist_consistency(
+        self,
+        traj: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Huber drift and MAE against the time-aligned first MPC plan."""
+        err = traj[:, :, self.yaw_i] - target.detach().to(traj.dtype)
+        valid = mask.to(device=traj.device, dtype=traj.dtype)
+        n = valid.sum().clamp_min(1.0)
+        ae = err.abs()
+        beta = max(float(self.waist_consistency_beta), 1.0e-9)
+        huber = torch.where(
+            ae < beta,
+            0.5 * err.square() / beta,
+            ae - 0.5 * beta,
+        )
+        return (huber * valid).sum() / n, (ae * valid).sum() / n
+
+    def _combined_aux(self, flat: dict, sel: torch.Tensor, plan, inputs):
+        # The executed-prefix mean includes the trainable correction head.  If
+        # physics is evaluated on ``plan.traj`` unchanged, that head bypasses
+        # every torque/collision/terminal constraint and can move the actual
+        # command arbitrarily.  Price the corrected first waypoint; the tail
+        # remains the decoder trajectory that becomes the next warm start.
+        aux_traj = plan.traj.clone()
+        aux_traj[:, 0] = plan.mean
+        physics = self._aux_cost(
+            aux_traj, plan.elem_mask, inputs.state,
+            index_dataclass(flat["strike"], sel),
+        )
+        waist, waist_mae = self._waist_consistency(
+            plan.traj,
+            flat["waist_anchor"].index_select(0, sel),
+            flat["waist_anchor_mask"].index_select(0, sel),
+        )
+        weighted = (
+            float(self.cfg.aux.weight) * physics
+            + self.waist_consistency_weight * waist
+        )
+        return physics, waist, waist_mae, weighted
+
     # -------------------------------------------------------------- update --
     def update(self, storage: PpoStorage) -> dict[str, float]:
+        if self.critic_only:
+            return self._update_critic_only(storage)
         p = self.p
         flat = storage.flat
         n = flat["actions"].shape[0]
@@ -380,6 +470,16 @@ class PpoUpdater:
                 "entropy": float("nan"), "aux": float("nan"), "kl": float("nan"),
                 "clip_frac": 0.0, "ratio_dev": 0.0, "orth_cos": 0.0,
                 "orth_remain": 0.0, "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+                "param_cos": 0.0, "param_cos_distance": 1.0,
+                "param_cost_norm": 0.0, "param_rl_norm": 0.0,
+                "separate_ppo_grad_norm": 0.0,
+                "separate_aux_grad_norm": 0.0,
+                "separate_value_grad_norm": 0.0,
+                "separate_ppo_clip": 1.0,
+                "separate_aux_clip": 1.0,
+                "separate_value_clip": 1.0,
+                "trust_before": 0.0, "trust_after": 0.0,
+                "trust_alpha": 0.0, "trust_rejected": 0.0,
                 "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
                 "orth_leak": 0.0, "orth_para_frac": 0.0,
                 "orth_skipped": 1.0,
@@ -392,9 +492,20 @@ class PpoUpdater:
         if p.normalize_advantage:
             adv_all = (adv_all - adv_all.mean()) / (adv_all.std() + 1e-8)
 
-        acc = {k: 0.0 for k in ("surrogate", "value", "entropy", "aux", "kl",
+        acc = {k: 0.0 for k in ("surrogate", "value", "entropy", "aux",
+                                "aux_objective",
+                                "waist_consistency", "waist_consistency_mae_rad", "kl",
                                 "clip_frac", "ratio_dev", "orth_cos",
                                 "orth_remain", "orth_cost_norm", "orth_rl_norm",
+                                "param_cos", "param_cos_distance",
+                                "param_cost_norm", "param_rl_norm",
+                                "separate_ppo_grad_norm",
+                                "separate_aux_grad_norm",
+                                "separate_value_grad_norm",
+                                "separate_ppo_clip", "separate_aux_clip",
+                                "separate_value_clip",
+                                "trust_before", "trust_after",
+                                "trust_alpha", "trust_rejected",
                                 "orth_cost_scale", "orth_traj_scale",
                                 "orth_leak", "orth_para_frac",
                                 "orth_skipped")}
@@ -407,6 +518,22 @@ class PpoUpdater:
                 mb = idx.shape[0]
                 self.optimizer.zero_grad(set_to_none=True)
                 stats = {k: 0.0 for k in acc}
+                lora_params = self._lora_params()
+                trust_base = (
+                    [parameter.detach().clone() for parameter in lora_params]
+                    if self.cfg.orth.trust_region else None
+                )
+                trust_state = (
+                    {
+                        parameter: copy.deepcopy(self.optimizer.state.get(parameter, {}))
+                        for parameter in lora_params
+                    }
+                    if self.cfg.orth.trust_region else None
+                )
+                if not self.cfg.orth.enabled:
+                    self._begin_separate_grads()
+                else:
+                    self._begin_balanced_head_grads()
 
                 for s in range(0, mb, micro):
                     sel = idx[s: s + micro]
@@ -416,6 +543,10 @@ class PpoUpdater:
                     for k in stats:
                         if k in part:
                             stats[k] += w * float(part[k])
+                if not self.cfg.orth.enabled:
+                    stats.update(self._finish_separate_grads())
+                else:
+                    stats.update(self._finish_balanced_head_grads())
 
                 if not self._checked_frozen:
                     self.actor.assert_frozen()
@@ -433,9 +564,23 @@ class PpoUpdater:
                 if p.desired_kl is not None and p.schedule == "adaptive":
                     self._adapt_lr(stats["kl"], allow_increase=(n_updates > 0))
 
-                nn.utils.clip_grad_norm_(self.actor.trainable_parameters(),
-                                         p.max_grad_norm)
+                if self.cfg.orth.enabled:
+                    nn.utils.clip_grad_norm_(self.actor.actor_parameters(),
+                                             p.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.actor.critic.parameters(),
+                                             p.max_grad_norm)
                 self.optimizer.step()
+                if self.cfg.orth.trust_region:
+                    stats.update(self._apply_lora_trust_region(
+                        flat, idx, micro,
+                        # Trust protects the original full-trajectory physics
+                        # objective.  The task loss is allowed to fall only
+                        # along steps that do not worsen this anchor.
+                        baseline=float(stats["aux"]),
+                        params=lora_params,
+                        base=trust_base,
+                        optimizer_state=trust_state,
+                    ))
                 for k in acc:
                     acc[k] += stats[k]
                 n_updates += 1
@@ -450,10 +595,231 @@ class PpoUpdater:
         out = {k: v / max(n_updates, 1) for k, v in acc.items()}
         out["learning_rate"] = self.learning_rate
         out["lr_floor_hits"] = float(self.lr_floor_hits)
-        out["noise_std_mean"] = float(self.actor.current_std().mean())
-        out["noise_std_max_dim"] = float(self.actor.current_std().max())
+        out["noise_std_mean"] = float(self.actor.current_std().detach().mean())
+        out["noise_std_max_dim"] = float(self.actor.current_std().detach().max())
         out["kl_early_stops"] = float(kl_early_stops)
+        with torch.no_grad():
+            returns = flat["returns"]
+            predicted = self.actor.critic(flat["critic_obs"])
+            residual_var = (returns - predicted).var(unbiased=False)
+            return_var = returns.var(unbiased=False)
+            explained = 1.0 - residual_var / return_var.clamp_min(1.0e-12)
+            out["critic_explained_variance"] = float(explained)
+            out["critic_return_mean"] = float(returns.mean())
+            out["critic_return_std"] = float(returns.std(unbiased=False))
+            out["critic_value_mean"] = float(predicted.mean())
         return out
+
+    def _begin_separate_grads(self) -> None:
+        """Allocate minibatch accumulators for separately clipped objectives."""
+        self._sep_policy_params = list(self.actor.actor_parameters())
+        self._sep_aux_params = self._lora_params()
+        self._sep_value_params = list(self.actor.critic.parameters())
+        self._sep_policy_grads = [torch.zeros_like(p) for p in self._sep_policy_params]
+        self._sep_aux_grads = [torch.zeros_like(p) for p in self._sep_aux_params]
+        self._sep_value_grads = [torch.zeros_like(p) for p in self._sep_value_params]
+
+    def _begin_balanced_head_grads(self) -> None:
+        """Accumulate correction-head objectives over the whole minibatch.
+
+        Norm matching inside each memory microbatch changes the algorithm when
+        the split changes.  These buffers postpone that nonlinear operation
+        until every microbatch has contributed its exactly weighted gradient.
+        """
+        head = self.actor.mean_correction
+        self._bal_head_params = [] if head is None else list(head.parameters())
+        self._bal_head_ppo = [torch.zeros_like(p) for p in self._bal_head_params]
+        self._bal_head_aux = [torch.zeros_like(p) for p in self._bal_head_params]
+
+    def _finish_balanced_head_grads(self) -> dict[str, float]:
+        ppo = self._bal_head_ppo
+        aux = self._bal_head_aux
+        ppo_norm = self._grad_list_norm(ppo)
+        aux_norm = self._grad_list_norm(aux)
+        eps = float(self.cfg.orth.eps)
+        if ppo and float(aux_norm) > eps:
+            dot = sum((gr.double() * gc.double()).sum() for gr, gc in zip(ppo, aux))
+            c2 = aux_norm.square().clamp_min(eps)
+            proj = dot / c2
+            scale = (float(self.cfg.orth.cost_to_rl_norm) * ppo_norm /
+                     aux_norm.clamp_min(eps))
+            mix = float(self.cfg.orth.rl_to_cost_norm)
+            shrink = float(self.cfg.orth.traj_grad_scale)
+            for param, gr, gc in zip(self._bal_head_params, ppo, aux):
+                parallel = proj.to(gr) * gc
+                used = gr - parallel + float(self.cfg.orth.wp0_leak) * parallel
+                grad = shrink * (scale.to(gr) * gc + mix * used)
+                param.grad = grad if param.grad is None else param.grad + grad
+        else:
+            scale = ppo_norm.new_zeros(())
+            for param, grad in zip(self._bal_head_params, ppo):
+                param.grad = grad if param.grad is None else param.grad + grad
+        stats = {
+            "separate_ppo_grad_norm": float(ppo_norm),
+            "separate_aux_grad_norm": float(aux_norm),
+            "separate_ppo_clip": 1.0,
+            "separate_aux_clip": float(scale) if ppo else 1.0,
+        }
+        for name in ("_bal_head_params", "_bal_head_ppo", "_bal_head_aux"):
+            delattr(self, name)
+        return stats
+
+    @staticmethod
+    def _accumulate_grad_list(buffers, grads, weight: float) -> None:
+        for buffer, grad in zip(buffers, grads):
+            if grad is not None and torch.isfinite(grad).all():
+                buffer.add_(grad.detach(), alpha=float(weight))
+
+    def _accumulate_separate_grads(
+        self,
+        ppo_head: torch.Tensor,
+        aux_w: torch.Tensor,
+        value_loss: torch.Tensor,
+        *,
+        weight: float,
+    ) -> None:
+        """Accumulate PPO, auxiliary, and critic gradients independently."""
+        ppo_grads = torch.autograd.grad(
+            ppo_head, self._sep_policy_params, retain_graph=True,
+            allow_unused=True,
+        )
+        aux_grads = (
+            torch.autograd.grad(
+                aux_w, self._sep_aux_params, retain_graph=True,
+                allow_unused=True,
+            )
+            if aux_w.requires_grad else tuple(None for _ in self._sep_aux_params)
+        )
+        value_grads = torch.autograd.grad(
+            self.p.value_loss_coef * value_loss,
+            self._sep_value_params, retain_graph=False,
+            allow_unused=True,
+        )
+        self._accumulate_grad_list(self._sep_policy_grads, ppo_grads, weight)
+        self._accumulate_grad_list(self._sep_aux_grads, aux_grads, weight)
+        self._accumulate_grad_list(self._sep_value_grads, value_grads, weight)
+
+    @staticmethod
+    def _grad_list_norm(grads) -> torch.Tensor:
+        if not grads:
+            return torch.tensor(0.0)
+        total = grads[0].new_zeros((), dtype=torch.float64)
+        for grad in grads:
+            total = total + grad.double().square().sum()
+        return total.sqrt()
+
+    def _finish_separate_grads(self) -> dict[str, float]:
+        """Clip each objective globally, then add shared LoRA contributions."""
+        limit = float(self.p.max_grad_norm)
+        ppo_norm = self._grad_list_norm(self._sep_policy_grads)
+        aux_norm = self._grad_list_norm(self._sep_aux_grads)
+        value_norm = self._grad_list_norm(self._sep_value_grads)
+
+        def coefficient(norm: torch.Tensor) -> float:
+            value = float(norm)
+            return min(1.0, limit / max(value, 1.0e-12))
+
+        ppo_clip = coefficient(ppo_norm)
+        aux_clip = coefficient(aux_norm)
+        value_clip = coefficient(value_norm)
+        for parameter, grad in zip(self._sep_policy_params, self._sep_policy_grads):
+            parameter.grad = grad.mul(ppo_clip)
+        for parameter, grad in zip(self._sep_aux_params, self._sep_aux_grads):
+            scaled = grad.mul(aux_clip)
+            parameter.grad = (
+                scaled if parameter.grad is None else parameter.grad + scaled
+            )
+        for parameter, grad in zip(self._sep_value_params, self._sep_value_grads):
+            parameter.grad = grad.mul(value_clip)
+
+        stats = {
+            "separate_ppo_grad_norm": float(ppo_norm),
+            "separate_aux_grad_norm": float(aux_norm),
+            "separate_value_grad_norm": float(value_norm),
+            "separate_ppo_clip": ppo_clip,
+            "separate_aux_clip": aux_clip,
+            "separate_value_clip": value_clip,
+        }
+        for name in (
+            "_sep_policy_params", "_sep_aux_params", "_sep_value_params",
+            "_sep_policy_grads", "_sep_aux_grads", "_sep_value_grads",
+        ):
+            delattr(self, name)
+        return stats
+
+    def _update_critic_only(self, storage: PpoStorage) -> dict[str, float]:
+        """Fit Bellman/GAE returns while leaving every policy parameter frozen."""
+        p = self.p
+        flat = storage.flat
+        returns = flat["returns"]
+        old_values = flat["values"]
+        if not torch.isfinite(returns).all():
+            return {
+                "surrogate": 0.0, "value": float("nan"), "entropy": 0.0,
+                "aux": 0.0, "kl": 0.0, "clip_frac": 0.0, "ratio_dev": 0.0,
+                "orth_cos": 0.0, "orth_remain": 0.0,
+                "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+                "param_cos": 0.0, "param_cos_distance": 1.0,
+                "param_cost_norm": 0.0, "param_rl_norm": 0.0,
+                "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
+                "orth_leak": 0.0, "orth_para_frac": 0.0,
+                "orth_skipped": 1.0, "trust_before": 0.0,
+                "trust_after": 0.0, "trust_alpha": 0.0,
+                "trust_rejected": 0.0, "learning_rate": self.learning_rate,
+                "lr_floor_hits": 0.0,
+                "noise_std_mean": float(self.actor.current_std().detach().mean()),
+                "noise_std_max_dim": float(self.actor.current_std().detach().max()),
+                "kl_early_stops": 0.0, "critic_explained_variance": float("nan"),
+            }
+        losses = []
+        for _ in range(int(p.num_learning_epochs)):
+            for idx in storage.minibatches(p.num_mini_batches):
+                self.optimizer.zero_grad(set_to_none=True)
+                value = self.actor.critic(flat["critic_obs"].index_select(0, idx))
+                target = returns.index_select(0, idx)
+                old = old_values.index_select(0, idx)
+                if p.use_clipped_value_loss:
+                    clipped = old + (value - old).clamp(
+                        -p.clip_param, p.clip_param,
+                    )
+                    loss = torch.max(
+                        (value - target).square(),
+                        (clipped - target).square(),
+                    ).mean()
+                else:
+                    loss = (value - target).square().mean()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.critic.parameters(), p.max_grad_norm)
+                self.optimizer.step()
+                losses.append(float(loss.detach()))
+        with torch.no_grad():
+            predicted = self.actor.critic(flat["critic_obs"])
+            residual_var = (returns - predicted).var(unbiased=False)
+            return_var = returns.var(unbiased=False)
+            explained = 1.0 - residual_var / return_var.clamp_min(1.0e-12)
+        return {
+            "surrogate": 0.0,
+            "value": float(sum(losses) / max(len(losses), 1)),
+            "entropy": 0.0, "aux": 0.0, "kl": 0.0,
+            "clip_frac": 0.0, "ratio_dev": 0.0,
+            "orth_cos": 0.0, "orth_remain": 0.0,
+            "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+            "param_cos": 0.0, "param_cos_distance": 1.0,
+            "param_cost_norm": 0.0, "param_rl_norm": 0.0,
+            "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
+            "orth_leak": 0.0, "orth_para_frac": 0.0,
+            "orth_skipped": 0.0, "trust_before": 0.0,
+            "trust_after": 0.0, "trust_alpha": 0.0,
+            "trust_rejected": 0.0, "learning_rate": self.learning_rate,
+            "lr_floor_hits": 0.0,
+            "noise_std_mean": float(self.actor.current_std().detach().mean()),
+            "noise_std_max_dim": float(self.actor.current_std().detach().max()),
+            "kl_early_stops": 0.0,
+            "critic_explained_variance": float(explained),
+            "critic_return_mean": float(returns.mean()),
+            "critic_return_std": float(returns.std(unbiased=False)),
+            "critic_value_mean": float(predicted.mean()),
+        }
 
     def _rl_only_params(self) -> list[nn.Parameter]:
         """Parameters PPO owns that the traj-space combine must not touch.
@@ -466,6 +832,82 @@ class PpoUpdater:
         if self.actor.mean_correction is not None:
             params.extend(self.actor.mean_correction.parameters())
         return params
+
+    def _lora_params(self) -> list[nn.Parameter]:
+        return [
+            parameter for name, parameter in self.actor.named_parameters()
+            if parameter.requires_grad
+            and (".lora_a" in name or ".lora_b" in name)
+        ]
+
+    @torch.no_grad()
+    def _trust_aux(self, flat: dict, idx: torch.Tensor, micro: int) -> float:
+        total = 0.0
+        n = int(idx.numel())
+        for start in range(0, n, micro):
+            sel = idx[start : start + micro]
+            weight = float(sel.numel()) / float(max(n, 1))
+            inputs = MpcInputs(
+                init=flat["init"].index_select(0, sel),
+                state=flat["state"].index_select(0, sel),
+                ctx=index_dataclass(flat["ctx"], sel),
+                hit_index=flat["hit_index"].index_select(0, sel),
+            )
+            plan = self.actor.plan(
+                inputs,
+                encoding=index_dataclass(flat["encoding"], sel)
+                if "encoding" in flat else None,
+            )
+            value = self._aux_cost(
+                plan.traj, plan.elem_mask, inputs.state,
+                index_dataclass(flat["strike"], sel),
+            )
+            total += weight * float(value)
+        return total
+
+    @torch.no_grad()
+    def _apply_lora_trust_region(
+        self,
+        flat: dict,
+        idx: torch.Tensor,
+        micro: int,
+        *,
+        baseline: float,
+        params: list[nn.Parameter],
+        base: list[torch.Tensor],
+        optimizer_state: dict,
+    ) -> dict[str, float]:
+        cfg = self.cfg.orth
+        proposed = [parameter.detach().clone() for parameter in params]
+        limit = baseline * (1.0 + float(cfg.trust_rel_tol)) + float(cfg.trust_abs_tol)
+        accepted_alpha = 0.0
+        after = float("inf")
+        alpha = 1.0
+        for _ in range(int(cfg.trust_backtracks)):
+            for parameter, origin, candidate in zip(params, base, proposed):
+                parameter.copy_(origin + alpha * (candidate - origin))
+            after = self._trust_aux(flat, idx, micro)
+            if math.isfinite(after) and after <= limit:
+                accepted_alpha = alpha
+                break
+            alpha *= float(cfg.trust_shrink)
+        rejected = accepted_alpha == 0.0
+        if rejected:
+            for parameter, origin in zip(params, base):
+                parameter.copy_(origin)
+                if parameter in optimizer_state:
+                    self.optimizer.state[parameter] = copy.deepcopy(
+                        optimizer_state[parameter]
+                    )
+                else:
+                    self.optimizer.state.pop(parameter, None)
+            after = baseline
+        return {
+            "trust_before": float(baseline),
+            "trust_after": float(after),
+            "trust_alpha": float(accepted_alpha),
+            "trust_rejected": float(rejected),
+        }
 
     def _chunk_loss(self, flat: dict, sel: torch.Tensor, adv_all: torch.Tensor,
                     *, weight: float = 1.0) -> dict:
@@ -513,22 +955,37 @@ class PpoUpdater:
             value_loss = (value - returns).square().mean()
 
         # ---- the analytic anchor -------------------------------------------
-        aux = self._aux_cost(plan.traj, plan.elem_mask, inputs.state,
-                             index_dataclass(flat["strike"], sel))
-        aux_w = self.cfg.aux.weight * aux
-        ppo_head = surrogate_loss - p.entropy_coef * entropy.mean()
+        aux, waist_consistency, waist_mae, aux_w = self._combined_aux(
+            flat, sel, plan, inputs,
+        )
+        actor_objective = self.actor_loss_weight * surrogate_loss
+        ppo_head = self.actor_loss_weight * (
+            surrogate_loss - p.entropy_coef * entropy.mean()
+        )
         loss = ppo_head + p.value_loss_coef * value_loss + aux_w
 
         orth_stats = {"orth_cos": 0.0, "orth_remain": 0.0,
                       "orth_cost_norm": 0.0, "orth_rl_norm": 0.0,
+                      "param_cos": 0.0, "param_cos_distance": 1.0,
+                      "param_cost_norm": 0.0, "param_rl_norm": 0.0,
+                      "separate_ppo_grad_norm": 0.0,
+                      "separate_aux_grad_norm": 0.0,
+                      "separate_value_grad_norm": 0.0,
+                      "separate_ppo_clip": 1.0,
+                      "separate_aux_clip": 1.0,
+                      "separate_value_clip": 1.0,
+                      "trust_before": 0.0, "trust_after": 0.0,
+                      "trust_alpha": 0.0, "trust_rejected": 0.0,
                       "orth_cost_scale": 0.0, "orth_traj_scale": 0.0,
                       "orth_leak": 0.0, "orth_para_frac": 0.0,
                       "orth_skipped": 0.0}
         if self.cfg.orth.enabled:
-            self._backward_orth(plan.traj, surrogate_loss, ppo_head, aux_w,
+            self._backward_orth(plan.traj, actor_objective, ppo_head, aux_w,
                                 value_loss, weight=w, stats=orth_stats)
         else:
-            (w * loss).backward()
+            self._accumulate_separate_grads(
+                ppo_head, aux_w, value_loss, weight=w,
+            )
 
         with torch.no_grad():
             kl = torch.sum(
@@ -540,7 +997,11 @@ class PpoUpdater:
 
         return {"loss": loss.detach(), "surrogate": surrogate_loss.detach(),
                 "value": value_loss.detach(), "entropy": entropy.mean().detach(),
-                "aux": aux.detach(), "kl": kl, "clip_frac": clip_frac,
+                "aux": aux.detach(),
+                "aux_objective": aux_w.detach(),
+                "waist_consistency": waist_consistency.detach(),
+                "waist_consistency_mae_rad": waist_mae.detach(),
+                "kl": kl, "clip_frac": clip_frac,
                 "ratio_dev": ratio_dev, **orth_stats}
 
     def _backward_orth(
@@ -556,8 +1017,9 @@ class PpoUpdater:
     ) -> None:
         """Two-backward combine: cost + always-orth RL at waypoint 0.
 
-        Decoder LoRA sees the combined traj gradient.  ``std`` / mean-correction
-        see raw PPO.  The critic sees only the value loss.
+        Decoder LoRA sees the combined trajectory gradient.  ``std`` sees raw
+        PPO; the mean-correction head sees norm-balanced physics plus the PPO
+        component orthogonal to physics.  The critic sees only value loss.
         """
         p = self.p
         zeros = torch.zeros_like(traj)
@@ -576,6 +1038,41 @@ class PpoUpdater:
             stats["orth_skipped"] = 1.0
             return
 
+        # The trajectory-space cosine above is local to waypoint 0.  Report
+        # the actual conflict after both objectives pass through the shared
+        # decoder Jacobian into the trainable LoRA subspace as well.  This is a
+        # diagnostic only: the executed combine remains in trajectory space.
+        lora_params = [
+            param for name, param in self.actor.named_parameters()
+            if param.requires_grad and (".lora_a" in name or ".lora_b" in name)
+        ]
+        rl_param = torch.autograd.grad(
+            surrogate_loss, lora_params, retain_graph=True, allow_unused=True,
+        )
+        cost_param = torch.autograd.grad(
+            aux_w, lora_params, retain_graph=True, allow_unused=True,
+        ) if aux_w.requires_grad else tuple(None for _ in lora_params)
+        dot = traj.new_zeros((), dtype=torch.float64)
+        rl_sq = traj.new_zeros((), dtype=torch.float64)
+        cost_sq = traj.new_zeros((), dtype=torch.float64)
+        for gr, gc in zip(rl_param, cost_param):
+            if gr is not None:
+                rl_sq = rl_sq + gr.detach().double().square().sum()
+            if gc is not None:
+                cost_sq = cost_sq + gc.detach().double().square().sum()
+            if gr is not None and gc is not None:
+                dot = dot + (gr.detach().double() * gc.detach().double()).sum()
+        rl_norm_p = rl_sq.sqrt()
+        cost_norm_p = cost_sq.sqrt()
+        denom_p = (rl_norm_p * cost_norm_p).clamp_min(float(self.cfg.orth.eps))
+        param_cos = dot / denom_p
+        stats.update({
+            "param_cos": float(param_cos),
+            "param_cos_distance": float(1.0 - param_cos),
+            "param_rl_norm": float(rl_norm_p),
+            "param_cost_norm": float(cost_norm_p),
+        })
+
         g, orth_stats = combine_wp0_orth(
             g_rl, g_cost,
             cost_to_rl_norm=self.cfg.orth.cost_to_rl_norm,
@@ -590,13 +1087,30 @@ class PpoUpdater:
         traj.backward(weight * g, retain_graph=True)
 
         rl_params = self._rl_only_params()
-        head_grads = torch.autograd.grad(
+        # ``std`` has no physics path.  The mean-correction head does, now that
+        # aux_traj[0] is plan.mean.  Give those parameters the same
+        # cost-plus-orthogonal-PPO treatment used for trajectory/LoRA instead
+        # of letting the raw PPO gradient bypass the auxiliary loss.
+        head_params = self._bal_head_params
+        cost_head = (
+            torch.autograd.grad(aux_w, head_params, retain_graph=True,
+                                allow_unused=True)
+            if aux_w.requires_grad and head_params
+            else tuple(None for _ in head_params)
+        )
+        ppo_head_grads = torch.autograd.grad(
             ppo_head, rl_params, retain_graph=False, allow_unused=True)
-        for param, grad in zip(rl_params, head_grads):
-            if grad is None or not torch.isfinite(grad).all():
-                continue
-            scaled = weight * grad
-            param.grad = scaled if param.grad is None else param.grad + scaled
+        # std is the first RL-only parameter and has no physics path.
+        grad_std = ppo_head_grads[0]
+        if grad_std is not None and torch.isfinite(grad_std).all():
+            scaled = weight * grad_std
+            self.actor.std.grad = (
+                scaled if self.actor.std.grad is None
+                else self.actor.std.grad + scaled
+            )
+        self._accumulate_grad_list(
+            self._bal_head_ppo, ppo_head_grads[1:], weight)
+        self._accumulate_grad_list(self._bal_head_aux, cost_head, weight)
 
         if torch.isfinite(value_loss):
             (weight * p.value_loss_coef * value_loss).backward()
@@ -648,6 +1162,8 @@ class RolloutDriver:
         fk=None,
         on_done=None,
         safety=None,
+        waist_terminal_reward_weight: float = 0.0,
+        waist_terminal_reward_scale_rad: float = 0.10,
     ):
         self.actor = actor
         self.mpc = mpc
@@ -658,6 +1174,12 @@ class RolloutDriver:
         self.fk = fk
         self.on_done = on_done
         self.safety = safety
+        self.waist_terminal_reward_weight = float(waist_terminal_reward_weight)
+        self.waist_terminal_reward_scale_rad = float(waist_terminal_reward_scale_rad)
+        if self.waist_terminal_reward_weight < 0.0:
+            raise ValueError("waist terminal reward weight must be non-negative")
+        if self.waist_terminal_reward_scale_rad <= 0.0:
+            raise ValueError("waist terminal reward scale must be positive")
         self.device = actor.device_
         self.n = actor.n
         self.t_plan = 0.0
@@ -671,6 +1193,55 @@ class RolloutDriver:
         except (TypeError, ValueError):
             self._plant_takes_integral = False
         self._integral = None
+        self._waist_anchor = torch.zeros(
+            self.mpc.B, self.mpc.H, device=self.device, dtype=self.mpc.dtype,
+        )
+        self._waist_anchor_age = torch.full(
+            (self.mpc.B,), self.mpc.H, device=self.device, dtype=torch.long,
+        )
+        self._waist_anchor_len = torch.full(
+            (self.mpc.B,), self.mpc.H, device=self.device, dtype=torch.long,
+        )
+        self._waist_terminal_due = torch.zeros(
+            self.mpc.B, device=self.device, dtype=torch.bool,
+        )
+        self._waist_terminal_target = torch.zeros(
+            self.mpc.B, device=self.device, dtype=self.mpc.dtype,
+        )
+        self._yaw_i = G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
+
+    @torch.no_grad()
+    def _aligned_waist_anchor(
+        self,
+        plan_ref: torch.Tensor,
+        elem_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shift the first plan to the current absolute MPC tick.
+
+        A fresh anchor block begins on reset and whenever the previous block's
+        horizon is exhausted.  At age ``a``, current waypoint ``j`` is compared
+        with anchor waypoint ``a + j``.  This preserves the first plan's valid
+        initial-velocity transient instead of forcing an immediate turn.
+        """
+        refresh = self._waist_anchor_age >= self._waist_anchor_len
+        if bool(refresh.any()):
+            self._waist_anchor[refresh] = plan_ref[refresh, :, self._yaw_i]
+            self._waist_anchor_age[refresh] = 0
+            lengths = (elem_mask[refresh, :, self._yaw_i] > 0).sum(1).long()
+            self._waist_anchor_len[refresh] = lengths.clamp(1, self.mpc.H)
+        terminal_index = (self._waist_anchor_len - 1).clamp(0, self.mpc.H - 1)
+        self._waist_terminal_target = self._waist_anchor.gather(
+            1, terminal_index.view(-1, 1),
+        )[:, 0]
+        self._waist_terminal_due = self._waist_anchor_age == terminal_index
+        offsets = torch.arange(self.mpc.H, device=self.device).view(1, -1)
+        absolute = self._waist_anchor_age.view(-1, 1) + offsets
+        inside = absolute < self._waist_anchor_len.view(-1, 1)
+        target = self._waist_anchor.gather(
+            1, absolute.clamp_max(self.mpc.H - 1),
+        )
+        valid = inside & (elem_mask[:, :, self._yaw_i] > 0)
+        return target, valid
 
     # ------------------------------------------------------ privileged obs --
     def privileged_obs(self, q, qd, mean, ctx: ContextInputs,
@@ -744,6 +1315,16 @@ class RolloutDriver:
         state = torch.cat([q, qd], dim=-1)
 
         res = mpc.plan(q, qd)             # deterministic feature extractor
+        plan_ref = getattr(res, "plan_ref", None)
+        if plan_ref is None:
+            # Compatibility with the pinned/sibling MPC surface.  Its full
+            # trajectory differs only at row zero after lead/slew; restore the
+            # planner's un-led first waypoint from ``last_ref0``.
+            plan_ref = res.traj.clone()
+            plan_ref[:, 0] = mpc.last_ref0
+        waist_anchor, waist_anchor_mask = self._aligned_waist_anchor(
+            plan_ref, res.elem_mask,
+        )
         # Replay must see the init refine actually consumed (waist-PR seed /
         # arm DLS mutate ``mpc.init`` in place) and the encoding it used.
         # Storing the pre-plan warm start and re-encoding from ``ctx`` is what
@@ -796,9 +1377,20 @@ class RolloutDriver:
             drum_axes=sched.geom.get("axis"), drum_radii=sched.drum_radius,
             drum_valid=sched.drum_valid, filter_active=engaged,
         )
+        if self.waist_terminal_reward_weight > 0.0:
+            waist_bonus, waist_error = terminal_waist_reward(
+                q, self._waist_terminal_target, self._waist_terminal_due,
+                yaw_index=self._yaw_i,
+                weight=self.waist_terminal_reward_weight,
+                scale_rad=self.waist_terminal_reward_scale_rad,
+            )
+            terms.terms["waist_terminal"] = waist_bonus
+            terms.raw["waist_terminal_error_rad"] = waist_error
+            terms.counts["waist_terminal_due"] = self._waist_terminal_due.to(q.dtype)
+            terms.total = terms.total + waist_bonus
         t3 = time.perf_counter()
 
-        mpc.commit(cmd, q, fired)
+        mpc.commit(cmd, q, fired, qd=qd)
 
         done = sched.done()
         if storage is not None:
@@ -814,10 +1406,15 @@ class RolloutDriver:
                 actions=action, log_probs=log_prob, mu=mean.clone(),
                 sigma=dist.stddev.clone(), values=value,
                 rewards=terms.total, dones=done,
+                waist_anchor=waist_anchor,
+                waist_anchor_mask=waist_anchor_mask,
             )
 
         if bool(done.any()) and self.on_done is not None:
             q, qd = self.on_done(done.nonzero(as_tuple=True)[0], q, qd)
+        self._waist_anchor_age.add_(1)
+        self._waist_anchor_age.masked_fill_(done, self.mpc.H)
+        self._waist_anchor_len.masked_fill_(done, self.mpc.H)
         actor.reset(done)
 
         self.t_plan += t1 - t0

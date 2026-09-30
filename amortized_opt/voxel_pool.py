@@ -26,6 +26,7 @@ import torch
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, N_DOF, PELVIS_IN_ENV
 from .cost import StrikeContext
 from .frontier import N_CHART, N_MODE
+from .strike_seed import strike_seed
 from .tokenizer import ContextInputs, build_waypoint_masks
 
 
@@ -715,8 +716,10 @@ class VoxelPool:
         if not keys:
             return np.empty((0, N_DOF), dtype=np.float32)
         cells = np.asarray([key.q0_cell for key in keys], dtype=np.float64)
-        lower = cells * self.q_cell_rad
-        upper = (cells + 1.0) * self.q_cell_rad
+        cell_lower = cells * self.q_cell_rad
+        cell_upper = (cells + 1.0) * self.q_cell_rad
+        lower = cell_lower
+        upper = cell_upper
         if (q_lo is None) != (q_hi is None):
             raise ValueError("q_lo and q_hi must be supplied together")
         if q_lo is not None:
@@ -727,12 +730,40 @@ class VoxelPool:
                 or np.any(limit_lo >= limit_hi)
             ):
                 raise ValueError("q_lo/q_hi must be finite ordered joint bounds")
-            lower = np.maximum(lower, limit_lo)
-            upper = np.minimum(upper, limit_hi)
-            if np.any(lower >= upper):
+            # Joint boxes are closed while voxel cells are [lower, upper).
+            # A cell whose lower face equals q_hi therefore has the one valid
+            # boundary point q_hi; a cell whose upper face equals q_lo has no
+            # point in common because that face belongs to the next cell.
+            intersects = (
+                (cell_lower <= limit_hi[None, :])
+                & (cell_upper > limit_lo[None, :])
+            )
+            if not bool(intersects.all()):
                 raise ValueError("voxel cell does not intersect the supplied joint bounds")
+            lower = np.maximum(cell_lower, limit_lo)
+            upper = np.minimum(cell_upper, limit_hi)
         q = lower + (upper - lower) * rng.random(cells.shape)
         return q.astype(np.float32)
+
+    def q0_cell_intersects_bounds(
+        self,
+        key: VoxelKey,
+        *,
+        q_lo: float | Sequence[float],
+        q_hi: float | Sequence[float],
+    ) -> bool:
+        """Whether a half-open position cell intersects a closed joint box."""
+        limit_lo = np.broadcast_to(np.asarray(q_lo, dtype=np.float64), (N_DOF,))
+        limit_hi = np.broadcast_to(np.asarray(q_hi, dtype=np.float64), (N_DOF,))
+        if (
+            not np.isfinite(limit_lo).all() or not np.isfinite(limit_hi).all()
+            or np.any(limit_lo >= limit_hi)
+        ):
+            raise ValueError("q_lo/q_hi must be finite ordered joint bounds")
+        cells = np.asarray(key.q0_cell, dtype=np.float64)
+        cell_lower = cells * self.q_cell_rad
+        cell_upper = (cells + 1.0) * self.q_cell_rad
+        return bool(np.all((cell_lower <= limit_hi) & (cell_upper > limit_lo)))
 
     def sample_qd0(
         self,
@@ -824,26 +855,6 @@ class VoxelPool:
                 eff[:, 1] if str(name).startswith("right_") else shared
             )
         return torch.stack(lengths, dim=1)
-
-    @staticmethod
-    def _velocity_quintic(
-        q0: torch.Tensor, qd0: torch.Tensor, terminal: torch.Tensor,
-        lengths: torch.Tensor, horizon: int, dt: float,
-    ) -> torch.Tensor:
-        k = torch.arange(
-            1, int(horizon) + 1, device=q0.device, dtype=q0.dtype,
-        ).view(1, int(horizon), 1)
-        L = lengths.clamp_min(1).to(q0.dtype)
-        u = (k / L.unsqueeze(1)).clamp(0.0, 1.0)
-        d = (terminal - q0).unsqueeze(1)
-        velocity = (qd0 * L * float(dt)).unsqueeze(1)
-        u3 = u * u * u
-        return (
-            q0.unsqueeze(1) + velocity * u
-            + (10.0 * d - 6.0 * velocity) * u3
-            + (8.0 * velocity - 15.0 * d) * u3 * u
-            + (6.0 * d - 3.0 * velocity) * u3 * u * u
-        )
 
     @staticmethod
     def _stack_template_field(
@@ -1033,7 +1044,10 @@ class VoxelPool:
             device=device, dtype=dtype,
         )
         lengths = self._element_lengths(hit, active, horizon, joint_names)
-        seed = self._velocity_quintic(q0, qd0, terminal, lengths, horizon, float(dt))
+        seed = strike_seed(
+            q0, qd0, terminal, lengths, horizon, float(dt),
+            active=active, joint_names=joint_names,
+        )
         tth = hit.clamp_min(0).to(dtype) * float(dt)
         masks = build_waypoint_masks(
             tth[:, 0], tth[:, 1], max_horizon=horizon, dt=float(dt),

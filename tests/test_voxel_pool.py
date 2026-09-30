@@ -144,6 +144,32 @@ def test_position_materialization_intersects_hard_joint_bounds():
     assert np.all(q < 0.02)
 
 
+def test_position_materialization_handles_closed_upper_joint_face():
+    pool = VoxelPool(q_cell_rad=0.02)
+    at_upper_face = _key(q_joint0=0)
+    above_upper_face = _key(q_joint0=1)
+    q_lo = np.full(N_DOF, -0.5)
+    q_hi = np.full(N_DOF, 0.5)
+    q_hi[0] = 0.0
+
+    assert pool.q0_cell_intersects_bounds(
+        at_upper_face, q_lo=q_lo, q_hi=q_hi,
+    )
+    assert not pool.q0_cell_intersects_bounds(
+        above_upper_face, q_lo=q_lo, q_hi=q_hi,
+    )
+    q = pool.sample_q0(
+        [at_upper_face] * 8, rng=np.random.default_rng(4),
+        q_lo=q_lo, q_hi=q_hi,
+    )
+    assert np.all(q[:, 0] == 0.0)
+    with pytest.raises(ValueError, match="does not intersect"):
+        pool.sample_q0(
+            [above_upper_face], rng=np.random.default_rng(4),
+            q_lo=q_lo, q_hi=q_hi,
+        )
+
+
 def test_failed_probe_remains_unknown_and_success_promotes():
     pool = VoxelPool()
     probes = ProbeBuffer(capacity=2)

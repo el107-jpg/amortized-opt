@@ -36,6 +36,7 @@ from torch import Tensor
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, PELVIS_IN_ENV
 from .fk import ChainFK, stick_contact_offset, stick_tip_offset
+from .strike_seed import accelerating_path_torch
 
 __all__ = [
     "damped_pinv",
@@ -376,33 +377,6 @@ def adjust_arm_terminal(
         )
 
 
-def _rest_quintic(q_cur: Tensor, terminal: Tensor, lengths: Tensor, H: int) -> Tensor:
-    """Rest-to-rest quintic, knots 1..H -- same formula as ``train_cost.ramp_seed``."""
-    k = torch.arange(1, H + 1, device=q_cur.device, dtype=q_cur.dtype).view(1, H, 1)
-    L = lengths.clamp_min(1).to(q_cur.dtype).unsqueeze(1)
-    s = (k / L).clamp(0.0, 1.0)
-    ease = s * s * s * (10.0 - 15.0 * s + 6.0 * s * s)
-    return q_cur.unsqueeze(1) + ease * (terminal - q_cur).unsqueeze(1)
-
-
-def _vel_quintic(
-    q_cur: Tensor, v_cur: Tensor, terminal: Tensor, lengths: Tensor, H: int, dt: float,
-) -> Tensor:
-    """Velocity-matched quintic -- same formula as ``train_cost.vel_ramp_seed``."""
-    k = torch.arange(1, H + 1, device=q_cur.device, dtype=q_cur.dtype).view(1, H, 1)
-    L = lengths.clamp_min(1).to(q_cur.dtype)
-    u = (k / L.unsqueeze(1)).clamp(0.0, 1.0)
-    d = (terminal - q_cur).unsqueeze(1)
-    V = (v_cur * L * float(dt)).unsqueeze(1)
-    u3 = u * u * u
-    return (
-        q_cur.unsqueeze(1) + V * u
-        + (10.0 * d - 6.0 * V) * u3
-        + (8.0 * V - 15.0 * d) * u3 * u
-        + (6.0 * d - 3.0 * V) * u3 * u * u
-    )
-
-
 def correct_quintic_init_arms(
     fk: ChainFK,
     init: Tensor,
@@ -419,18 +393,17 @@ def correct_quintic_init_arms(
     qd0: Tensor | None = None,
     dt: float = CONTROL_DT,
 ) -> Tensor:
-    """One-shot DLS on each active hand's strike terminal, then rebuild the arm quintic.
+    """One-shot DLS on each active hand's terminal, then rebuild its strike seed.
 
     ``init`` is ``(B, H, n)`` knots 1..H.  Strike knot ``k`` (``hit[b, h] >= 1``)
-    is row ``k - 1``; the waist at that row is the waist the quintic will have
+    is row ``k - 1``; the waist at that row is the waist the seed will have
     at the hit (after the yaw ramp and any encoder P/R rewrite).  ``aims`` is
     ``(B, 2, 3)`` in the env frame.  Only arm columns of active hands change;
     the path still starts at ``q0``.
 
-    Use this on **quintic inits**, not on a shifted decoder plan: after the
-    correction the arm columns are a fresh ramp to the new terminal
-    (``terminal_arm`` / ``ramp_seed``), not an in-place overwrite of the last
-    knot.
+    The function retains its legacy name. Use it on fresh inits, not shifted
+    decoder plans: correction rebuilds the arm seed to the new terminal,
+    preserving ``qd0`` when provided (otherwise assuming rest).
     """
     if int(steps) <= 0:
         return init
@@ -472,12 +445,12 @@ def correct_quintic_init_arms(
         )
         term = q_fix[:, acols].to(device=out.device, dtype=out.dtype)
         q0r = q0.to(device=out.device, dtype=out.dtype).index_select(0, rows)[:, acols]
-        L = k.to(dtype=out.dtype).unsqueeze(-1).expand(-1, len(acols))
-        if qd0 is not None:
-            v0 = qd0.to(device=out.device, dtype=out.dtype).index_select(0, rows)[:, acols]
-            sub = _vel_quintic(q0r, v0, term, L, H, float(dt))
-        else:
-            sub = _rest_quintic(q0r, term, L, H)
+        v0 = (torch.zeros_like(q0r) if qd0 is None else
+              qd0.to(device=out.device, dtype=out.dtype).index_select(0, rows)[:, acols])
+        sub = accelerating_path_torch(q0r, v0, term, k, H, float(dt))
+        if q_bounds is not None:
+            lo, hi = (torch.as_tensor(b, device=out.device, dtype=out.dtype)[acols] for b in q_bounds)
+            sub = sub.clamp(lo, hi)
         buf = out.index_select(0, rows).clone()
         idx = torch.as_tensor(acols, device=out.device, dtype=torch.long)
         buf.index_copy_(2, idx, sub)

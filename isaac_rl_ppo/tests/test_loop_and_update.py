@@ -342,6 +342,7 @@ def test_micro_batching_matches_a_single_pass(driver, run_cfg):
         cfg.ppo.schedule = "fixed"
         upd = PpoUpdater(actor, cfg, device="cpu", cost=cost)
         actor.zero_grad(set_to_none=True)
+        upd._begin_balanced_head_grads()
         idx = torch.arange(storage.flat["actions"].shape[0])
         adv = storage.flat["advantages"]
         mb = idx.shape[0]
@@ -349,6 +350,7 @@ def test_micro_batching_matches_a_single_pass(driver, run_cfg):
             sel = idx[s: s + (micro or mb)]
             upd._chunk_loss(storage.flat, sel, adv,
                             weight=sel.shape[0] / mb)
+        upd._finish_balanced_head_grads()
         return {n: p.grad.detach().clone() for n, p in actor.named_parameters()
                 if p.requires_grad and p.grad is not None}
 
@@ -384,8 +386,10 @@ def test_orth_update_trains_lora_std_and_critic(driver, run_cfg):
     assert run_cfg.orth.enabled
     upd = PpoUpdater(actor, run_cfg, device="cpu", cost=cost)
     actor.zero_grad(set_to_none=True)
+    upd._begin_balanced_head_grads()
     idx = torch.arange(storage.flat["actions"].shape[0])
     upd._chunk_loss(storage.flat, idx, storage.flat["advantages"], weight=1.0)
+    upd._finish_balanced_head_grads()
 
     lora = [p for n, p in actor.named_parameters()
             if ".lora_" in n and p.grad is not None

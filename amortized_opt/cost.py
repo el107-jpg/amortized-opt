@@ -206,11 +206,13 @@ _HANDS = ("left", "right")
 #: the bead plus the 15 cm of shaft behind it the plan calls out.
 SHAFT_SIGMAS: tuple[float, ...] = contact_sigma_candidates("cymbal_left")
 
-#: Peak groups whose differentiable hard price is already
+#: Peak groups whose differentiable price is already
 #: ``λ * cfg.w_*_peak * smooth_max(ReLU)``.  The linear ``λ * live`` add
 #: in :meth:`FusedCost.forward` skips these so the peak is not counted
-#: twice (AL ``live`` / PHR still use the horizon **hard max**).  PHR
-#: ``pen/2 V²`` still applies.
+#: twice.  The PHR quadratic squares that same smooth max (``raw``), not
+#: the horizon hard max: ``live`` stays the detached gate statistic the
+#: dual integrates, and a one-hot ``amax`` in the backward is what made
+#: the penalty swap joints between steps.
 _PEAK_AL_GROUPS = frozenset({
     "torque_peak", "velocity_peak", "collision_peak", "joint_box_peak",
 })
@@ -628,6 +630,25 @@ class CostConfig:
     #: comparable to a target rate in (rad/s)^2 -- a torso turning at a steady
     #: 1 rad/s pays ``w`` exactly.  Ramped by ``weights["waist_yaw_vel"]``.
     w_waist_yaw_vel: float = 0.0
+    #: Target-directed monotonic yaw preference.  Let ``d`` be the sign from
+    #: measured yaw to the analytic reference endpoint.  Every waypoint step
+    #: pays ``relu(-d * (q[k] - q[k-1]))``.  This forbids the cheap pattern
+    #: "move slightly the wrong way now, turn toward the target later" while
+    #: still allowing acceleration and deceleration without position reversal.
+    #: Requires ``StrikeContext.waist_yaw_ref``; zero keeps legacy behavior.
+    w_waist_yaw_monotonic: float = 0.0
+    #: Segment-wise acceleration-direction preference. Position and velocity
+    #: may initially point the wrong way, but acceleration must point from the
+    #: current yaw toward the nearest active hit's analytic yaw. Recomputed
+    #: after every re-goal, so a following hit may reverse direction.
+    w_waist_yaw_accel_direction: float = 0.0
+    #: Strong boundary-only version: price a first-sample acceleration whose
+    #: sign points away from the nearest active hit.  Later acceleration is
+    #: unconstrained so the waist can brake normally near the target.
+    w_waist_yaw_initial_accel_direction: float = 0.0
+    #: Ignore an analytic endpoint displacement smaller than this many radians
+    #: when selecting the desired direction.
+    waist_yaw_monotonic_target_deadband: float = 1.0e-3
     #: WAIST PITCH/ROLL RATE penalty, ``w_waist_pr_vel * mean_valid(qd_pr^2)``,
     #: in (rad/s)^-2.  The exact complement of ``w_waist_yaw_vel``: that one
     #: says how fast the torso may TURN, this one how fast it may LEAN.
@@ -796,6 +817,14 @@ class CostConfig:
             raise ValueError("w_waist_aim must be >= 0")
         if self.w_waist_yaw_vel < 0.0:
             raise ValueError("w_waist_yaw_vel must be >= 0")
+        if self.w_waist_yaw_monotonic < 0.0:
+            raise ValueError("w_waist_yaw_monotonic must be >= 0")
+        if self.w_waist_yaw_accel_direction < 0.0:
+            raise ValueError("w_waist_yaw_accel_direction must be >= 0")
+        if self.w_waist_yaw_initial_accel_direction < 0.0:
+            raise ValueError("w_waist_yaw_initial_accel_direction must be >= 0")
+        if self.waist_yaw_monotonic_target_deadband < 0.0:
+            raise ValueError("waist_yaw_monotonic_target_deadband must be >= 0")
         if self.w_waist_pr_vel < 0.0:
             raise ValueError("w_waist_pr_vel must be >= 0")
         if self.w_waist_pr_band < 0.0:
@@ -1855,6 +1884,15 @@ class FusedCost:
         terms["waist_yaw_vel"] = (
             cfg.w_waist_yaw_vel * w["waist_yaw_vel"]
         ) * raw["waist_yaw_vel"]
+        terms["waist_yaw_monotonic"] = (
+            cfg.w_waist_yaw_monotonic * w["waist_yaw_vel"]
+        ) * raw["waist_yaw_monotonic"]
+        terms["waist_yaw_accel_direction"] = (
+            cfg.w_waist_yaw_accel_direction * w["waist_yaw_vel"]
+        ) * raw["waist_yaw_accel_direction"]
+        terms["waist_yaw_initial_accel_direction"] = (
+            cfg.w_waist_yaw_initial_accel_direction * w["waist_yaw_vel"]
+        ) * raw["waist_yaw_initial_accel_direction"]
         # Waist pitch/roll RATE, the lean half of the same idea: reach saturates
         # at the URDF limit, so a lean is worth paying for as a posture and
         # worth nothing as momentum.  Exactly zero at ``w_waist_pr_vel = 0``.
@@ -1886,16 +1924,17 @@ class FusedCost:
             if v is None:
                 continue
             terms[term] = terms[term] + w[g] * v
-        # PHR quadratic on the LIVE residual.  Keys ``pen_<group>`` are absent
-        # when the coefficient is zero, so a caller that does not pass them is
-        # bit-identical (not "plus a zero").  ``w`` above only copies keys it
-        # already names -- these ride the original ``weights`` dict.
+        # PHR quadratic.  Keys ``pen_<group>`` are absent when the coefficient
+        # is zero, so a caller that does not pass them is bit-identical (not
+        # "plus a zero").  Segment groups square ``live`` (the ReLU residual).
+        # Peak groups square ``raw`` (the smooth max already priced above);
+        # ``live`` for those groups stays the detached hard max the dual reads.
         if weights:
             for g, term in TERM_FOR_GROUP.items():
                 p = weights.get(f"pen_{g}")
                 if p is None:
                     continue
-                v = live.get(g)
+                v = raw.get(g) if g in _PEAK_AL_GROUPS else live.get(g)
                 if v is None:
                     continue
                 terms[term] = terms[term] + 0.5 * p * v.clamp_min(0.0).square()
@@ -3295,6 +3334,83 @@ class FusedCost:
             raw["waist_aim"] = val_aim
         else:
             raw["waist_aim"] = ss.q.new_zeros(B)
+
+        # TARGET-DIRECTED MONOTONIC YAW.  The desired sign comes from the
+        # measured boundary pose to the analytic reference endpoint, while the
+        # penalty reads every adjacent spline sample.  A positive target thus
+        # makes every negative increment expensive, including the very first
+        # command.  Deceleration is free as long as position keeps increasing.
+        if ctx.waist_yaw_ref is not None:
+            yaw_i = int(self.c_waist_yaw.nonzero(as_tuple=True)[0][0])
+            q_yaw = ss.q[:, :, yaw_i]
+            # One monotonic segment ends at the NEAREST active hit.  Samples
+            # after that are deliberately unpriced: when the hit fires MPC
+            # re-goals, recomputes the analytic aim from the new state, and the
+            # next segment may choose the opposite direction immediately.
+            k = ctx.hit_index.to(dtype=torch.long)
+            active = ctx.active > 0.5
+            H_ref = int(ctx.waist_yaw_ref.shape[1])
+            big = torch.full_like(k, H_ref + 1)
+            k_first = torch.where(active, k.clamp(1, H_ref), big).min(dim=1).values
+            has_hit = active.any(dim=1) & (k_first <= H_ref)
+            ref_i = (k_first.clamp(1, H_ref) - 1).view(-1, 1)
+            target_yaw = ctx.waist_yaw_ref.gather(1, ref_i)[:, 0]
+            endpoint_delta = target_yaw - q_yaw[:, 0].detach()
+            db = float(cfg.waist_yaw_monotonic_target_deadband)
+            direction = torch.where(
+                endpoint_delta.abs() > db,
+                endpoint_delta.sign(),
+                torch.zeros_like(endpoint_delta),
+            ).detach()
+            # Causal stop-gradient on the preceding sample: a wrong-way step
+            # is repaired by moving the CURRENT sample in the desired direction,
+            # never by dragging the already-earlier sample backward to meet it.
+            dq = q_yaw[:, 1:] - q_yaw[:, :-1].detach()
+            sample_i = torch.arange(
+                1, ss.q.shape[1], device=ss.q.device, dtype=torch.long,
+            ).view(1, -1)
+            segment_end = (k_first * int(cfg.n_sub)).view(-1, 1)
+            valid = (
+                ss.mask[:, 1:, yaw_i]
+                * (direction != 0).to(ss.q.dtype).unsqueeze(1)
+                * has_hit.to(ss.q.dtype).unsqueeze(1)
+                * (sample_i <= segment_end).to(ss.q.dtype)
+            )
+            wrong = (-direction.unsqueeze(1) * dq).clamp_min(0.0)
+            n_mono = valid.sum(dim=1).clamp_min(1.0)
+            raw["waist_yaw_monotonic"] = (wrong * valid).sum(dim=1) / n_mono
+            counts["waist_yaw_monotonic"] = valid.sum(dim=1).detach()
+
+            sample_all = torch.arange(
+                ss.q.shape[1], device=ss.q.device, dtype=torch.long,
+            ).view(1, -1)
+            valid_acc = (
+                ss.mask[:, :, yaw_i]
+                * (direction != 0).to(ss.q.dtype).unsqueeze(1)
+                * has_hit.to(ss.q.dtype).unsqueeze(1)
+                * (sample_all <= segment_end).to(ss.q.dtype)
+            )
+            wrong_acc = (
+                -direction.unsqueeze(1) * ss.qdd[:, :, yaw_i]
+            ).clamp_min(0.0)
+            n_acc = valid_acc.sum(dim=1).clamp_min(1.0)
+            raw["waist_yaw_accel_direction"] = (
+                wrong_acc * valid_acc
+            ).sum(dim=1) / n_acc
+            counts["waist_yaw_accel_direction"] = valid_acc.sum(dim=1).detach()
+            raw["waist_yaw_initial_accel_direction"] = (
+                -direction * ss.qdd[:, 0, yaw_i]
+            ).clamp_min(0.0) * has_hit.to(ss.q.dtype)
+            counts["waist_yaw_initial_accel_direction"] = has_hit.to(
+                ss.q.dtype
+            ).detach()
+        else:
+            raw["waist_yaw_monotonic"] = ss.q.new_zeros(B)
+            counts["waist_yaw_monotonic"] = ss.q.new_zeros(B)
+            raw["waist_yaw_accel_direction"] = ss.q.new_zeros(B)
+            counts["waist_yaw_accel_direction"] = ss.q.new_zeros(B)
+            raw["waist_yaw_initial_accel_direction"] = ss.q.new_zeros(B)
+            counts["waist_yaw_initial_accel_direction"] = ss.q.new_zeros(B)
 
     # --------------------------------------------------- waist P/R band ---
     def _waist_pr_band(self, waypoints, wp_mask, B, ctx, raw, viol, live) -> None:

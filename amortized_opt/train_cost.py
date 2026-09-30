@@ -70,6 +70,7 @@ import torch.nn.functional as F
 
 from .constants import CONTROL_DT, G1_UPPER_BODY_JOINTS, N_DOF, PELVIS_IN_ENV
 from .constants import SHAFT_HIT_SAMPLES, STICK_MIN_SEP
+from .strike_seed import accelerating_path_torch, strike_seed
 from .cost import CostConfig, FusedCost, StrikeContext, stick_cost_from_context
 from .fk import ChainFK, stick_tip_offset
 from .frontier import (
@@ -187,9 +188,14 @@ from .line_search_step import (
 )
 from .objective_replay import (
     FrozenControls,
+    GlobalTorchRngState,
     ObjectiveReplayContext,
     ReplayIncompleteError,
     restore_mutable_batch_fields,
+    restore_global_torch_rng,
+    restore_stream,
+    snapshot_global_torch_rng,
+    snapshot_streams,
 )
 
 __all__ = [
@@ -234,6 +240,7 @@ __all__ = [
     "save_phase2_checkpoint",
     "load_phase2_checkpoint",
     "mpc_init_tie_loss",
+    "waist_yaw_mpc_init_tie_loss",
     "temporal_consistency_loss",
     "train_phase2",
     "WAIST_SP_SELF_TERMS",
@@ -805,6 +812,12 @@ class Phase2Config:
 
     max_steps: int = 60_000
     batch_size: int = 512
+    #: Number of actor minibatches sampled together from the timing curriculum.
+    #: A value of 4 with ``batch_size=1024`` draws/shuffles 4096 task rows,
+    #: then consumes four non-overlapping 1024-row slices.  Timing proposals
+    #: and critic labels remain live per actor step; only the underlying random
+    #: state/goal/MPC task draw is cached.
+    actor_superbatch_factor: int = 1
     #: Waypoint budget per step.  Memory in the cost scales with ``B x H``
     #: (the FK/SDF pass is over ``B x (H+1)`` poses), so a 100-waypoint bucket
     #: at the same batch as a 25-waypoint one is 4x the activations.  The batch
@@ -870,6 +883,11 @@ class Phase2Config:
     #: ``viol_acc`` policy in plan §14 — do not clear balance only in-loop.
     line_search: bool = False
     line_search_cfg: LineSearchConfig = field(default_factory=LineSearchConfig)
+    #: Perturb the frozen terminal-head initialization seen by fresh rows.
+    #: Noise uses the pool's phase-1-matched OU + white law, then a cubic
+    #: envelope whose value and slope are zero at the measured initial knot.
+    terminal_init_noise: bool = False
+    terminal_init_noise_ramp_steps: int = 5
     #: Line-search direction backend.  ``lbfgs`` uses limited-memory BFGS on
     #: the replay-frozen batch (history updated after each executed step).
     optimizer: str = "adamw"
@@ -910,25 +928,62 @@ class Phase2Config:
     #: explicitly masked out.  Default off for backward-compatible experiments;
     #: the rhythm Bellman launcher enables it at the same scale as ``w_tc``.
     w_mpc_init_tie: float = 0.0
+    #: MPC replay consistency for waist yaw only.  Unlike the all-joint tie,
+    #: this is not diluted over 17 output columns: current waypoint ``j`` is
+    #: compared with the stored parent at the same absolute time.  It therefore
+    #: preserves the first plan's valid initial-velocity transient while
+    #: directly penalizing the closed-loop yaw sign flip.
+    w_waist_yaw_mpc_tie: float = 0.0
     w_bptt: float = 1.0
     bptt_start_frac: float = 0.67      # ramp in over the final third
     bptt_max_frac: float = 0.25        # fraction of steps that also do a chain
     bptt_batch: int = 128
+    #: Total weight-shared decoder applications in the two-solve BPTT chain.
+    #: Must be even: half refine hit 1, then half refine hit 2 after the
+    #: differentiable plant/bounce transition.  The encoder outputs are reused
+    #: within each solve and carry no graph when encoder parameters are frozen.
+    bptt_decoder_passes: int = 2
 
-    #: SUFFIX-BELLMAN TERM (:func:`make_suffix_step`).  On a subset of the
-    #: batch, re-solve a random tail of the main solve's own plan (same strike,
-    #: horizon shorter by the drawn offset) and price it with the SAME
-    #: ``FusedCost`` plus a Huber tie to the parent plan's tail -- the
-    #: shrinking-horizon principle of optimality, densified over offsets.
-    #: ``suffix_frac = 0`` disables the whole term; it is OFF by default until
-    #: the on/off ablation says otherwise.  Distinct from ``w_tc``: TC advances
-    #: the noised plant one tick (trains the fixed point to be ATTRACTING);
-    #: this term stays on the plan manifold and trains the identity itself.
+    #: VERIFIED SUFFIX DISTILLATION (:func:`make_suffix_step`).  Parent plans
+    #: passing the conservative Bellman admission gate are detached into a
+    #: short FIFO ring.  That gate permits half the terminal, collision, joint,
+    #: and torque violation formerly allowed by the critic MPC parent gate.
+    #: A later
+    #: update re-solves random tails and trains only the Bellman identity to
+    #: the verified parent -- it does not run a second FusedCost on the child.
+    #: ``suffix_frac = 0`` remains the backward-compatible off switch.
+    #:
+    #: Retained for checkpoint/CLI compatibility.  The verified replay path
+    #: deliberately ignores this former child-FusedCost coefficient.
     w_suffix_cost: float = 1.0
-    #: Huber (beta 0.02 rad, like TC) between the child solve and the parent
-    #: tail on their overlap.  Same scale as ``w_tc`` for the same units.
+    #: Huber (beta 0.02 rad, like TC) between the child solve and the detached
+    #: verified parent tail on their overlap.
     w_suffix_tie: float = 50.0
     suffix_frac: float = 0.0
+    #: Fixed next-update distillation batch.  The ring samples without
+    #: replacement when full enough and reuses parents at different offsets
+    #: while warming up.
+    suffix_replay_batch: int = 64
+    #: Global FIFO capacity across horizon buckets.  Small by design so the
+    #: teacher remains close to the live policy.
+    suffix_replay_capacity: int = 256
+    #: Do not self-distil until this many unique verified parents exist in the
+    #: selected horizon.  The effective suffix coefficient ramps linearly from
+    #: this threshold to ``suffix_replay_batch``.
+    suffix_replay_min_parents: int = 16
+    #: Maximum rows per differentiable suffix decoder call.  Zero evaluates
+    #: the full suffix subset at once.  Chunking preserves the exact weighted
+    #: mean/labels while reducing peak memory for large actor minibatches.
+    suffix_microbatch: int = 0
+    #: Shared remaining-TTH mixture for Bellman and critic-MPC suffix draws:
+    #: an asymmetric exponential peak at the freeze boundary, broad uniform
+    #: support from that boundary through the parent tail, and a small
+    #: below-freeze geometric component for generalization.
+    terminal_suffix_peak_frac: float = 0.55
+    terminal_suffix_long_frac: float = 0.42
+    terminal_suffix_low_frac: float = 0.03
+    terminal_suffix_peak_wp: int = 5
+    terminal_suffix_tail_tau: float = 8.0
     #: Smoothstep ramp of both suffix weights over the first N steps -- early
     #: on the identity ties two garbage plans, which is coupling paid for
     #: nothing until the cost loss has shaped the output.
@@ -1119,6 +1174,17 @@ class Phase2Config:
     timing_critic: ViolationCriticConfig = field(
         default_factory=ViolationCriticConfig,
     )
+    #: State noise applied when the timing curriculum advances a certified
+    #: parent plan to a random later waypoint.  The child starts from the
+    #: parent's spline state at that waypoint and receives the truncated tail
+    #: as its initialization; this is a cheap collocation handoff rather than
+    #: a plant rollout.
+    timing_mpc_q_noise: float = 0.01
+    timing_mpc_qd_noise: float = 0.05
+    #: Certified full parent trajectories retained per horizon. At the default
+    #: batch 512, 2048 keeps roughly four actor generations available for
+    #: repeatedly sampled random suffix collocations.
+    timing_mpc_parent_capacity: int = 2048
 
     # ---- data ----
     #: Use the positive-witness voxel curriculum instead of the legacy
@@ -1365,8 +1431,58 @@ class Phase2Config:
     replay_viol_uniform_mix: float = 0.0
 
     def __post_init__(self) -> None:
+        if float(self.w_waist_yaw_mpc_tie) < 0.0:
+            raise ValueError("w_waist_yaw_mpc_tie must be nonnegative")
+        if int(self.bptt_batch) < 1:
+            raise ValueError("bptt_batch must be positive")
+        if (
+            int(self.bptt_decoder_passes) < 2
+            or int(self.bptt_decoder_passes) % 2 != 0
+        ):
+            raise ValueError("bptt_decoder_passes must be an even integer >= 2")
         if isinstance(self.timing_critic, dict):
             self.timing_critic = ViolationCriticConfig(**self.timing_critic)
+        if int(self.actor_superbatch_factor) < 1:
+            raise ValueError("actor_superbatch_factor must be >= 1")
+        if not math.isfinite(float(self.timing_mpc_q_noise)) or float(
+            self.timing_mpc_q_noise
+        ) < 0.0:
+            raise ValueError("timing_mpc_q_noise must be finite and nonnegative")
+        if not math.isfinite(float(self.timing_mpc_qd_noise)) or float(
+            self.timing_mpc_qd_noise
+        ) < 0.0:
+            raise ValueError("timing_mpc_qd_noise must be finite and nonnegative")
+        if int(self.timing_mpc_parent_capacity) < 1:
+            raise ValueError("timing_mpc_parent_capacity must be positive")
+        if int(self.suffix_microbatch) < 0:
+            raise ValueError("suffix_microbatch must be >= 0")
+        suffix_mix = (
+            float(self.terminal_suffix_peak_frac),
+            float(self.terminal_suffix_long_frac),
+            float(self.terminal_suffix_low_frac),
+        )
+        if any(x < 0.0 or not math.isfinite(x) for x in suffix_mix) or not math.isclose(
+            sum(suffix_mix), 1.0, rel_tol=0.0, abs_tol=1.0e-6,
+        ):
+            raise ValueError(
+                "terminal suffix mixture fractions must be finite, nonnegative, and sum to 1"
+            )
+        if int(self.terminal_suffix_peak_wp) < 2:
+            raise ValueError("terminal_suffix_peak_wp must be at least 2")
+        if float(self.terminal_suffix_tail_tau) <= 0.0:
+            raise ValueError("terminal_suffix_tail_tau must be positive")
+        if int(self.suffix_replay_batch) < 1:
+            raise ValueError("suffix_replay_batch must be >= 1")
+        if int(self.suffix_replay_capacity) < 1:
+            raise ValueError("suffix_replay_capacity must be >= 1")
+        if not 1 <= int(self.suffix_replay_min_parents) <= int(self.suffix_replay_batch):
+            raise ValueError(
+                "suffix_replay_min_parents must be in [1, suffix_replay_batch]"
+            )
+        if int(self.suffix_replay_batch) > int(self.suffix_replay_capacity):
+            raise ValueError(
+                "suffix_replay_batch cannot exceed suffix_replay_capacity"
+            )
         gamma = float(self.replay_viol_uniform_mix)
         if not 0.0 <= gamma <= 1.0:
             raise ValueError(
@@ -1435,9 +1551,14 @@ class Phase2Config:
                     "voxel_pool uses decoder-owned torso motion and forbids "
                     "waist set-point/reference coupling: " + ", ".join(enabled)
                 )
-            if float(self.cost.w_waist_aim) != 0.0:
+            if (
+                float(self.cost.w_waist_aim) != 0.0
+                or float(self.cost.w_waist_yaw_monotonic) != 0.0
+                or float(self.cost.w_waist_yaw_accel_direction) != 0.0
+                or float(self.cost.w_waist_yaw_initial_accel_direction) != 0.0
+            ):
                 raise ValueError(
-                    "voxel_pool requires cost.w_waist_aim=0; the voxel path "
+                    "voxel_pool requires waist reference costs off; the voxel path "
                     "carries no waist-yaw reference"
                 )
             fracs = (
@@ -1710,6 +1831,33 @@ def mpc_init_tie_loss(
     return loss, n
 
 
+def waist_yaw_mpc_init_tie_loss(
+    traj: torch.Tensor,
+    shifted_parent: torch.Tensor,
+    elem_mask: torch.Tensor,
+    mpc_rows: torch.Tensor,
+    *,
+    yaw_index: int,
+    beta: float = 0.02,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Time-aligned MPC consistency on the single waist-yaw output column.
+
+    Returns ``(loss, valid_count, output_grad_norm)``.  The last value is the
+    norm of ``d loss / d traj_yaw`` before the configured scalar weight; logging
+    ``weight * output_grad_norm`` makes gradient significance directly visible.
+    """
+    rows = mpc_rows.to(device=traj.device, dtype=traj.dtype).view(-1, 1)
+    mask = elem_mask[:, :-1, int(yaw_index)].to(dtype=traj.dtype) * rows
+    pred = traj[:, :-1, int(yaw_index)]
+    target = shifted_parent[:, :-1, int(yaw_index)].detach()
+    loss, _sq, n = _masked_huber(pred, target, mask, beta)
+    with torch.no_grad():
+        d = (pred.detach() - target) * mask
+        grad = torch.where(d.abs() < beta, d / beta, d.sign()) * mask / n
+        grad_norm = grad.float().norm()
+    return loss, n, grad_norm
+
+
 # ================================================================ bounce =====
 def bounce_tip_velocity(
     v_tip: torch.Tensor, normal: torch.Tensor, restitution: torch.Tensor
@@ -1796,11 +1944,9 @@ def ramp_seed(
 ) -> torch.Tensor:
     """Quintic-eased straight line ``q_cur -> terminal``, then hold.
 
-    The GPU stand-in for :func:`~amortized_opt.warmstart.warmstart_trajectory`
-    used when the roller respawns a slot that is carrying its post-hit state.
-    Same *shape* as the numpy seed (rest-to-rest quintic timing along a joint
-    straight line) without the goal-pose library lookup, which is a host-side
-    dict.  It is only an initialization; the model refines it.
+    Retained for waist and idle-arm settling. Active strike arms use
+    :func:`~amortized_opt.strike_seed.strike_seed`, which matches the starting
+    velocity and leaves arrival velocity free.
     """
     k = torch.arange(1, H + 1, device=q_cur.device, dtype=q_cur.dtype).view(1, H, 1)
     L = lengths.clamp_min(1).to(q_cur.dtype).unsqueeze(1)     # (B, 1, n)
@@ -1887,9 +2033,9 @@ def retime_batch_timing(
     batch["context"] = replace(batch["context"], goal_tth=goal_tth)
     hit_eff = effective_hits(new_hit, active, h)
     elem_len = per_element_lengths(hit_eff, pool.cfg.joint_names)
-    seed = vel_ramp_seed(
+    seed = strike_seed(
         batch["q0"], batch["v0"], terminal, elem_len, h,
-        float(pool.cfg.dt),
+        float(pool.cfg.dt), active=active, joint_names=pool.cfg.joint_names,
     )
     batch["seed"] = seed
     batch["init"] = seed * batch["masks"].elem_mask
@@ -2670,9 +2816,11 @@ class MPCRoller:
                     ).squeeze(1)
                     cols["init"].index_copy_(
                         0, take,
-                        ramp_seed(
-                            cols["q0"].index_select(0, take), term,
-                            per_elem, self.H,
+                        strike_seed(
+                            cols["q0"].index_select(0, take),
+                            cols["qd0"].index_select(0, take), term,
+                            per_elem, self.H, self.dt,
+                            active=cols["active"].index_select(0, take), joint_names=self.names,
                         ),
                     )
                     frontier_take = take
@@ -2716,7 +2864,11 @@ class MPCRoller:
             term = seed.gather(1, (per_elem.clamp(1, self.H) - 1).unsqueeze(1)).squeeze(1)
             st["init"].index_copy_(
                 0, take,
-                ramp_seed(st["q0"].index_select(0, take), term, per_elem, self.H),
+                strike_seed(
+                    st["q0"].index_select(0, take), st["qd0"].index_select(0, take),
+                    term, per_elem, self.H, self.dt,
+                    active=st["active"].index_select(0, take), joint_names=self.names,
+                ),
             )
             # The drawn scenario's ``aim_yaw`` was solved at ITS OWN q0; this
             # slot keeps the carried robot state instead.  Same policy as the
@@ -3095,8 +3247,10 @@ class MPCRoller:
                 joint_names=self.names,
             )
             term = q_fix[:, cols]
-            L = k.view(-1, 1).expand(-1, len(cols))
-            sub = ramp_seed(q0r[:, cols], term, L, self.H)
+            sub = accelerating_path_torch(
+                q0r[:, cols], st["qd0"].index_select(0, rows)[:, cols],
+                term, k, self.H, self.dt,
+            ).clamp(self.q_lo[cols], self.q_hi[cols])
             buf = buf.clone()
             buf[:, :, cols] = sub
             st["init"].index_copy_(0, rows, buf)
@@ -3713,7 +3867,7 @@ class MPCRoller:
         core.eval()
         with amp:
             enc = core.encode_context(ctx)
-            if enc.waist_pr_sp is not None:
+            if enc.waist_pr_sp is not None and core.terminal_initializer is None:
                 init = seed_waist_pr_to_sp(
                     init, st["q0"], st["qd0"], enc.waist_pr_sp,
                     joint_names=self.names, dt=self.dt, ease_wp=self.waist_ease_wp,
@@ -3726,12 +3880,32 @@ class MPCRoller:
                     & st["active"].to(torch.bool)
                     & (st["hit"] >= 1)
                 )
-                init = correct_quintic_init_arms(
-                    self.fk, init, st["q0"], st["hit"], st["goal_pos"],
-                    active=live, steps=1,
-                    q_bounds=(self.q_lo, self.q_hi),
-                    joint_names=self.names, qd0=st["qd0"], dt=self.dt,
-                )
+                if core.terminal_initializer is not None:
+                    seed = core.initial_trajectory(ctx, state, masks).to(self.dtype)
+                    for h in (0, 1):
+                        rows = live[:, h]
+                        cols = self.arm_cols[h]
+                        init[:, :, cols] = torch.where(
+                            rows[:, None, None], seed[:, :, cols], init[:, :, cols]
+                        )
+                    any_live = live.any(dim=-1)
+                    init[:, :, self.waist_cols] = torch.where(
+                        any_live[:, None, None], seed[:, :, self.waist_cols],
+                        init[:, :, self.waist_cols],
+                    )
+                    if enc.waist_pr_sp is not None:
+                        init = seed_waist_pr_to_sp(
+                            init, st["q0"], st["qd0"], enc.waist_pr_sp,
+                            joint_names=self.names, dt=self.dt,
+                            ease_wp=self.waist_ease_wp,
+                        )
+                else:
+                    init = correct_quintic_init_arms(
+                        self.fk, init, st["q0"], st["hit"], st["goal_pos"],
+                        active=live, steps=1,
+                        q_bounds=(self.q_lo, self.q_hi),
+                        joint_names=self.names, qd0=st["qd0"], dt=self.dt,
+                    )
                 self._arm_dls_pending.zero_()
             out = core(init, state, enc, masks)
         if was:
@@ -3898,7 +4072,10 @@ LOSS_KEYS: tuple[str, ...] = ("loss", "cost", "aux", "tc", "bptt")
 #: not a constraint, so it has no entry in ``VIOL_KEYS``.
 TERM_KEYS: tuple[str, ...] = (
     "terminal", "collision", "torque", "velocity", "joint_box", "smooth", "posture",
-    "effort", "torque_static", "waist_aim", "waist_yaw_vel", "waist_pr_vel", "tip_crossover",
+    "effort", "torque_static", "waist_aim", "waist_yaw_vel", "waist_yaw_monotonic",
+    "waist_yaw_accel_direction",
+    "waist_yaw_initial_accel_direction",
+    "waist_pr_vel", "tip_crossover",
     "terminal_aim", "waist_pr_band", "waist_pr_terminal", "waist_upright",
 )
 TORQUE_TERM_IDX: int = TERM_KEYS.index("torque")
@@ -4119,21 +4296,50 @@ def _hard_feasibility_ok_from_gate(
     )
 
 
-def _timing_mpc_ingress_ok(
+def _bellman_parent_ingress_ok(
     gate: torch.Tensor,
     cfg: ViolationCriticConfig,
 ) -> torch.Tensor:
-    """Close-feasibility predicate for neural previous-step MPC rows."""
-    normalized = robust_transform(residuals_from_gate(gate, cfg), cfg.scales)
-    return (
-        torch.isfinite(normalized).all(dim=1)
-        & (gate[:, 4] <= float(cfg.primary_mpc_terminal_limit))
-        & (gate[:, 5] >= float(cfg.primary_mpc_collision_sdf_limit))
-        & (
-            normalized[:, 2:]
-            <= float(cfg.acceptable_normalized_violation)
-        ).all(dim=1)
+    """Bellman admission at half the former critic-MPC allowances.
+
+    The critic MPC pool now accepts every structurally advanceable actor plan.
+    Bellman teachers remain selective: each physical allowance is half of the
+    old MPC parent gate.  Joint and torque limits include the old robust-space
+    slack before being halved.
+    """
+    if gate.ndim != 2 or gate.shape[1] < 8:
+        raise ValueError(
+            f"Bellman parent gate requires shape (B, >=8), got {tuple(gate.shape)}"
+        )
+    exact = gate[:, 4:8].detach().float()
+    robust_slack = math.sinh(float(cfg.acceptable_normalized_violation))
+    terminal_max = 0.5 * float(cfg.primary_mpc_terminal_limit)
+    collision_min = 0.5 * float(cfg.primary_mpc_collision_sdf_limit)
+    joint_max = 0.5 * (
+        float(cfg.joint_limit) + robust_slack * float(cfg.joint_scale)
     )
+    torque_max = 0.5 * (
+        float(cfg.torque_limit) + robust_slack * float(cfg.torque_scale)
+    )
+    return (
+        torch.isfinite(exact).all(dim=1)
+        & (exact[:, 0] <= terminal_max)
+        & (exact[:, 1] >= collision_min)
+        & (exact[:, 2] <= joint_max)
+        & (exact[:, 3] <= torque_max)
+    )
+
+
+def _timing_mpc_parent_ingress_ok(gate: torch.Tensor) -> torch.Tensor:
+    """Admit every completed actor row to the critic MPC parent pool.
+
+    ``commit_side_effects`` and the finite-gradient guard remain the outer
+    transaction boundary. The ring itself separately rejects rows that have no
+    later pre-hit waypoint from which a suffix can be constructed.
+    """
+    if gate.ndim != 2:
+        raise ValueError(f"critic MPC parent gate requires a matrix, got {tuple(gate.shape)}")
+    return torch.ones(int(gate.shape[0]), device=gate.device, dtype=torch.bool)
 
 
 def _metrics_tensor(ct, loss, loss_cost, loss_aux, device, dtype) -> torch.Tensor:
@@ -4426,6 +4632,10 @@ def measure_torque_directional_curvature(
     v = v0[sl].detach().float()
     lens = lengths[sl]
     strike_n = _strike_rows(strike, sl)
+    row_idx = torch.arange(n, device=traj.device, dtype=torch.long)
+    weights_n = _index_batch_weights(
+        weights, row_idx, batch_size=int(traj.shape[0]),
+    )
 
     device_type = "cuda" if x.is_cuda else "cpu"
 
@@ -4434,7 +4644,8 @@ def measure_torque_directional_curvature(
         # autocast context and restores that context on exit.
         with torch.amp.autocast(device_type=device_type, enabled=False):
             ct = cost.forward(
-                q, waypoints.float(), v, strike_n, lengths=lens, weights=weights,
+                q, waypoints.float(), v, strike_n,
+                lengths=lens, weights=weights_n,
             )
             return float(cfg.w_cost) * ct.terms["torque"].mean()
 
@@ -4937,10 +5148,69 @@ class _ShutdownFlag:
         signal.signal(signal.SIGINT, _handler)
 
 
+def _snapshot_phase2_rng_state(streams: dict) -> dict:
+    """Capture the process-global and explicitly-owned phase-2 streams."""
+    global_state = snapshot_global_torch_rng()
+    return {
+        "global_torch": {
+            "cpu": global_state.cpu,
+            "cuda": global_state.cuda,
+        },
+        "streams": snapshot_streams(streams),
+    }
+
+
+def _restore_phase2_rng_state(state, streams: dict) -> str | None:
+    """Restore RNG state and report full, partial, or legacy coverage."""
+    if not isinstance(state, dict):
+        return None
+    # The script passes the full checkpoint so old ``torch_rng``-only files
+    # remain resumable; direct callers may pass just the nested bundle.
+    nested = state.get("rng_state")
+    has_bundle = isinstance(nested, dict) and bool(nested)
+    if has_bundle:
+        state = nested
+    restored = False
+    global_state = state.get("global_torch")
+    if isinstance(global_state, dict):
+        cpu = global_state.get("cpu")
+        if cpu is not None:
+            cuda = global_state.get("cuda")
+            restore_global_torch_rng(GlobalTorchRngState(
+                cpu=cpu, cuda=None if cuda is None else tuple(cuda),
+            ))
+            restored = True
+    elif state.get("torch_rng") is not None:
+        restore_global_torch_rng(GlobalTorchRngState(
+            cpu=state["torch_rng"], cuda=None,
+        ))
+        restored = True
+    named = state.get("streams")
+    if not isinstance(named, dict):
+        named = state.get("named")
+    if not isinstance(named, dict):
+        named = {}
+    # Missing entries are expected for legacy/partial checkpoints.  Unknown
+    # future streams are ignored so an older runtime can still resume.
+    for name, stream in streams.items():
+        if name in named:
+            restore_stream(stream, named[name])
+            restored = True
+    if not restored:
+        return None
+    if not has_bundle:
+        return "legacy global-only"
+    expected = set(streams)
+    restored_names = expected.intersection(named)
+    if restored_names == expected and isinstance(global_state, dict):
+        return "full"
+    return "partial"
+
+
 def save_phase2_checkpoint(
     path, *, model, optimizer, al: AugmentedLagrangian, step: int,
     cfg: Phase2Config, model_cfg: ModelConfig, scenario_cfg=None, extra=None,
-    atomic: bool = True,
+    atomic: bool = True, rng_streams: dict | None = None,
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4956,8 +5226,15 @@ def save_phase2_checkpoint(
         # Selector state under ``extra["line_search"]`` when LS is on
         # (caller merges via ``_checkpoint_extra_with_ls``).
         "extra": dict(extra or {}),
+        # Keep this legacy field for old readers and pre-bundle checkpoints.
         "torch_rng": torch.get_rng_state(),
     }
+    if rng_streams is not None:
+        rng_state = _snapshot_phase2_rng_state(rng_streams)
+        payload["rng_state"] = rng_state
+        cuda_state = rng_state["global_torch"]["cuda"]
+        if cuda_state is not None:
+            payload["torch_cuda_rng"] = cuda_state
     if atomic:
         tmp = path.with_name(path.name + ".tmp")
         torch.save(payload, tmp)
@@ -4983,6 +5260,7 @@ def _save_last_pt(
     scenario_cfg,
     ls_rt,
     extra: dict | None = None,
+    rng_streams: dict | None = None,
 ) -> None:
     save_phase2_checkpoint(
         run_dir / "last.pt",
@@ -4994,6 +5272,7 @@ def _save_last_pt(
         model_cfg=model_cfg,
         scenario_cfg=scenario_cfg,
         extra=_checkpoint_extra_with_ls(extra, ls_rt, optimizer=optimizer),
+        rng_streams=rng_streams,
     )
 
 
@@ -5009,6 +5288,7 @@ def _save_step_pt(
     scenario_cfg,
     ls_rt,
     extra: dict | None = None,
+    rng_streams: dict | None = None,
 ) -> Path | None:
     keep = int(cfg.ckpt_keep_every)
     if keep <= 0 or int(step) % keep != 0:
@@ -5024,6 +5304,7 @@ def _save_step_pt(
         model_cfg=model_cfg,
         scenario_cfg=scenario_cfg,
         extra=_checkpoint_extra_with_ls(extra, ls_rt, optimizer=optimizer),
+        rng_streams=rng_streams,
     )
     return path
 
@@ -5048,7 +5329,10 @@ def _checkpoint_extra_with_ls(extra: dict | None, ls_rt, *, optimizer=None) -> d
     return out
 
 
-def load_phase2_checkpoint(path, *, model=None, optimizer=None, al=None, map_location=None):
+def load_phase2_checkpoint(
+    path, *, model=None, optimizer=None, al=None, map_location=None,
+    rng_streams: dict | None = None,
+):
     ck = torch.load(Path(path), map_location=map_location, weights_only=False)
     if model is not None:
         core = model.module if hasattr(model, "module") else model
@@ -5057,6 +5341,8 @@ def load_phase2_checkpoint(path, *, model=None, optimizer=None, al=None, map_loc
         optimizer.load_state_dict(ck["optimizer"])
     if al is not None and ck.get("al") is not None:
         al.load_state_dict(ck["al"])
+    if rng_streams is not None:
+        _restore_phase2_rng_state(ck, rng_streams)
     return ck
 
 
@@ -5114,6 +5400,7 @@ def suffix_offsets(
     H: int,
     *,
     generator: torch.Generator | None = None,
+    min_offset: int = 0,
 ) -> torch.Tensor:
     """``(B,)`` random suffix offsets ``k`` with every active strike kept ahead.
 
@@ -5127,8 +5414,111 @@ def suffix_offsets(
     act = active.bool()
     span = torch.where(act, hit, torch.full_like(hit, int(H)))
     kmax = (span.min(dim=1).values - 1).clamp_min(0)
+    min_offset = int(min_offset)
+    if min_offset not in (0, 1):
+        raise ValueError("suffix min_offset must be 0 or 1")
     u = torch.rand(kmax.shape[0], device=hit.device, generator=generator)
-    return torch.minimum((u * (kmax + 1).to(u.dtype)).long(), kmax)
+    if min_offset == 0:
+        return torch.minimum((u * (kmax + 1).to(u.dtype)).long(), kmax)
+    # A verified-replay child should start at an actual later waypoint when
+    # one exists.  Imminent strikes still fall back to the k=0 idempotence row.
+    positive = 1 + torch.minimum((u * kmax.to(u.dtype)).long(), (kmax - 1).clamp_min(0))
+    return torch.where(kmax > 0, positive, torch.zeros_like(kmax))
+
+
+def terminal_mixture_suffix_offsets(
+    hit: torch.Tensor,
+    active: torch.Tensor,
+    H: int,
+    *,
+    generator: torch.Generator | None = None,
+    peak_frac: float = 0.55,
+    long_frac: float = 0.42,
+    low_frac: float = 0.03,
+    peak_wp: int = 5,
+    tail_tau: float = 8.0,
+    component: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sample remaining TTH from the freeze-peaked three-component mixture.
+
+    The peak component has a sharp discontinuity below ``peak_wp`` and an
+    exponential long tail. The long component is uniform from the peak through
+    each parent's available horizon. The low component is geometric over the
+    below-freeze waypoints. Components are normalized per parent and the final
+    mixture is renormalized when a short parent cannot support one of them.
+    """
+    mix = (float(peak_frac), float(long_frac), float(low_frac))
+    peak_wp, tail_tau = int(peak_wp), float(tail_tau)
+    if any(x < 0.0 or not math.isfinite(x) for x in mix) or not math.isclose(
+        sum(mix), 1.0, rel_tol=0.0, abs_tol=1.0e-6,
+    ):
+        raise ValueError("terminal suffix mixture must sum to one")
+    if peak_wp < 2 or tail_tau <= 0.0:
+        raise ValueError("invalid terminal suffix peak/tail")
+    rows = int(hit.shape[0])
+    if rows == 0:
+        return torch.zeros(0, device=hit.device, dtype=torch.long)
+    act = active.bool()
+    nearest = torch.where(act, hit, torch.full_like(hit, int(H))).min(1).values
+    kmax = (nearest - 1).clamp_min(0)
+    offsets = torch.zeros_like(kmax)
+    usable = (kmax >= 1).nonzero(as_tuple=True)[0]
+    if not int(usable.numel()):
+        return offsets
+    remaining_grid = torch.arange(
+        1, int(H), device=hit.device, dtype=torch.float32,
+    )
+    valid = remaining_grid.unsqueeze(0) <= kmax.index_select(0, usable).unsqueeze(1)
+    below = remaining_grid < float(peak_wp)
+    at = remaining_grid == float(peak_wp)
+    above = remaining_grid > float(peak_wp)
+    peak_raw = torch.where(
+        below,
+        0.10 * torch.exp(-(float(peak_wp - 1) - remaining_grid)),
+        torch.where(
+            at, torch.ones_like(remaining_grid),
+            torch.exp(-(remaining_grid - float(peak_wp)) / tail_tau),
+        ),
+    ).unsqueeze(0) * valid
+    long_raw = (
+        (remaining_grid >= float(peak_wp)).unsqueeze(0) * valid
+    ).to(torch.float32)
+    low_raw = torch.where(
+        below, torch.pow(2.0, remaining_grid - 1.0),
+        torch.zeros_like(remaining_grid),
+    ).unsqueeze(0) * valid
+
+    def _normalize(component: torch.Tensor) -> torch.Tensor:
+        return component / component.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+
+    mixture_probability = (
+        mix[0] * _normalize(peak_raw)
+        + mix[1] * _normalize(long_raw)
+        + mix[2] * _normalize(low_raw)
+    )
+    if component is None:
+        probability = mixture_probability
+    else:
+        selected_component = component.to(hit.device).index_select(0, usable).long()
+        if bool(((selected_component < 0) | (selected_component > 2)).any()):
+            raise ValueError("terminal suffix component ids must be 0, 1, or 2")
+        stack = torch.stack([
+            _normalize(peak_raw), _normalize(long_raw), _normalize(low_raw),
+        ], dim=1)
+        probability = stack[
+            torch.arange(int(usable.numel()), device=hit.device),
+            selected_component,
+        ]
+        unavailable = probability.sum(dim=1) <= 0.0
+        probability = torch.where(
+            unavailable.unsqueeze(1), mixture_probability, probability,
+        )
+    probability = probability / probability.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
+    remaining = torch.multinomial(
+        probability, 1, replacement=True, generator=generator,
+    )[:, 0] + 1
+    offsets.index_copy_(0, usable, nearest.index_select(0, usable) - remaining)
+    return offsets
 
 
 def shift_plan(
@@ -5152,28 +5542,15 @@ def shift_plan(
 
 def make_suffix_step(module, cost: FusedCost, cfg: Phase2Config,
                      *, compile_mode: str | None = "default"):
-    """Suffix-Bellman term: re-solve a random tail of the main solve's plan.
+    """Re-solve a detached, verified parent tail and distil its Bellman identity.
 
-    The horizon shrinks to the strike, so both solves price the SAME terminal
-    event and the principle of optimality holds exactly: the tail of the
-    optimal H-plan is the optimal (H - k)-plan from the state it passes
-    through.  Per sample one offset ``k`` (:func:`suffix_offsets`) picks the
-    subproblem; the model re-solves from the parent spline's own state at
-    waypoint ``k`` with the shifted parent as init, and the term is
-
-        w_suffix_cost * FusedCost(child)            (every solve anchored)
-      + w_suffix_tie  * Huber(child, parent tail)   (the Bellman identity)
-
-    on the overlapping support.  Deliberately distinct from
-    :func:`make_tc_step`: TC steps the *noised plant* one tick, which trains
-    the replan fixed point to be attracting; this term stays on the plan
-    manifold -- no sim, no gain noise -- and densifies the identity itself at
-    every horizon (which also oversamples short horizons with physically
-    coherent scenarios, the band ``short_wp`` exists for).  The state/init
-    handoff is DETACHED so the child cannot drag the parent through its
-    inputs; the tie is the only parent<->child coupling, and the per-row mean
-    already normalizes it, so a parent appearing under several offsets over
-    training is not upweighted.
+    The parent was admitted by the exact task/physics gate on an earlier
+    update.  The horizon shrinks to the strike, so the tail of that successful
+    plan is the teacher for the state it passes through.  Both the handoff and
+    target are detached: gradients update only the new child solve.  Unlike
+    the former online suffix branch, this function intentionally does *not*
+    evaluate ``FusedCost(child)``; ordinary primary rows remain responsible
+    for physics optimization while this branch trains replanning identity.
     """
     def _model(init, state, enc, masks):
         return module(init, state, enc, masks)
@@ -5181,13 +5558,13 @@ def make_suffix_step(module, cost: FusedCost, cfg: Phase2Config,
     if compile_mode is not None and cfg.compile_model:
         _model = torch.compile(_model, mode=compile_mode, dynamic=False)
 
-    def fn(traj, q0, v0, enc, em_parent, masks_s, strike_s, lengths_s, weights,
-           offs):
+    def fn(traj, q0, v0, enc, em_parent, masks_s, offs):
         B, H, D = traj.shape
-        shifted, valid = shift_plan(traj, offs)          # grad-carrying tail
+        parent = traj.detach()
+        shifted, valid = shift_plan(parent, offs)
         # -- handoff state from the PARENT plan's own spline, detached --------
         with torch.no_grad(), torch.autocast(device_type="cuda", enabled=False):
-            t32 = traj.detach().float()
+            t32 = parent.float()
             em32 = em_parent.float()
             sp = cost.spline.from_masks(q0.float(), t32, v0.float(), em32)
             end = torch.full((1,), float(cost.dt), device=traj.device,
@@ -5203,19 +5580,63 @@ def make_suffix_step(module, cost: FusedCost, cfg: Phase2Config,
         em_s = masks_s.elem_mask.to(traj.dtype)
         child_init = shifted.detach() * em_s
         out = _model(child_init, torch.cat([q0_s, v0_s], dim=-1), enc, masks_s)
-        child_ct = cost.forward(
-            q0_s, out.traj, v0_s, strike_s,
-            lengths=lengths_s, weights=weights,
-        )
         m = em_s * shift_plan(em_parent, offs)[0].to(traj.dtype) \
             * valid.unsqueeze(-1).to(traj.dtype)
-        tie = _masked_huber(out.traj, shifted, m, 0.02)[0]
+        tie, _sq, n = _masked_huber(out.traj, shifted.detach(), m, 0.02)
         return (
-            child_ct.total.mean(), tie, _gate_from_ct(child_ct).detach(),
-            q0_s.detach(), v0_s.detach(), child_init.detach(),
+            tie, n.detach(), q0_s.detach(), v0_s.detach(), child_init.detach(),
         )
 
     return fn
+
+
+def _run_suffix_step_chunked(
+    fn,
+    traj: torch.Tensor,
+    q0: torch.Tensor,
+    v0: torch.Tensor,
+    enc,
+    em_parent: torch.Tensor,
+    masks_s,
+    offs: torch.Tensor,
+    *,
+    microbatch: int,
+):
+    """Run a suffix solve in row chunks without changing its batch mean."""
+    n = int(traj.shape[0])
+    cap = int(microbatch)
+    if cap <= 0 or n <= cap:
+        return fn(
+            traj, q0, v0, enc, em_parent, masks_s, offs,
+        )
+    loss_tie = traj.sum() * 0.0
+    tie_elems = traj.sum().detach() * 0.0
+    tails: list[list[torch.Tensor]] = [[], [], []]
+    device = traj.device
+    for start in range(0, n, cap):
+        idx = torch.arange(start, min(start + cap, n), device=device)
+        masks_part = type(masks_s)(**{
+            name: (
+                None if getattr(masks_s, name) is None
+                else getattr(masks_s, name).index_select(0, idx)
+            )
+            for name in masks_s.__dataclass_fields__
+        })
+        out = fn(
+            traj.index_select(0, idx),
+            q0.index_select(0, idx),
+            v0.index_select(0, idx),
+            _index_encoded(enc, idx),
+            em_parent.index_select(0, idx),
+            masks_part,
+            offs.index_select(0, idx),
+        )
+        weight = float(idx.numel()) / float(n)
+        loss_tie = loss_tie + weight * out[0]
+        tie_elems = tie_elems + out[1]
+        for values, value in zip(tails, out[2:]):
+            values.append(value)
+    return loss_tie, tie_elems, *(torch.cat(values, dim=0) for values in tails)
 
 
 def _strike_rows(s: StrikeContext, sl) -> StrikeContext:
@@ -5264,11 +5685,19 @@ def make_bptt_step(module, cost: FusedCost, sim: BatchedPDSim, cfg: Phase2Config
     lead_f = lead_fraction(cfg.cmd_lead_s, cost.dt, len(names),
                            device=cost.device, dtype=cost.dtype)
 
+    passes_per_solve = int(cfg.bptt_decoder_passes) // 2
+
+    def decoder_solve(core, init, state, enc, masks):
+        out = core(init, state, enc, masks)
+        for _ in range(passes_per_solve - 1):
+            out = core(out.traj, state, enc, masks)
+        return out
+
     def fn(init1, state1, q0, v0, enc1, masks1, strike1, len1, hit1,
            term2, enc2, masks2, strike2, len2, elen2, weights, kp, kd,
            hand_index, normal, e_rest, noise_q, noise_v, noise_tip):
         core = module
-        out1 = core(init1, state1, enc1, masks1)
+        out1 = decoder_solve(core, init1, state1, enc1, masks1)
         traj1 = out1.traj
         c1_total = cost_tuple(cost, q0, traj1, v0, strike1, len1, weights)[0]
 
@@ -5307,8 +5736,14 @@ def make_bptt_step(module, cost: FusedCost, sim: BatchedPDSim, cfg: Phase2Config
             q_post = torch.clamp(q_hit + noise_q, q_lo, q_hi)
 
         # --- second solve, from the post-hit state ---------------------------
-        seed2 = ramp_seed(q_post, term2, elen2, traj1.shape[1])
-        out2 = core(seed2 * masks2.elem_mask, torch.cat([q_post, v_post], -1), enc2, masks2)
+        seed2 = strike_seed(
+            q_post, v_post, term2, elen2, traj1.shape[1], cost.dt,
+            active=strike2.active, joint_names=names,
+        )
+        out2 = decoder_solve(
+            core, seed2 * masks2.elem_mask,
+            torch.cat([q_post, v_post], -1), enc2, masks2,
+        )
         c2_total = cost_tuple(cost, q_post, out2.traj, v_post, strike2, len2, weights)[0]
         return c1_total.mean(), c2_total.mean()
 
@@ -5506,6 +5941,19 @@ def migrate_al_state(state: dict | None) -> dict | None:
     if groups is not None:
         out["groups"] = groups
     return out
+
+
+def clamp_resumed_al_penalty(value: float, lower: float, upper: float) -> float:
+    """Clamp an enabled resumed PHR penalty without enabling a disabled one.
+
+    An exact zero is a semantic switch: :class:`AugmentedLagrangian` omits the
+    quadratic term entirely.  Resume-time config reconciliation must therefore
+    preserve zero even when the current positive-penalty floor is nonzero.
+    """
+    value = float(value)
+    if value == 0.0:
+        return 0.0
+    return float(min(max(value, float(lower)), float(upper)))
 
 
 #: Groups whose price :attr:`WeightSchedule.full_limit_joints` makes per joint.
@@ -6396,6 +6844,157 @@ def _detach_batch(batch: dict, *, device=None) -> dict:
     return out
 
 
+class _VerifiedSuffixRing:
+    """Small FIFO of Bellman-admitted parent trajectories.
+
+    Storage is batched per horizon for cheap GPU sampling, while a monotonically
+    increasing sequence column enforces one global capacity across horizons.
+    Sampling is uniform inside the recent FIFO window; an additional recency
+    weighting would unnecessarily collapse diversity in a 256-entry ring.
+    """
+
+    _FIELDS = ("q0", "v0", "context", "hit", "active", "masks")
+
+    def __init__(self, *, capacity: int, device):
+        self.capacity = int(capacity)
+        self.device = torch.device(device)
+        self.data: dict[int, dict] = {}
+        self.next_sequence = 0
+
+    def __len__(self) -> int:
+        return sum(self.size(bucket) for bucket in self.data)
+
+    def size(self, bucket: int) -> int:
+        item = self.data.get(int(bucket))
+        return 0 if item is None else int(item["q0"].shape[0])
+
+    def distribution(self) -> dict[int, int]:
+        return {bucket: self.size(bucket) for bucket in sorted(self.data)}
+
+    @torch.no_grad()
+    def add(
+        self,
+        bucket: int,
+        batch: dict,
+        traj: torch.Tensor,
+        *,
+        hard_ok: torch.Tensor,
+    ) -> int:
+        """Append verified parents and evict the globally oldest rows."""
+        bucket = int(bucket)
+        mask = hard_ok.detach().to(device=traj.device, dtype=torch.bool).reshape(-1)
+        if int(mask.numel()) != int(traj.shape[0]):
+            raise ValueError("hard_ok must have one value per suffix parent")
+        idx = mask.nonzero(as_tuple=True)[0]
+        if not int(idx.numel()):
+            return 0
+        parent = _index_batch(
+            {key: batch[key] for key in self._FIELDS}, idx,
+        )
+        parent["parent_traj"] = traj.detach().index_select(0, idx)
+        n = int(idx.numel())
+        parent["suffix_sequence"] = torch.arange(
+            self.next_sequence, self.next_sequence + n,
+            device=traj.device, dtype=torch.long,
+        )
+        self.next_sequence += n
+        parent["bucket"] = bucket
+        parent = _detach_batch(parent, device=self.device)
+        if bucket in self.data:
+            parent = _cat_phase2_batches([self.data[bucket], parent])
+        self.data[bucket] = parent
+        self._trim()
+        return n
+
+    @torch.no_grad()
+    def _trim(self) -> None:
+        total = len(self)
+        if total <= self.capacity:
+            return
+        sequences = torch.cat([
+            item["suffix_sequence"] for item in self.data.values()
+        ])
+        keep_from = torch.topk(
+            sequences, k=self.capacity, largest=True, sorted=False,
+        ).values.min()
+        for bucket in list(self.data):
+            item = self.data[bucket]
+            idx = (item["suffix_sequence"] >= keep_from).nonzero(as_tuple=True)[0]
+            if int(idx.numel()):
+                self.data[bucket] = _index_batch(item, idx)
+            else:
+                del self.data[bucket]
+
+    @torch.no_grad()
+    def sample(
+        self,
+        bucket: int,
+        n: int,
+        *,
+        min_parents: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[dict | None, float]:
+        """Return a fixed batch and its unique-parent warmup coefficient."""
+        size = self.size(bucket)
+        n = int(n)
+        if size < int(min_parents):
+            return None, 0.0
+        if size >= n:
+            idx = torch.randperm(size, device=self.device, generator=generator)[:n]
+        else:
+            # Reused parents draw independent offsets later in the caller.
+            idx = torch.randint(size, (n,), device=self.device, generator=generator)
+        fill = min(float(size) / float(max(n, 1)), 1.0)
+        return _index_batch(self.data[int(bucket)], idx), fill
+
+    def state_dict(self) -> dict:
+        return {
+            "version": 1,
+            "capacity": self.capacity,
+            "next_sequence": int(self.next_sequence),
+            "data": {
+                int(bucket): _detach_batch(item, device="cpu")
+                for bucket, item in self.data.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state.get("version", -1)) != 1:
+            raise ValueError("unsupported verified suffix-ring checkpoint")
+        self.next_sequence = int(state.get("next_sequence", 0))
+        self.data = {
+            int(bucket): _detach_batch(item, device=self.device)
+            for bucket, item in state.get("data", {}).items()
+        }
+        self._trim()
+
+
+def _suffix_distill_loss(
+    replay_batch: dict,
+    offs: torch.Tensor,
+    *,
+    bucket: int,
+    encode_step,
+    suffix_fn,
+    pool: Phase2Pool,
+    microbatch: int,
+):
+    """Build one shifted child batch and return its teacher-only tie loss."""
+    active = replay_batch["active"]
+    hit_parent = replay_batch["hit"]
+    hit_child = torch.where(
+        active.bool(), hit_parent - offs.unsqueeze(1), hit_parent,
+    )
+    masks_child = pool.masks_for(hit_child.clamp_min(0), active, int(bucket))
+    enc = encode_step(replay_batch["context"])
+    return _run_suffix_step_chunked(
+        suffix_fn,
+        replay_batch["parent_traj"], replay_batch["q0"], replay_batch["v0"],
+        enc, replay_batch["masks"].elem_mask, masks_child, offs,
+        microbatch=int(microbatch),
+    )
+
+
 class _VoxelMPCParentRing:
     """The latest shifted decoder-parent generation for each horizon.
 
@@ -6522,6 +7121,325 @@ class _VoxelMPCParentRing:
         self.generation = {
             int(bucket): int(value)
             for bucket, value in state.get("generation", {}).items()
+        }
+
+
+def _shift_time_rows(value: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    """Left-shift a ``(B, H, ...)`` tensor independently for each row."""
+    if value.ndim < 2 or int(value.shape[0]) != int(offs.shape[0]):
+        raise ValueError("time tensor and offsets must share their batch dimension")
+    horizon = int(value.shape[1])
+    ar = torch.arange(horizon, device=value.device)
+    index = (ar.unsqueeze(0) + offs.to(value.device).unsqueeze(1)).clamp_max(
+        horizon - 1
+    )
+    expand = (int(value.shape[0]), horizon, *value.shape[2:])
+    index = index.reshape(int(value.shape[0]), horizon, *([1] * (value.ndim - 2)))
+    return value.gather(1, index.expand(expand))
+
+
+class _TrajectorySuffixMPCParentRing:
+    """Cheap timing-MPC collocations sampled from certified trajectory tails.
+
+    Each certified full parent trajectory is stored once. Every draw samples a
+    remaining-TTH component, selects a parent capable of supporting it, builds
+    the detached spline state there, and returns the corresponding noisy suffix
+    problem. Reusing one parent at many offsets supplies many later-in-flight
+    collocations without storing every suffix or running a PD simulation.
+    """
+
+    def __init__(
+        self,
+        *,
+        device,
+        pool,
+        costs: dict[int, FusedCost],
+        q_noise: float = 0.01,
+        qd_noise: float = 0.05,
+        capacity: int = 2048,
+        terminal_peak_frac: float = 0.55,
+        terminal_long_frac: float = 0.42,
+        terminal_low_frac: float = 0.03,
+        terminal_peak_wp: int = 5,
+        terminal_tail_tau: float = 8.0,
+    ):
+        self.device = torch.device(device)
+        self.data: dict[int, dict] = {}
+        self.generation: dict[int, int] = {}
+        self.pool = pool
+        self.costs = costs
+        self.q_noise = float(q_noise)
+        self.qd_noise = float(qd_noise)
+        self.capacity = int(capacity)
+        self.terminal_peak_frac = float(terminal_peak_frac)
+        self.terminal_long_frac = float(terminal_long_frac)
+        self.terminal_low_frac = float(terminal_low_frac)
+        self.terminal_peak_wp = int(terminal_peak_wp)
+        self.terminal_tail_tau = float(terminal_tail_tau)
+        self.last_advance_offset_mean = 0.0
+        self.last_advance_seconds_mean = 0.0
+        self.last_unique_parent_frac = 0.0
+        self.dropped_legacy_rows = 0
+
+    @property
+    def buckets(self) -> tuple[int, ...]:
+        return tuple(sorted(self.data))
+
+    def __len__(self) -> int:
+        return sum(self.size(bucket) for bucket in self.data)
+
+    def size(self, bucket: int) -> int:
+        batch = self.data.get(int(bucket))
+        return 0 if batch is None else int(batch["q0"].shape[0])
+
+    def distribution(self) -> dict[int, int]:
+        return {bucket: self.size(bucket) for bucket in self.buckets}
+
+    def sample_idx(
+        self,
+        bucket: int,
+        n: int,
+        *,
+        generator: torch.Generator | None = None,
+        **_unused,
+    ) -> torch.Tensor:
+        size = self.size(bucket)
+        if size <= 0:
+            raise RuntimeError(
+                f"trajectory-suffix MPC ring is empty for bucket {int(bucket)}"
+            )
+        return torch.randint(
+            size, (int(n),), device=self.device, generator=generator,
+        )
+
+    @torch.no_grad()
+    def batch(
+        self, bucket: int, idx: torch.Tensor, *, generator=None, noise=False,
+    ) -> dict:
+        del noise
+        bucket = int(bucket)
+        idx = idx.to(self.device).clone()
+        rows = int(idx.numel())
+        component = torch.multinomial(
+            torch.tensor(
+                [self.terminal_peak_frac, self.terminal_long_frac,
+                 self.terminal_low_frac],
+                device=self.device, dtype=torch.float32,
+            ),
+            rows, replacement=True, generator=generator,
+        )
+        stored = self.data[bucket]
+        stored_active = stored["active"].bool()
+        stored_nearest = torch.where(
+            stored_active, stored["hit"],
+            torch.full_like(stored["hit"], bucket),
+        ).min(dim=1).values
+        requirements = ((0, self.terminal_peak_wp + 1), (1, bucket))
+        for component_id, nearest_required in requirements:
+            positions = (component == component_id).nonzero(as_tuple=True)[0]
+            candidates = (stored_nearest >= nearest_required).nonzero(as_tuple=True)[0]
+            if not int(positions.numel()) or not int(candidates.numel()):
+                continue
+            draw = torch.randint(
+                int(candidates.numel()), (int(positions.numel()),),
+                device=self.device, generator=generator,
+            )
+            idx.index_copy_(0, positions, candidates.index_select(0, draw))
+        parent = _index_batch(stored, idx)
+        selected = parent.pop("_parent_traj")
+        rows, _, dof = selected.shape
+        offs = terminal_mixture_suffix_offsets(
+            parent["hit"], parent["active"], bucket,
+            generator=generator,
+            peak_frac=self.terminal_peak_frac,
+            long_frac=self.terminal_long_frac,
+            low_frac=self.terminal_low_frac,
+            peak_wp=self.terminal_peak_wp,
+            tail_tau=self.terminal_tail_tau,
+            component=component,
+        )
+        if bool((offs < 1).any()):
+            raise RuntimeError("timing MPC suffix failed to advance")
+
+        # Evaluate the parent's continuous spline at the chosen knot. Decoder
+        # rows represent knots 1..H, so offset k hands off at row k-1.
+        cost = self.costs[bucket]
+        with torch.autocast(device_type=selected.device.type, enabled=False):
+            parent32 = selected.float()
+            elem32 = parent["masks"].elem_mask.float()
+            spline = cost.spline.from_masks(
+                parent["q0"].float(), parent32, parent["v0"].float(), elem32,
+            )
+            end = torch.full(
+                (1,), float(cost.dt), device=selected.device, dtype=torch.float32,
+            )
+            _q, qd, _qdd, _jerk = spline.eval_offsets(end)
+            velocity = qd[:, :, 0, :]
+            km1 = (offs - 1).view(rows, 1, 1).expand(rows, 1, dof)
+            q0 = parent32.gather(1, km1)[:, 0]
+            v0 = velocity.gather(1, km1)[:, 0]
+
+        if self.q_noise:
+            q0 = q0 + self.q_noise * torch.randn(
+                q0.shape, device=q0.device, dtype=q0.dtype, generator=generator,
+            )
+        if self.qd_noise:
+            v0 = v0 + self.qd_noise * torch.randn(
+                v0.shape, device=v0.device, dtype=v0.dtype, generator=generator,
+            )
+        q_lo = self.pool.q_lo.to(device=q0.device, dtype=q0.dtype)
+        q_hi = self.pool.q_hi.to(device=q0.device, dtype=q0.dtype)
+        q0 = q0.clamp(q_lo, q_hi).to(parent["q0"].dtype)
+        v0 = v0.to(parent["v0"].dtype)
+        parent["q0"] = q0
+        parent["v0"] = v0
+        parent["state"] = torch.cat([q0, v0], dim=-1)
+
+        active = parent["active"].to(torch.bool)
+        child_hit = torch.where(
+            active,
+            parent["hit"] - offs.unsqueeze(1),
+            torch.full_like(parent["hit"], -1),
+        )
+        if bool((active & (child_hit < 1)).any()):
+            raise RuntimeError("timing MPC suffix moved beyond an active strike")
+        parent["hit"] = child_hit
+        parent["masks"] = self.pool.masks_for(child_hit, active, bucket)
+        goal_tth = torch.where(
+            active,
+            child_hit.to(q0.dtype) * float(self.pool.cfg.dt),
+            torch.zeros_like(child_hit, dtype=q0.dtype),
+        )
+        context_updates = {"goal_tth": goal_tth}
+        if hasattr(parent["context"], "yaw_now"):
+            yaw_now = getattr(parent["context"], "yaw_now")
+            if yaw_now is not None:
+                yaw_i = tuple(self.pool.cfg.joint_names).index("waist_yaw_joint")
+                context_updates["yaw_now"] = q0[:, yaw_i]
+        parent["context"] = replace(parent["context"], **context_updates)
+
+        strike = parent["strike"]
+        strike_updates = {
+            "hit_index": effective_hits(child_hit, active, bucket),
+        }
+        for name in ("waist_yaw_ref", "waist_pr_ref"):
+            ref = getattr(strike, name, None)
+            if ref is not None:
+                strike_updates[name] = _shift_time_rows(ref, offs)
+        parent["strike"] = replace(strike, **strike_updates)
+
+        shifted, _valid = shift_plan(selected, offs)
+        shifted = shifted * parent["masks"].elem_mask.to(shifted.dtype)
+        parent["seed"] = shifted.clone()
+        parent["init"] = shifted.clone()
+        parent["mpc_init"] = torch.ones(rows, device=shifted.device, dtype=torch.bool)
+        parent["al_ok"] = torch.ones(rows, device=shifted.device, dtype=torch.bool)
+        parent["voxel_kind"] = torch.zeros(rows, device=shifted.device, dtype=torch.long)
+        parent.pop("replay_loc", None)
+        self.last_advance_offset_mean = float(offs.float().mean().item())
+        self.last_advance_seconds_mean = (
+            self.last_advance_offset_mean * float(self.pool.cfg.dt)
+        )
+        self.last_unique_parent_frac = float(idx.unique().numel()) / float(max(rows, 1))
+        return parent
+
+    @torch.no_grad()
+    def refresh(
+        self,
+        bucket: int,
+        batch: dict,
+        traj: torch.Tensor,
+        *,
+        hard_ok: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> int:
+        del generator
+        bucket = int(bucket)
+        n = int(batch["q0"].shape[0])
+        if traj.ndim != 3 or int(traj.shape[0]) != n or int(traj.shape[1]) != bucket:
+            raise ValueError(
+                f"parent trajectory shape {tuple(traj.shape)} does not match "
+                f"batch ({n}, {bucket}, D)"
+            )
+        mask = hard_ok.to(device=traj.device, dtype=torch.bool).reshape(-1)
+        if int(mask.numel()) != n:
+            raise ValueError("hard_ok must have one value per batch row")
+
+        # A timing child must actually advance.  Rows whose nearest active hit
+        # is already at knot 1 have no valid pre-hit suffix and are not stored.
+        active = batch["active"].to(device=traj.device, dtype=torch.bool)
+        hit = batch["hit"].to(device=traj.device, dtype=torch.long)
+        span = torch.where(active, hit, torch.full_like(hit, bucket))
+        advanceable = span.min(dim=1).values > 1
+        idx = (mask & advanceable).nonzero(as_tuple=True)[0]
+        if not int(idx.numel()):
+            # Retain previously certified full parents. A quiet ingress step
+            # must not erase the reuse window the pool exists to provide.
+            self.generation[bucket] = self.generation.get(bucket, 0) + 1
+            return 0
+
+        parent = _index_batch(batch, idx)
+        selected = traj.detach().index_select(0, idx)
+        rows = int(selected.shape[0])
+        # Keep the full certified parent exactly once. ``batch`` materializes a
+        # fresh random suffix from it on every draw, including duplicate draws
+        # of the same parent within one actor minibatch.
+        parent["_parent_traj"] = selected.clone()
+        # The original initializer is dead once the actor has produced this
+        # certified parent. Avoid retaining two more HxD tensors; ``batch``
+        # reconstructs both seed/init from the sampled parent suffix.
+        parent.pop("seed", None)
+        parent.pop("init", None)
+        parent["mpc_init"] = torch.ones(rows, device=selected.device, dtype=torch.bool)
+        parent["al_ok"] = torch.ones(rows, device=selected.device, dtype=torch.bool)
+        parent["voxel_kind"] = torch.zeros(rows, device=selected.device, dtype=torch.long)
+        parent.pop("replay_loc", None)
+        parent = _detach_batch(parent, device=self.device)
+        previous = self.data.get(bucket)
+        merged = parent if previous is None else _cat_phase2_batches([previous, parent])
+        total = int(merged["q0"].shape[0])
+        if total > self.capacity:
+            keep = torch.arange(
+                total - self.capacity, total, device=self.device,
+            )
+            merged = _index_batch(merged, keep)
+        self.data[bucket] = merged
+        self.generation[bucket] = self.generation.get(bucket, 0) + 1
+        return rows
+
+    def state_dict(self) -> dict:
+        return {
+            "version": 3,
+            "mode": "trajectory_parent_pool",
+            "generation": dict(self.generation),
+            "data": {
+                int(bucket): _detach_batch(batch, device="cpu")
+                for bucket, batch in self.data.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        version = int(state.get("version", -1))
+        self.generation = {
+            int(bucket): int(value)
+            for bucket, value in state.get("generation", {}).items()
+        }
+        if version in (1, 2):
+            # V1 retained stale state/TTH; V2 stored only one already-selected
+            # suffix. Neither contains the certified full parent trajectory
+            # needed for sample-time offset selection. Refill from live actor
+            # outputs on the next visit to each bucket.
+            self.dropped_legacy_rows = sum(
+                int(batch["q0"].shape[0])
+                for batch in state.get("data", {}).values()
+            )
+            self.data = {}
+            return
+        if version != 3 or state.get("mode") != "trajectory_parent_pool":
+            raise ValueError("unsupported trajectory-parent MPC ring checkpoint")
+        self.data = {
+            int(bucket): _detach_batch(batch, device=self.device)
+            for bucket, batch in state.get("data", {}).items()
         }
 
 
@@ -7316,6 +8234,13 @@ class _VoxelTrainingState:
         parents = self.pool.keys(bucket=bucket, boundary=True)
         if not parents:
             return None
+        source = getattr(self, "source", None)
+        q_bounds = None
+        if source is not None and hasattr(source, "q_lo") and hasattr(source, "q_hi"):
+            q_bounds = (
+                source.q_lo.detach().cpu().numpy(),
+                source.q_hi.detach().cpu().numpy(),
+            )
         for _ in range(max(16, len(parents))):
             parent = parents[int(rng.integers(0, len(parents)))]
             cfg = getattr(self, "cfg", None)
@@ -7329,6 +8254,14 @@ class _VoxelTrainingState:
                 continue
             available = []
             for proposal in proposals:
+                # Positional expansion can step through a face of the hard
+                # joint box.  Such a cell cannot be materialized and is not a
+                # useful unknown probe, so discard it before it enters the
+                # retry buffer.
+                if q_bounds is not None and not self.pool.q0_cell_intersects_bounds(
+                    proposal.key, q_lo=q_bounds[0], q_hi=q_bounds[1],
+                ):
+                    continue
                 candidate = ProbeCandidateKey(proposal.key, proposal.hit_pair)
                 if candidate in self.probes:
                     continue
@@ -7721,6 +8654,77 @@ def _index_batch(batch: dict, idx: torch.Tensor) -> dict:
                 fv.index_select(0, idx) if torch.is_tensor(fv) else fv
             )
         out[key] = type(val)(**kwargs)
+    return out
+
+
+def _split_timing_superbatch(
+    batch: dict,
+    minibatch_size: int,
+    factor: int,
+    *,
+    generator: torch.Generator,
+) -> list[dict]:
+    """Shuffle/split a timing batch without separating a task's timing rows.
+
+    Boundary and interior rows share ``timing_primary_group`` and must stay in
+    one actor minibatch because interiors reuse their group's selected frontier.
+    Ungrouped MPC/anchor rows are independently shuffled and divided evenly.
+    """
+    b = _train_batch_rows(batch)
+    minibatch_size = int(minibatch_size)
+    factor = int(factor)
+    if b != minibatch_size * factor:
+        raise ValueError(
+            f"superbatch rows {b} != minibatch_size*factor "
+            f"({minibatch_size}*{factor})"
+        )
+    device = batch["q0"].device
+    groups = batch.get("timing_primary_group")
+    if not torch.is_tensor(groups) or not bool((groups >= 0).any()):
+        order = torch.randperm(b, device=device, generator=generator)
+        return [
+            _index_batch(batch, order[i * minibatch_size:(i + 1) * minibatch_size])
+            for i in range(factor)
+        ]
+
+    grouped = groups >= 0
+    group_ids = groups[grouped].unique(sorted=True)
+    if int(group_ids.numel()) % factor:
+        raise ValueError("timing task groups must divide evenly across superbatch slices")
+    group_ids = group_ids.index_select(
+        0,
+        torch.randperm(int(group_ids.numel()), device=device, generator=generator),
+    )
+    ungrouped_rows = (~grouped).nonzero(as_tuple=True)[0]
+    ungrouped_rows = ungrouped_rows.index_select(
+        0,
+        torch.randperm(int(ungrouped_rows.numel()), device=device, generator=generator),
+    )
+    groups_per_slice = int(group_ids.numel()) // factor
+    ungrouped_per_slice = int(ungrouped_rows.numel()) // factor
+    if int(ungrouped_rows.numel()) != ungrouped_per_slice * factor:
+        raise ValueError("ungrouped timing rows must divide evenly across superbatch slices")
+
+    out = []
+    for i in range(factor):
+        chosen_groups = group_ids[
+            i * groups_per_slice:(i + 1) * groups_per_slice
+        ]
+        chosen_mask = (groups[:, None] == chosen_groups[None, :]).any(dim=1)
+        rows = torch.cat((
+            chosen_mask.nonzero(as_tuple=True)[0],
+            ungrouped_rows[i * ungrouped_per_slice:(i + 1) * ungrouped_per_slice],
+        ))
+        if int(rows.numel()) != minibatch_size:
+            raise ValueError(
+                f"timing superbatch slice has {int(rows.numel())} rows, "
+                f"expected {minibatch_size}"
+            )
+        rows = rows.index_select(
+            0,
+            torch.randperm(minibatch_size, device=device, generator=generator),
+        )
+        out.append(_index_batch(batch, rows))
     return out
 
 
@@ -8538,6 +9542,16 @@ def _timing_assist_batch(
         active, directions, horizon=int(batch["bucket"]),
         step=int(tc.coarse_step_knots),
     )
+    terminal_unlocked = bool(getattr(critic, "terminal_band_unlocked", True))
+    latch_floor_wp = 1 if terminal_unlocked else int(tc.short_floor_wp)
+    boundary_floor_wp = int(getattr(critic, "boundary_floor_wp", 1))
+    terminal_floor_wp = max(latch_floor_wp, boundary_floor_wp)
+    if terminal_floor_wp > 1:
+        pairs = torch.where(
+            active[:, None, :].bool(),
+            pairs.clamp_min(terminal_floor_wp),
+            torch.full_like(pairs, -1),
+        )
     k = int(pairs.shape[1])
     repeated_rows = rows.repeat_interleave(k)
     candidate = _index_batch(batch, repeated_rows)
@@ -8647,6 +9661,8 @@ def _timing_assist_batch(
         f"{detail_prefix}_selected_tth_p50_s": _median_or_zero(active_tth),
         f"{detail_prefix}_anchor_pred_fail": float((~anchor_ok).sum()),
         f"{detail_prefix}_ray_all_pred_pass": float((first_fail == k).sum()),
+        f"{detail_prefix}_terminal_floor_wp": float(terminal_floor_wp),
+        f"{detail_prefix}_terminal_unlocked": float(terminal_unlocked),
     }
 
 
@@ -9421,6 +10437,31 @@ def _timing_primary_layout(
     return base, anchor, boundary, interior, b - anchor - boundary - interior
 
 
+def _timing_curriculum_group_count(
+    *,
+    base_tasks: int,
+    curriculum_open: bool,
+    curriculum_open_actor_step: int | None,
+    actor_step: int,
+    ramp_steps: int,
+) -> int:
+    """Return complete expanded timing-task groups for an enabled ramp.
+
+    ``None`` opening provenance denotes an old checkpoint which was already
+    open before progressive ramps existed; continuing it fully open is safer
+    than silently changing its batch distribution on resume.
+    """
+    if not curriculum_open:
+        return 0
+    if int(ramp_steps) <= 0 or curriculum_open_actor_step is None:
+        return int(base_tasks)
+    elapsed = max(0, int(actor_step) - int(curriculum_open_actor_step))
+    return min(
+        int(base_tasks),
+        int(base_tasks) * elapsed // int(ramp_steps),
+    )
+
+
 def _expand_timing_base_tasks(
     batch: dict,
     *,
@@ -9444,6 +10485,45 @@ def _expand_timing_base_tasks(
         n, device=batch["q0"].device, dtype=torch.long,
     ).repeat_interleave(per_task)
     return out
+
+
+@torch.no_grad()
+def _apply_terminal_initializer(
+    core,
+    batch: dict,
+    *,
+    pool: Phase2Pool | None = None,
+    generator: torch.Generator | None = None,
+    start_anchored_noise: bool = False,
+    noise_ramp_steps: int = 5,
+) -> bool:
+    """Replace fresh-scenario seeds with the frozen terminal-head seed."""
+    initializer = getattr(core, "terminal_initializer", None)
+    if initializer is None:
+        return False
+    seed = core.initial_trajectory(batch["context"], batch["state"], batch["masks"])
+    fresh = ~batch.get(
+        "mpc_init",
+        torch.zeros(seed.shape[0], device=seed.device, dtype=torch.bool),
+    ).bool()
+    if start_anchored_noise:
+        if pool is None:
+            raise ValueError("terminal init noise requires the Phase2Pool")
+        H = int(seed.shape[1])
+        noisy = pool.noised_init(seed, H, generator=generator)
+        # The decoder trajectory starts at t=dt; measured q0/qd0 live at t=0
+        # outside this tensor. Extending this cubic envelope to t=0 gives zero
+        # perturbation and zero first derivative there, then reaches the usual
+        # OU amplitude after ``noise_ramp_steps`` knots.
+        ramp_n = max(int(noise_ramp_steps), 1)
+        u = torch.arange(
+            1, H + 1, device=seed.device, dtype=seed.dtype,
+        ).clamp_max(ramp_n) / float(ramp_n)
+        envelope = (u.square() * (3.0 - 2.0 * u)).view(1, H, 1)
+        seed = seed + envelope * (noisy - seed)
+        seed = seed * batch["masks"].elem_mask
+    batch["init"] = torch.where(fresh[:, None, None], seed, batch["init"])
+    return True
 
 
 def _ls_probe_scalar_F(
@@ -9473,6 +10553,7 @@ def _ls_probe_scalar_F(
     dtype,
     amp,
     rec,
+    generator: torch.Generator | None = None,
     torque_grad_scale: float = 1.0,
     return_tensor: bool = False,
 ) -> float | torch.Tensor:
@@ -9502,6 +10583,12 @@ def _ls_probe_scalar_F(
             else torch.autocast(device_type="cuda", enabled=False))
     with ctxm:
         enc = encode_step(batch["context"])
+        core = model.module if hasattr(model, "module") else model
+        terminal_reseeded = _apply_terminal_initializer(
+            core, batch, pool=pool, generator=generator,
+            start_anchored_noise=bool(cfg.terminal_init_noise),
+            noise_ramp_steps=int(cfg.terminal_init_noise_ramp_steps),
+        )
         if cfg.waist_sp_from_head:
             sp = enc.waist_yaw_sp.float()
             strike = replace(
@@ -9519,15 +10606,16 @@ def _ls_probe_scalar_F(
                 dt=float(getattr(pool.cfg, "dt", 0.02)),
                 ease_wp=getattr(pool.cfg, "waist_upright_ease_wp", None),
             )
-        fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
-        batch["init"] = correct_quintic_init_arms(
-            costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
-            batch["context"].goal_pos,
-            active=fresh_active, steps=1,
-            q_bounds=(pool.q_lo, pool.q_hi),
-            joint_names=base.joint_names, qd0=batch["v0"],
-            dt=float(getattr(pool.cfg, "dt", 0.02)),
-        )
+        if not terminal_reseeded:
+            fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
+            batch["init"] = correct_quintic_init_arms(
+                costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
+                batch["context"].goal_pos,
+                active=fresh_active, steps=1,
+                q_bounds=(pool.q_lo, pool.q_hi),
+                joint_names=base.joint_names, qd0=batch["v0"],
+                dt=float(getattr(pool.cfg, "dt", 0.02)),
+            )
         step_out = step_fns[bucket](
             batch["init"], batch["state"], batch["q0"], batch["v0"],
             enc, batch["masks"], strike, lengths, w,
@@ -9577,43 +10665,39 @@ def _ls_probe_scalar_F(
             )
         loss_bptt = torch.zeros((), device=device)
 
-        loss_sfx_cost = torch.zeros((), device=device)
         loss_sfx_tie = torch.zeros((), device=device)
         loss_mpc_tie = torch.zeros((), device=device)
+        loss_waist_mpc_tie = torch.zeros((), device=device)
+        waist_mpc_tie_grad = torch.zeros((), device=device)
         if cfg.w_mpc_init_tie > 0.0:
             loss_mpc_tie, _ = mpc_init_tie_loss(
                 _traj, batch["seed"], batch["masks"].elem_mask,
                 batch["mpc_init"],
             )
-        if sfx_fns and sfx_ramp > 0.0:
-            if samples.suffix_offs is None:
-                raise ReplayIncompleteError(
-                    "suffix term active but suffix_offs not recorded"
+        if cfg.w_waist_yaw_mpc_tie > 0.0:
+            loss_waist_mpc_tie, _, waist_mpc_tie_grad = (
+                waist_yaw_mpc_init_tie_loss(
+                    _traj, batch["seed"], batch["masks"].elem_mask,
+                    batch["mpc_init"], yaw_index=yaw_i,
                 )
-            sf = _suffix_rows(batch, cfg.suffix_frac)
-            act_sf = batch["active"].index_select(0, sf)
-            offs = samples.suffix_offs
-            hit_sf = torch.where(act_sf.bool(),
-                                 batch["hit"].index_select(0, sf) - offs.unsqueeze(1),
-                                 batch["hit"].index_select(0, sf))
-            masks_sf = pool.masks_for(hit_sf.clamp_min(0), act_sf, bucket)
-            hit_eff_sf = effective_hits(hit_sf, act_sf, bucket)
-            strike_sf = replace(_strike_rows(batch["strike"], sf),
-                                hit_index=hit_eff_sf, waist_yaw_ref=None)
-            if cfg.waist_pr_sp_from_head:
-                strike_sf = replace(strike_sf, waist_pr_ref=None)
-            enc_sf = _index_encoded(enc, sf)
-            loss_sfx_cost, loss_sfx_tie, *_suffix_diagnostics = sfx_fns[bucket](
-                _traj.index_select(0, sf), batch["q0"].index_select(0, sf),
-                batch["v0"].index_select(0, sf), enc_sf,
-                batch["masks"].elem_mask.index_select(0, sf), masks_sf, strike_sf,
-                group_lengths(hit_eff_sf), _index_batch_weights(w, sf, bs), offs,
+            )
+        if sfx_fns and sfx_ramp > 0.0:
+            suffix_batch = samples.extras.get("suffix_replay_batch")
+            if samples.suffix_offs is None or suffix_batch is None:
+                raise ReplayIncompleteError(
+                    "suffix replay active but frozen batch/offsets not recorded"
+                )
+            loss_sfx_tie, *_suffix_diagnostics = _suffix_distill_loss(
+                suffix_batch, samples.suffix_offs,
+                bucket=bucket, encode_step=encode_step,
+                suffix_fn=sfx_fns[bucket], pool=pool,
+                microbatch=int(cfg.suffix_microbatch),
             )
         extra = (
             cfg.w_tc * loss_tc + cfg.w_bptt * loss_bptt
             + cfg.w_mpc_init_tie * loss_mpc_tie
-            + sfx_ramp * (cfg.w_suffix_cost * loss_sfx_cost
-                          + cfg.w_suffix_tie * loss_sfx_tie)
+            + cfg.w_waist_yaw_mpc_tie * loss_waist_mpc_tie
+            + sfx_ramp * cfg.w_suffix_tie * loss_sfx_tie
         )
         if (
             cfg.dls_terminal_frac > 0.0
@@ -9824,9 +10908,11 @@ def train_phase2(
     library=None,
     al_state: dict | None = None,
     opt_state: dict | None = None,
+    rng_state: dict | None = None,
     line_search_state: dict | None = None,
     voxel_train_state: dict | None = None,
     timing_critic_state: dict | None = None,
+    suffix_replay_state: dict | None = None,
     probe_fn=None,
     stage_a_init: bool = False,
     max_hours: float | None = None,
@@ -9897,6 +10983,9 @@ def train_phase2(
         or cfg.w_waist_pr_sp_distill or cfg.w_waist_sp_hold
         or cfg.w_waist_sp_smooth or cfg.waist_sp_search_frac
         or cfg.w_waist_sp_search or cfg.cost.w_waist_aim
+        or cfg.cost.w_waist_yaw_monotonic
+        or cfg.cost.w_waist_yaw_accel_direction
+        or cfg.cost.w_waist_yaw_initial_accel_direction
     ):
         raise ValueError(
             "voxel_pool configuration was mutated to enable a forbidden "
@@ -9975,7 +11064,9 @@ def train_phase2(
             al.pen = dict(fresh.pen)
         for g in al.groups:
             al.lam[g] = float(min(max(al.lam[g], al.lam_min[g]), al.lam_max[g]))
-            al.pen[g] = float(min(max(al.pen[g], al.pen_min[g]), al.pen_max[g]))
+            al.pen[g] = clamp_resumed_al_penalty(
+                al.pen[g], al.pen_min[g], al.pen_max[g]
+            )
         if log and rank == 0:
             tw = limit_group_name("torque", "waist")
             print(f"[resume] AL config reapplied: rho_{tw}={al.rho[tw]:.4g} "
@@ -10014,8 +11105,13 @@ def train_phase2(
                              else None)
          for b in pool.buckets}
         if cfg.suffix_frac > 0.0
-        and (cfg.w_suffix_cost > 0.0 or cfg.w_suffix_tie > 0.0) else {}
+        and cfg.w_suffix_tie > 0.0 else {}
     )
+    suffix_ring = _VerifiedSuffixRing(
+        capacity=int(cfg.suffix_replay_capacity), device=device,
+    )
+    if suffix_replay_state:
+        suffix_ring.load_state_dict(suffix_replay_state)
     bptt_bucket = min(pool.buckets)
     bptt_fn = (
         make_bptt_step(model, costs[bptt_bucket], sim, cfg,
@@ -10026,7 +11122,12 @@ def train_phase2(
     # ONE flag decides whether a waist-yaw reference is harvested (the roller)
     # and stored (the replay pool); computing it once is what keeps the two
     # from disagreeing -- ``ReplayPool.add`` raises if they ever do.
-    want_waist_ref = cfg.cost.w_waist_aim > 0.0 and not cfg.waist_sp_from_head
+    want_waist_ref = (
+        cfg.cost.w_waist_aim > 0.0
+        or cfg.cost.w_waist_yaw_monotonic > 0.0
+        or cfg.cost.w_waist_yaw_accel_direction > 0.0
+        or cfg.cost.w_waist_yaw_initial_accel_direction > 0.0
+    ) and not cfg.waist_sp_from_head
     want_waist_pr_ref = bool(cfg.waist_pr_ema) and not cfg.waist_pr_sp_from_head
     replay = None
     post_hit = None
@@ -10162,9 +11263,16 @@ def train_phase2(
     sfx_gen.manual_seed(int(cfg.seed) + 4243 + 101 * rank)
     jit_gen = torch.Generator(device=device)
     jit_gen.manual_seed(int(cfg.seed) + 5501 + 101 * rank)
+    phase2_rng_streams = {
+        "gen": gen,
+        "sfx_gen": sfx_gen,
+        "jit_gen": jit_gen,
+        "rng": rng,
+    }
 
     timing_critic = None
     timing_mpc_ring = None
+    timing_critic_pending: list[dict] = []
     if cfg.timing_critic.enabled:
         trainer_cls = (
             OnlineDistributionalCriticTrainer
@@ -10179,6 +11287,16 @@ def train_phase2(
         )
         if timing_critic_state:
             timing_critic.load_state_dict(timing_critic_state)
+            for item in timing_critic_state.get("pending_observations", []):
+                timing_critic_pending.append({
+                    "features": item["features"].detach().cpu(),
+                    "gate": item["gate"].detach().cpu(),
+                    "anchor": (
+                        None if item.get("anchor") is None
+                        else item["anchor"].detach().cpu().bool()
+                    ),
+                    "actor_step": int(item["actor_step"]),
+                })
         if log and rank == 0:
             restored = " restored" if timing_critic_state else " fresh"
             print(
@@ -10193,11 +11311,52 @@ def train_phase2(
             cfg.timing_critic.representation == "distributional"
             and cfg.timing_critic.anchor_curriculum
         ):
-            timing_mpc_ring = _VoxelMPCParentRing(device=device)
+            timing_mpc_ring = _TrajectorySuffixMPCParentRing(
+                device=device,
+                pool=pool,
+                costs=costs,
+                q_noise=cfg.timing_mpc_q_noise,
+                qd_noise=cfg.timing_mpc_qd_noise,
+                capacity=cfg.timing_mpc_parent_capacity,
+                terminal_peak_frac=cfg.terminal_suffix_peak_frac,
+                terminal_long_frac=cfg.terminal_suffix_long_frac,
+                terminal_low_frac=cfg.terminal_suffix_low_frac,
+                terminal_peak_wp=cfg.terminal_suffix_peak_wp,
+                terminal_tail_tau=cfg.terminal_suffix_tail_tau,
+            )
             if timing_critic_state and timing_critic_state.get("primary_mpc_ring"):
                 timing_mpc_ring.load_state_dict(
                     timing_critic_state["primary_mpc_ring"]
                 )
+                if log and rank == 0 and timing_mpc_ring.dropped_legacy_rows:
+                    print(
+                        "[timing-critic] discarded "
+                        f"{timing_mpc_ring.dropped_legacy_rows} legacy MPC rows "
+                        "without advanced state/TTH; buckets refill on next visit",
+                        flush=True,
+                    )
+
+    def _flush_timing_critic_pending() -> None:
+        if timing_critic is None or not timing_critic_pending:
+            return
+        pending = list(timing_critic_pending)
+        timing_critic_pending.clear()
+        features = torch.cat([item["features"] for item in pending], dim=0)
+        gates = torch.cat([item["gate"] for item in pending], dim=0)
+        actor_step = max(int(item["actor_step"]) for item in pending)
+        kwargs = {
+            "actor_step": actor_step,
+            "batch_size_multiplier": len(pending),
+        }
+        if cfg.timing_critic.representation == "distributional":
+            anchors = [item["anchor"] for item in pending]
+            kwargs["anchor_mask"] = torch.cat(anchors, dim=0)
+        timing_critic.observe_gate(features, gates, **kwargs)
+    if int(cfg.actor_superbatch_factor) > 1 and timing_mpc_ring is None:
+        raise ValueError(
+            "actor_superbatch_factor > 1 currently requires the "
+            "distributional anchor timing curriculum"
+        )
 
     voxel_state = None
     voxel_mpc_ring = None
@@ -10274,8 +11433,22 @@ def train_phase2(
 
     def _train_checkpoint_extra(extra: dict | None = None) -> dict:
         out = dict(extra or {})
+        if sfx_fns:
+            out["suffix_replay"] = suffix_ring.state_dict()
         if timing_critic is not None:
             timing_state = timing_critic.state_dict()
+            timing_state["pending_observations"] = [
+                {
+                    "features": item["features"].clone(),
+                    "gate": item["gate"].clone(),
+                    "anchor": (
+                        None if item["anchor"] is None
+                        else item["anchor"].clone()
+                    ),
+                    "actor_step": int(item["actor_step"]),
+                }
+                for item in timing_critic_pending
+            ]
             if timing_mpc_ring is not None:
                 timing_state["primary_mpc_ring"] = timing_mpc_ring.state_dict()
             out["timing_critic"] = timing_state
@@ -10327,6 +11500,15 @@ def train_phase2(
         ls_rt.al_lam_snapshot = dict(al.lam)
         ls_rt.al_pen_snapshot = dict(al.pen)
         ls_rt.stage_a_snapshot = bool(stage_a_init)
+
+    # Restore only after resume-time setup (including voxel priming and line
+    # search construction) so those deterministic setup draws cannot shift the
+    # first resumed update.  A fresh run has ``rng_state=None`` and follows the
+    # exact historical manual-seed path above.
+    if rng_state is not None:
+        restored_rng = _restore_phase2_rng_state(rng_state, phase2_rng_streams)
+        if restored_rng and log and rank == 0:
+            print(f"[resume] RNG state restored ({restored_rng})", flush=True)
 
     fh = open(run_dir / "metrics.jsonl", "a") if rank == 0 else None
     tb = MetricsTensorboard(
@@ -10390,6 +11572,7 @@ def train_phase2(
     ss_acc, ss_n = [0.0, 0.0, 0.0], 0
     sfx_acc, sfx_n = [0.0, 0.0], 0
     mpc_tie_acc, mpc_tie_frac_acc, mpc_tie_n = 0.0, 0.0, 0
+    waist_mpc_tie_acc, waist_mpc_tie_grad_acc, waist_mpc_tie_n = 0.0, 0.0, 0
     viol_acc = {g: 0.0 for g in CONSTRAINT_GROUPS}
     viol_n = 0
     best = -1.0
@@ -10427,6 +11610,9 @@ def train_phase2(
     # ``lo_limits`` until the first rolling eval -- a 5 % torque price for
     # ``eval_every`` steps, on a model whose torque term is the binding gate.
     stage_a = bool(stage_a_init)
+    # Ephemeral by design: checkpoints resume at the next freshly generated
+    # super-batch instead of serializing several large collocation slices.
+    actor_superbatch_queue: deque[dict] = deque()
 
     deadline = None if max_hours is None else t0 + 3600.0 * float(max_hours)
     start_step = int(start_step)
@@ -10474,6 +11660,7 @@ def train_phase2(
             )
     for step in range(start_step, int(cfg.max_steps)):
         grad_term_probe = None
+        waist_mpc_param_grad_norm = None
         gb_stats: dict[str, float] = {}
         if _ShutdownFlag.requested:
             stopped = "signal"
@@ -10552,6 +11739,9 @@ def train_phase2(
         critic_extra_observations = []
         include_bptt_step = False
         sfx_ramp_step = 0.0
+        suffix_replay_batch = None
+        suffix_replay_offs = None
+        suffix_replay_fill = 0.0
         ls_log: dict = {}
         commit_side_effects = True
 
@@ -10623,6 +11813,12 @@ def train_phase2(
             )
         batch = None
         use_replay = False
+        if actor_superbatch_queue:
+            batch = _detach_batch(actor_superbatch_queue.popleft(), device=device)
+            use_replay = bool(batch["mpc_init"].any())
+            roll_acc["actor_superbatch_cached_rows"] = (
+                roll_acc.get("actor_superbatch_cached_rows", 0.0) + float(bs)
+            )
         idle_far_cloud = (
             frontier_cloud is not None and bool(cfg.frontier_idle_far_cloud)
         )
@@ -10642,48 +11838,145 @@ def train_phase2(
                 yaw_i=yaw_i, step=step,
             )
         if batch is None and timing_mpc_ring is not None:
+            draw_bs = int(bs) * int(cfg.actor_superbatch_factor)
             (
                 base_n, anchor_n, boundary_n, interior_n, mpc_n,
-            ) = _timing_primary_layout(bs, cfg.timing_critic)
+            ) = _timing_primary_layout(draw_bs, cfg.timing_critic)
             live_n = sum(post_hit.size(b) for b in post_hit.data)
             kind_fracs = cfg.effective_kind_fracs(
                 pool, extra_counts={KIND_POST_HIT: live_n},
             )
             timing_n = anchor_n + boundary_n + interior_n
-            if bool(timing_critic.curriculum_open):
-                base_batch = _sample_fresh_batch(
-                    pool, bucket, base_n, generator=gen,
-                    kind_fracs=kind_fracs, live_post_hit=None,
-                    short_wp=cfg.short_wp, short_boost=cfg.short_boost,
-                    noise=True,
-                )
-                timing_part = _expand_timing_base_tasks(
-                    base_batch,
-                    anchor_per_task=(
-                        cfg.timing_critic.primary_anchor_per_task
-                    ),
-                    boundary_per_task=(
-                        cfg.timing_critic.primary_boundary_per_task
-                    ),
-                    interior_per_task=(
-                        cfg.timing_critic.primary_interior_per_task
-                    ),
-                )
+            ramp_steps = int(cfg.timing_critic.anchor_curriculum_ramp_steps)
+            # Keep the old branch structurally intact when the new feature is
+            # disabled.  In particular, it makes exactly the old random draws.
+            if ramp_steps <= 0:
+                if bool(timing_critic.curriculum_open):
+                    base_batch = _sample_fresh_batch(
+                        pool, bucket, base_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    timing_part = _expand_timing_base_tasks(
+                        base_batch,
+                        anchor_per_task=(
+                            cfg.timing_critic.primary_anchor_per_task
+                        ),
+                        boundary_per_task=(
+                            cfg.timing_critic.primary_boundary_per_task
+                        ),
+                        interior_per_task=(
+                            cfg.timing_critic.primary_interior_per_task
+                        ),
+                    )
+                    expanded_n = base_n
+                    independent_anchor_n = 0
+                else:
+                    # Before calibration opens, maximize state/task diversity:
+                    # every neural timing slot is a distinct horizon anchor.
+                    timing_part = _sample_fresh_batch(
+                        pool, bucket, timing_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    timing_part["timing_primary_kind"] = torch.zeros(
+                        timing_n, device=device, dtype=torch.long,
+                    )
+                    timing_part["timing_primary_group"] = torch.full(
+                        (timing_n,), -1, device=device, dtype=torch.long,
+                    )
+                    expanded_n = 0
+                    independent_anchor_n = timing_n
+                ramp_fraction = float(bool(timing_critic.curriculum_open))
             else:
-                # Before calibration opens, maximize state/task diversity:
-                # every neural timing slot is a distinct horizon anchor.
-                timing_part = _sample_fresh_batch(
-                    pool, bucket, timing_n, generator=gen,
-                    kind_fracs=kind_fracs, live_post_hit=None,
-                    short_wp=cfg.short_wp, short_boost=cfg.short_boost,
-                    noise=True,
+                expanded_n = _timing_curriculum_group_count(
+                    base_tasks=base_n,
+                    curriculum_open=bool(timing_critic.curriculum_open),
+                    curriculum_open_actor_step=getattr(
+                        timing_critic, "curriculum_open_actor_step", None,
+                    ),
+                    actor_step=int(step),
+                    ramp_steps=ramp_steps,
                 )
-                timing_part["timing_primary_kind"] = torch.zeros(
-                    timing_n, device=device, dtype=torch.long,
+                # Superbatch splitting keeps every timing group intact and
+                # needs an equal number of groups per future minibatch.
+                # Quantize only the enabled ramp; the ordinary B=512 path is
+                # unaffected.
+                superbatch_factor = int(cfg.actor_superbatch_factor)
+                expanded_n -= expanded_n % superbatch_factor
+                independent_anchor_n = timing_n - expanded_n * (
+                    int(cfg.timing_critic.primary_anchor_per_task)
+                    + int(cfg.timing_critic.primary_boundary_per_task)
+                    + int(cfg.timing_critic.primary_interior_per_task)
                 )
-                timing_part["timing_primary_group"] = torch.full(
-                    (timing_n,), -1, device=device, dtype=torch.long,
-                )
+                ramp_fraction = float(timing_critic.curriculum_ramp_fraction(step))
+                if expanded_n == 0:
+                    timing_part = _sample_fresh_batch(
+                        pool, bucket, timing_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    timing_part["timing_primary_kind"] = torch.zeros(
+                        timing_n, device=device, dtype=torch.long,
+                    )
+                    timing_part["timing_primary_group"] = torch.full(
+                        (timing_n,), -1, device=device, dtype=torch.long,
+                    )
+                elif independent_anchor_n == 0:
+                    base_batch = _sample_fresh_batch(
+                        pool, bucket, base_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    timing_part = _expand_timing_base_tasks(
+                        base_batch,
+                        anchor_per_task=(
+                            cfg.timing_critic.primary_anchor_per_task
+                        ),
+                        boundary_per_task=(
+                            cfg.timing_critic.primary_boundary_per_task
+                        ),
+                        interior_per_task=(
+                            cfg.timing_critic.primary_interior_per_task
+                        ),
+                    )
+                else:
+                    base_batch = _sample_fresh_batch(
+                        pool, bucket, expanded_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    expanded_part = _expand_timing_base_tasks(
+                        base_batch,
+                        anchor_per_task=(
+                            cfg.timing_critic.primary_anchor_per_task
+                        ),
+                        boundary_per_task=(
+                            cfg.timing_critic.primary_boundary_per_task
+                        ),
+                        interior_per_task=(
+                            cfg.timing_critic.primary_interior_per_task
+                        ),
+                    )
+                    anchor_part = _sample_fresh_batch(
+                        pool, bucket, independent_anchor_n, generator=gen,
+                        kind_fracs=kind_fracs, live_post_hit=None,
+                        short_wp=cfg.short_wp, short_boost=cfg.short_boost,
+                        noise=True,
+                    )
+                    anchor_part["timing_primary_kind"] = torch.zeros(
+                        independent_anchor_n, device=device, dtype=torch.long,
+                    )
+                    anchor_part["timing_primary_group"] = torch.full(
+                        (independent_anchor_n,), -1, device=device,
+                        dtype=torch.long,
+                    )
+                    timing_part = _cat_phase2_batches([expanded_part, anchor_part])
 
             parts = [timing_part]
             if mpc_n > 0 and timing_mpc_ring.size(bucket) > 0:
@@ -10707,6 +12000,18 @@ def train_phase2(
                 roll_acc["timing_primary_mpc"] = (
                     roll_acc.get("timing_primary_mpc", 0.0) + float(mpc_n)
                 )
+                roll_acc["timing_mpc_unique_parent_frac"] = (
+                    roll_acc.get("timing_mpc_unique_parent_frac", 0.0)
+                    + timing_mpc_ring.last_unique_parent_frac
+                )
+                roll_acc["timing_mpc_advance_wp"] = (
+                    roll_acc.get("timing_mpc_advance_wp", 0.0)
+                    + timing_mpc_ring.last_advance_offset_mean
+                )
+                roll_acc["timing_mpc_advance_s"] = (
+                    roll_acc.get("timing_mpc_advance_s", 0.0)
+                    + timing_mpc_ring.last_advance_seconds_mean
+                )
             elif mpc_n > 0:
                 # A cold or failed preceding generation has no safe MPC rows.
                 # Fill with independent anchors, not duplicate base tasks.
@@ -10728,23 +12033,83 @@ def train_phase2(
                     + float(mpc_n)
                 )
             batch = _cat_phase2_batches(parts)
-            order = torch.randperm(bs, device=device, generator=gen)
-            batch = _index_batch(batch, order)
+            if int(cfg.actor_superbatch_factor) > 1:
+                slices = _split_timing_superbatch(
+                    batch, bs, int(cfg.actor_superbatch_factor), generator=gen,
+                )
+                batch = slices[0]
+                actor_superbatch_queue.extend(
+                    _detach_batch(part, device="cpu") for part in slices[1:]
+                )
+                del slices
+                roll_acc["actor_superbatch_generated_rows"] = (
+                    roll_acc.get("actor_superbatch_generated_rows", 0.0)
+                    + float(draw_bs)
+                )
+                roll_acc["actor_superbatch_refresh"] = (
+                    roll_acc.get("actor_superbatch_refresh", 0.0) + 1.0
+                )
+            else:
+                order = torch.randperm(draw_bs, device=device, generator=gen)
+                batch = _index_batch(batch, order)
             roll_acc["timing_primary_base_tasks"] = (
                 roll_acc.get("timing_primary_base_tasks", 0.0)
-                + float(base_n if timing_critic.curriculum_open else timing_n)
+                + float(expanded_n + independent_anchor_n)
             )
             roll_acc["timing_primary_anchor"] = (
                 roll_acc.get("timing_primary_anchor", 0.0)
-                + float(anchor_n if timing_critic.curriculum_open else timing_n)
+                + float(
+                    expanded_n * int(cfg.timing_critic.primary_anchor_per_task)
+                    + independent_anchor_n
+                )
             )
             roll_acc["timing_primary_boundary"] = (
                 roll_acc.get("timing_primary_boundary", 0.0)
-                + float(boundary_n if timing_critic.curriculum_open else 0)
+                + float(
+                    expanded_n * int(cfg.timing_critic.primary_boundary_per_task)
+                )
             )
             roll_acc["timing_primary_interior"] = (
                 roll_acc.get("timing_primary_interior", 0.0)
-                + float(interior_n if timing_critic.curriculum_open else 0)
+                + float(
+                    expanded_n * int(cfg.timing_critic.primary_interior_per_task)
+                )
+            )
+            selected_n = expanded_n * (
+                int(cfg.timing_critic.primary_boundary_per_task)
+                + int(cfg.timing_critic.primary_interior_per_task)
+            )
+            roll_acc["timing_curriculum_open"] = (
+                roll_acc.get("timing_curriculum_open", 0.0)
+                + float(timing_critic.curriculum_open)
+            )
+            roll_acc["timing_curriculum_open_step"] = (
+                roll_acc.get("timing_curriculum_open_step", 0.0)
+                + float(
+                    -1 if getattr(
+                        timing_critic, "curriculum_open_actor_step", None,
+                    ) is None else timing_critic.curriculum_open_actor_step
+                )
+            )
+            roll_acc["timing_curriculum_ramp_frac"] = (
+                roll_acc.get("timing_curriculum_ramp_frac", 0.0)
+                + ramp_fraction
+            )
+            roll_acc["timing_primary_expanded_tasks"] = (
+                roll_acc.get("timing_primary_expanded_tasks", 0.0)
+                + float(expanded_n)
+            )
+            roll_acc["timing_primary_independent_anchors"] = (
+                roll_acc.get("timing_primary_independent_anchors", 0.0)
+                + float(independent_anchor_n)
+            )
+            roll_acc["timing_primary_selected_frac_neural"] = (
+                roll_acc.get("timing_primary_selected_frac_neural", 0.0)
+                + float(selected_n) / max(float(timing_n), 1.0)
+            )
+            roll_acc["timing_primary_selected_frac_batch"] = (
+                roll_acc.get("timing_primary_selected_frac_batch", 0.0)
+                + float(selected_n) / max(float(draw_bs), 1.0)
             )
         if batch is None:
             use_replay = (
@@ -10860,6 +12225,8 @@ def train_phase2(
         timing_parent_batch = (
             _detach_batch(batch) if timing_mpc_ring is not None else None
         )
+        terminal_band_success = None
+        timing_boundary_success = None
         actual_bs = _require_train_batch_size(batch, bs, bucket)
         batch_b_acc += float(actual_bs)
         bucket_step_acc[int(bucket)] = bucket_step_acc.get(int(bucket), 0) + 1
@@ -10887,6 +12254,23 @@ def train_phase2(
                 w, batch["al_ok"], probe_penalty=float(cfg.voxel_probe_penalty),
             )
 
+        if sfx_fns:
+            suffix_replay_batch, suffix_replay_fill = suffix_ring.sample(
+                bucket, int(cfg.suffix_replay_batch),
+                min_parents=int(cfg.suffix_replay_min_parents),
+                generator=sfx_gen,
+            )
+            if suffix_replay_batch is not None:
+                suffix_replay_offs = terminal_mixture_suffix_offsets(
+                    suffix_replay_batch["hit"], suffix_replay_batch["active"],
+                    bucket, generator=sfx_gen,
+                    peak_frac=cfg.terminal_suffix_peak_frac,
+                    long_frac=cfg.terminal_suffix_long_frac,
+                    low_frac=cfg.terminal_suffix_low_frac,
+                    peak_wp=cfg.terminal_suffix_peak_wp,
+                    tail_tau=cfg.terminal_suffix_tail_tau,
+                )
+
         if (
             ls_rt is not None
             and replay_mgr is not None
@@ -10908,6 +12292,9 @@ def train_phase2(
                 ),
                 snapshot_mutable=True,
             )
+            if suffix_replay_batch is not None:
+                ls_rec.samples.suffix_offs = suffix_replay_offs.detach()
+                ls_rec.samples.extras["suffix_replay_batch"] = suffix_replay_batch
 
         if cfg.yaw_now_jitter > 0.0 and batch["context"].yaw_now is not None:
             # Perturb only the CONDITIONING token; q0, the cost and the stored
@@ -10943,7 +12330,7 @@ def train_phase2(
                 strike = replace(
                     strike, waist_pr_ref=pr.unsqueeze(1).expand(-1, bucket, -1)
                 )
-            if enc.waist_pr_sp is not None:
+            if enc.waist_pr_sp is not None and core.terminal_initializer is None:
                 # Quintic prior: ease P/R to the announced set-point, same job
                 # ``aim_yaw`` already does for the yaw column.  Detached inside
                 # ``seed_waist_pr_to_sp`` -- the seed is not a gradient path.
@@ -11026,18 +12413,30 @@ def train_phase2(
                 hit_eff = effective_hits(batch["hit"], batch["active"], bucket)
                 lengths = group_lengths(hit_eff)
                 strike = replace(strike, hit_index=hit_eff)
-            # Apply one geometric correction after timing selection has fixed
-            # every row. This replaces the former full-batch pass plus separate
-            # boundary/interior corrections.
-            fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
-            batch["init"] = correct_quintic_init_arms(
-                costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
-                batch["context"].goal_pos,
-                active=fresh_active, steps=1,
-                q_bounds=(pool.q_lo, pool.q_hi),
-                joint_names=base.joint_names, qd0=batch["v0"],
-                dt=float(getattr(pool.cfg, "dt", 0.02)),
+            # Build the frozen-head seed after timing selection has fixed every
+            # row. Legacy checkpoints retain their one geometric DLS correction.
+            terminal_reseeded = _apply_terminal_initializer(
+                core, batch, pool=pool, generator=gen,
+                start_anchored_noise=bool(cfg.terminal_init_noise),
+                noise_ramp_steps=int(cfg.terminal_init_noise_ramp_steps),
             )
+            if terminal_reseeded and enc.waist_pr_sp is not None:
+                batch["init"] = seed_waist_pr_to_sp(
+                    batch["init"], batch["q0"], batch["v0"], enc.waist_pr_sp,
+                    joint_names=base.joint_names,
+                    dt=float(getattr(pool.cfg, "dt", 0.02)),
+                    ease_wp=getattr(pool.cfg, "waist_upright_ease_wp", None),
+                )
+            if not terminal_reseeded:
+                fresh_active = batch["active"] & ~batch["mpc_init"].unsqueeze(-1)
+                batch["init"] = correct_quintic_init_arms(
+                    costs[bucket].fk, batch["init"], batch["q0"], batch["hit"],
+                    batch["context"].goal_pos,
+                    active=fresh_active, steps=1,
+                    q_bounds=(pool.q_lo, pool.q_hi),
+                    joint_names=base.joint_names, qd0=batch["v0"],
+                    dt=float(getattr(pool.cfg, "dt", 0.02)),
+                )
             if timing_parent_batch is not None:
                 all_rows = torch.arange(
                     int(batch["q0"].shape[0]), device=device,
@@ -11104,6 +12503,10 @@ def train_phase2(
                 loss, metrics, _traj, gate = step_out
             phase_timer.mark("aux_forward")
             hard_ok = _hard_feasibility_ok_from_gate(gate)
+            bellman_parent_ok = (
+                _bellman_parent_ingress_ok(gate, cfg.timing_critic)
+                if sfx_fns else None
+            )
             if timing_critic is not None:
                 critic_observation = (
                     build_critic_features(
@@ -11137,6 +12540,46 @@ def train_phase2(
                             )
                         ).all(dim=1)
                     )
+                    timing_kind_all = batch["timing_primary_kind"]
+                    timing_nearest = torch.where(
+                        batch["active"].bool(), batch["hit"],
+                        torch.full_like(batch["hit"], int(bucket)),
+                    ).min(dim=1).values
+                    mpc_rows_all = timing_kind_all == 1
+                    peak_wp = int(cfg.terminal_suffix_peak_wp)
+                    bands = (
+                        ("below_freeze", 1, peak_wp - 1),
+                        ("freeze_peak", peak_wp, peak_wp),
+                        ("mid", peak_wp + 1, min(19, int(bucket))),
+                        ("long", 20, int(bucket)),
+                    )
+                    for band_name, lo, hi in bands:
+                        band = (
+                            mpc_rows_all
+                            & (timing_nearest >= lo)
+                            & (timing_nearest <= hi)
+                        )
+                        roll_acc[f"timing_mpc_band_{band_name}_rows"] = (
+                            roll_acc.get(f"timing_mpc_band_{band_name}_rows", 0.0)
+                            + float(band.sum())
+                        )
+                        roll_acc[f"timing_mpc_band_{band_name}_manageable"] = (
+                            roll_acc.get(
+                                f"timing_mpc_band_{band_name}_manageable", 0.0,
+                            ) + float((band & timing_exact_ok).sum())
+                        )
+                    terminal_band = (
+                        mpc_rows_all
+                        & (timing_nearest >= 1)
+                        & (
+                            timing_nearest
+                            <= peak_wp
+                        )
+                    )
+                    terminal_band_success = timing_exact_ok[terminal_band]
+                    timing_boundary_success = timing_exact_ok[
+                        timing_kind_all == 2
+                    ]
                     timing_pred = batch[
                         "timing_selected_pred_manageable"
                     ].bool()
@@ -11266,70 +12709,51 @@ def train_phase2(
             loss_sfx_cost = torch.zeros((), device=device)
             loss_sfx_tie = torch.zeros((), device=device)
             loss_mpc_tie = torch.zeros((), device=device)
+            loss_waist_mpc_tie = torch.zeros((), device=device)
+            waist_mpc_tie_grad = torch.zeros((), device=device)
             if cfg.w_mpc_init_tie > 0.0:
                 loss_mpc_tie, _mpc_tie_elems = mpc_init_tie_loss(
                     _traj, batch["seed"], batch["masks"].elem_mask,
                     batch["mpc_init"],
                 )
+            if cfg.w_waist_yaw_mpc_tie > 0.0:
+                loss_waist_mpc_tie, _, waist_mpc_tie_grad = (
+                    waist_yaw_mpc_init_tie_loss(
+                        _traj, batch["seed"], batch["masks"].elem_mask,
+                        batch["mpc_init"], yaw_index=yaw_i,
+                    )
+                )
             sfx_ramp = (
                 _smoothstep(min((step + 1) / max(cfg.suffix_warmup, 1), 1.0))
-                if sfx_fns else 0.0
+                * float(suffix_replay_fill)
+                if suffix_replay_batch is not None else 0.0
             )
             sfx_ramp_step = float(sfx_ramp)
             if ls_rec is not None:
                 ls_rec.controls.sfx_ramp = sfx_ramp_step
                 ls_rec.controls.weights = w
-            if sfx_fns and sfx_ramp > 0.0:
-                # Bellman children are no longer restricted to MPC parents;
-                # every primary stratum contributes proportionally.
-                sf = _suffix_rows(batch, cfg.suffix_frac)
-                act_sf = batch["active"].index_select(0, sf)
-                hit_parent_sf = batch["hit"].index_select(0, sf)
-                offs = suffix_offsets(hit_parent_sf, act_sf, bucket,
-                                      generator=sfx_gen)
-                if ls_rec is not None:
-                    ls_rec.samples.suffix_offs = offs.detach()
-                hit_sf = torch.where(act_sf.bool(),
-                                     hit_parent_sf - offs.unsqueeze(1),
-                                     hit_parent_sf)
-                masks_sf = pool.masks_for(hit_sf.clamp_min(0), act_sf, bucket)
-                hit_eff_sf = effective_hits(hit_sf, act_sf, bucket)
-                # convention as TC / BPTT: no waist-yaw reference in sub-losses
-                strike_sf = replace(_strike_rows(batch["strike"], sf),
-                                    hit_index=hit_eff_sf, waist_yaw_ref=None)
-                if cfg.waist_pr_sp_from_head:
-                    # Encoder SP is not a sub-loss target (TC / BPTT / suffix
-                    # convention).  An EMA ref is stopgrad history and stays.
-                    strike_sf = replace(strike_sf, waist_pr_ref=None)
-                enc_sf = _index_encoded(enc, sf)
-                (
-                    loss_sfx_cost, loss_sfx_tie, sfx_gate,
-                    sfx_q0, sfx_v0, sfx_init,
-                ) = sfx_fns[bucket](
-                    _traj.index_select(0, sf), batch["q0"].index_select(0, sf),
-                    batch["v0"].index_select(0, sf), enc_sf,
-                    batch["masks"].elem_mask.index_select(0, sf),
-                    masks_sf, strike_sf, group_lengths(hit_eff_sf),
-                    _index_batch_weights(w, sf, bs), offs,
+            if suffix_replay_batch is not None and sfx_ramp > 0.0:
+                loss_sfx_tie, suffix_tie_elems, *_suffix_diagnostics = (
+                    _suffix_distill_loss(
+                        suffix_replay_batch, suffix_replay_offs,
+                        bucket=bucket, encode_step=encode_step,
+                        suffix_fn=sfx_fns[bucket], pool=pool,
+                        microbatch=int(cfg.suffix_microbatch),
+                    )
                 )
-                if timing_critic is not None:
-                    sfx_features = build_critic_features(
-                        q0=sfx_q0, qd0=sfx_v0,
-                        goal_pos=batch["context"].goal_pos.index_select(0, sf),
-                        goal_tth=masks_sf.hit_tth,
-                    )
-                    critic_extra_observations.append((
-                        sfx_features.detach(), sfx_gate.detach(),
-                    ))
-                    roll_acc["timing_suffix_labels"] = (
-                        roll_acc.get("timing_suffix_labels", 0.0)
-                        + float(sf.numel())
-                    )
+                roll_acc["suffix_replay_rows"] = (
+                    roll_acc.get("suffix_replay_rows", 0.0)
+                    + float(cfg.suffix_replay_batch)
+                )
+                roll_acc["suffix_replay_tie_elems"] = (
+                    roll_acc.get("suffix_replay_tie_elems", 0.0)
+                    + float(suffix_tie_elems.detach())
+                )
             extra = (
                 cfg.w_tc * loss_tc + cfg.w_bptt * loss_bptt
                 + cfg.w_mpc_init_tie * loss_mpc_tie
-                + sfx_ramp * (cfg.w_suffix_cost * loss_sfx_cost
-                              + cfg.w_suffix_tie * loss_sfx_tie)
+                + cfg.w_waist_yaw_mpc_tie * loss_waist_mpc_tie
+                + sfx_ramp * cfg.w_suffix_tie * loss_sfx_tie
             )
             dls_stats: dict[str, torch.Tensor] = {}
             if (
@@ -11495,6 +12919,22 @@ def train_phase2(
             mpc_tie_acc += float(loss_mpc_tie.detach())
             mpc_tie_frac_acc += float(batch["mpc_init"].float().mean())
             mpc_tie_n += 1
+        if cfg.w_waist_yaw_mpc_tie > 0.0:
+            waist_mpc_tie_acc += float(loss_waist_mpc_tie.detach())
+            waist_mpc_tie_grad_acc += float(
+                cfg.w_waist_yaw_mpc_tie * waist_mpc_tie_grad.detach()
+            )
+            waist_mpc_tie_n += 1
+            if rank == 0 and (step + 1) % cfg.log_every == 0:
+                probe_grads = torch.autograd.grad(
+                    cfg.w_waist_yaw_mpc_tie * loss_waist_mpc_tie,
+                    trainable_params(model), retain_graph=True, allow_unused=True,
+                )
+                sq = sum(
+                    grad.detach().double().square().sum()
+                    for grad in probe_grads if grad is not None
+                )
+                waist_mpc_param_grad_norm = float(sq.sqrt()) if not isinstance(sq, int) else 0.0
 
         if not torch.isfinite(total):
             # Never let one pathological batch poison the weights or the
@@ -11805,7 +13245,9 @@ def train_phase2(
                     has_bptt_payload=False,
                 )
             if run_search and sfx_fns and sfx_ramp_step > 0.0 and (
-                ls_rec is None or ls_rec.samples.suffix_offs is None
+                ls_rec is None
+                or ls_rec.samples.suffix_offs is None
+                or "suffix_replay_batch" not in ls_rec.samples.extras
             ):
                 assert_replayable_extras_or_raise(
                     cfg,
@@ -11816,34 +13258,40 @@ def train_phase2(
                 )
 
             def _probe_F() -> float:
-                return _ls_probe_scalar_F(
-                    batch=batch,
-                    use_replay=use_replay,
-                    bucket=bucket,
-                    bs=bs,
-                    encode_step=encode_step,
-                    step_fns=step_fns,
-                    tc_fns=tc_fns,
-                    sfx_fns=sfx_fns,
-                    model=model,
-                    costs=costs,
-                    pool=pool,
-                    sim=sim,
-                    cfg=cfg,
-                    base=base,
-                    yaw_i=yaw_i,
-                    pr_idx=pr_idx,
-                    pr_limit=pr_limit,
-                    waist_cfg=waist_cfg,
-                    w=w,
-                    sfx_ramp=sfx_ramp_step,
-                    include_bptt=include_bptt_step,
-                    device=device,
-                    dtype=dtype,
-                    amp=amp,
-                    rec=ls_rec,
-                    torque_grad_scale=torque_step_scale,
-                )
+                # Adam/SaLSa probes only compare scalar objective values.  A
+                # graph here was pure overhead and could OOM large actor
+                # batches.  The L-BFGS y-pair path below explicitly calls the
+                # same helper with ``return_tensor=True`` under grad mode.
+                with torch.no_grad():
+                    return _ls_probe_scalar_F(
+                        batch=batch,
+                        use_replay=use_replay,
+                        bucket=bucket,
+                        bs=bs,
+                        encode_step=encode_step,
+                        step_fns=step_fns,
+                        tc_fns=tc_fns,
+                        sfx_fns=sfx_fns,
+                        model=model,
+                        costs=costs,
+                        pool=pool,
+                        sim=sim,
+                        cfg=cfg,
+                        base=base,
+                        yaw_i=yaw_i,
+                        pr_idx=pr_idx,
+                        pr_limit=pr_limit,
+                        waist_cfg=waist_cfg,
+                        w=w,
+                        sfx_ramp=sfx_ramp_step,
+                        include_bptt=include_bptt_step,
+                        device=device,
+                        dtype=dtype,
+                        amp=amp,
+                        rec=ls_rec,
+                        generator=gen,
+                        torque_grad_scale=torque_step_scale,
+                    )
 
             ls_result = run_search_or_ordinary(
                 ls_rt,
@@ -11908,6 +13356,7 @@ def train_phase2(
                             dtype=dtype,
                             amp=amp,
                             rec=ls_rec,
+                            generator=gen,
                             torque_grad_scale=torque_step_scale,
                             return_tensor=True,
                         )
@@ -11958,16 +13407,51 @@ def train_phase2(
                     torch.zeros(extra_n, device=device, dtype=torch.bool),
                     timing_anchor_mask,
                 ))
-                timing_critic.observe_gate(
-                    observe_features, observe_gate, actor_step=step,
-                    anchor_mask=observe_anchor,
-                )
+                timing_critic_pending.append({
+                    "features": observe_features.detach().to(
+                        device="cpu", dtype=torch.float32,
+                    ),
+                    "gate": observe_gate.detach().to(
+                        device="cpu", dtype=torch.float32,
+                    ),
+                    "anchor": observe_anchor.detach().to(
+                        device="cpu", dtype=torch.bool,
+                    ),
+                    "actor_step": int(step),
+                })
             else:
-                timing_critic.observe_gate(
-                    observe_features, observe_gate, actor_step=step,
-                )
+                timing_critic_pending.append({
+                    "features": observe_features.detach().to(
+                        device="cpu", dtype=torch.float32,
+                    ),
+                    "gate": observe_gate.detach().to(
+                        device="cpu", dtype=torch.float32,
+                    ),
+                    "anchor": None,
+                    "actor_step": int(step),
+                })
+            if len(timing_critic_pending) >= int(
+                cfg.timing_critic.update_interval
+            ):
+                _flush_timing_critic_pending()
 
         phase_timer.mark("bookkeeping")
+
+        if (
+            sfx_fns
+            and commit_side_effects
+            and torch.isfinite(gnorm)
+        ):
+            admitted = suffix_ring.add(
+                bucket, batch, _traj, hard_ok=bellman_parent_ok,
+            )
+            roll_acc["suffix_replay_admitted"] = (
+                roll_acc.get("suffix_replay_admitted", 0.0) + float(admitted)
+            )
+            roll_acc["suffix_replay_size"] = (
+                roll_acc.get("suffix_replay_size", 0.0)
+                + float(len(suffix_ring))
+            )
 
         if (
             voxel_state is not None
@@ -11994,14 +13478,35 @@ def train_phase2(
             and commit_side_effects
             and torch.isfinite(gnorm)
         ):
-            timing_close_ok = _timing_mpc_ingress_ok(
-                gate.detach(), cfg.timing_critic,
-            )
+            if (
+                terminal_band_success is not None
+                and hasattr(timing_critic, "observe_terminal_band")
+            ):
+                timing_critic.observe_terminal_band(terminal_band_success)
+            if (
+                timing_boundary_success is not None
+                and hasattr(timing_critic, "observe_boundary")
+            ):
+                timing_critic.observe_boundary(
+                    timing_boundary_success,
+                    actor_step=step,
+                    horizon=bucket,
+                )
+            # The critic MPC pool is deliberately quality-agnostic. Full-cost
+            # training on noisy suffix states is the recovery signal; only the
+            # structural pre-hit-waypoint check inside ``refresh`` can reject a
+            # row here.
+            timing_parent_ok = _timing_mpc_parent_ingress_ok(gate.detach())
             refreshed = timing_mpc_ring.refresh(
-                bucket, timing_parent_batch, _traj, hard_ok=timing_close_ok,
+                bucket, timing_parent_batch, _traj, hard_ok=timing_parent_ok,
+                generator=gen,
             )
             roll_acc["timing_mpc_refresh"] = (
                 roll_acc.get("timing_mpc_refresh", 0.0) + float(refreshed)
+            )
+            roll_acc["timing_mpc_parent_pool_size"] = (
+                roll_acc.get("timing_mpc_parent_pool_size", 0.0)
+                + float(timing_mpc_ring.size(bucket))
             )
 
         if frontier_cloud is not None and commit_side_effects:
@@ -12163,6 +13668,15 @@ def train_phase2(
                 )
             if ls_rt is not None:
                 rec.update(ls_rt.last_log or ls_log)
+                rec["line_search_c1"] = float(
+                    ls_rt.cfg.c1_at(int(ls_rt.ctrl.successful_update_count) + 1)
+                )
+                rec["line_search_epsilon_floor"] = float(
+                    ls_rt.cfg.epsilon_min_at(
+                        int(ls_rt.ctrl.successful_update_count) + 1,
+                        float(ls_rt.epsilon_min),
+                    )
+                )
                 rec["ls_u"] = int(ls_rt.ctrl.successful_update_count)
                 rec["ls_seed_provenance"] = ls_rt.seed_provenance
                 ls_n = int(roll_acc.get("ls_u_n", 0.0))
@@ -12194,6 +13708,11 @@ def train_phase2(
                     torque_grad_cached_scale
                 )
             rec.update({k: float(v) for k, v in zip(METRIC_NAMES, acc / max(acc_n, 1))})
+            if waist_mpc_param_grad_norm is not None:
+                rec["waist_yaw_mpc_tie_param_grad_norm"] = waist_mpc_param_grad_norm
+                rec["waist_yaw_mpc_tie_param_grad_fraction"] = (
+                    waist_mpc_param_grad_norm / max(float(gnorm), 1.0e-12)
+                )
             if sp_res_n:
                 rec["waist_sp_res"] = sp_res_acc / sp_res_n
             if pr_sp_n:
@@ -12220,6 +13739,11 @@ def train_phase2(
             if mpc_tie_n:
                 rec["mpc_init_tie"] = mpc_tie_acc / mpc_tie_n
                 rec["mpc_init_frac"] = mpc_tie_frac_acc / mpc_tie_n
+            if waist_mpc_tie_n:
+                rec["waist_yaw_mpc_tie"] = waist_mpc_tie_acc / waist_mpc_tie_n
+                rec["waist_yaw_mpc_tie_weighted_output_grad_norm"] = (
+                    waist_mpc_tie_grad_acc / waist_mpc_tie_n
+                )
             if frontier_cloud is not None:
                 rec["frontier"] = {
                     int(b): {
@@ -12336,6 +13860,7 @@ def train_phase2(
                         _train_checkpoint_extra({"probe": pr_rec}),
                         ls_rt, optimizer=opt,
                     ),
+                    rng_streams=phase2_rng_streams,
                 )
             if voxel_state is None:
                 activated = _maybe_auto_activate_frontier(
@@ -12427,6 +13952,7 @@ def train_phase2(
                                 "eval": ev, "probe": last_probe,
                             }), ls_rt, optimizer=opt,
                         ),
+                        rng_streams=phase2_rng_streams,
                     )
                 else:
                     emit({"event": "best_blocked", "step": step + 1,
@@ -12450,11 +13976,13 @@ def train_phase2(
                     run_dir, model=model, optimizer=opt, al=al, step=step_done,
                     cfg=cfg, model_cfg=model_cfg, scenario_cfg=scenario_cfg,
                     ls_rt=ls_rt, extra=_train_checkpoint_extra(),
+                    rng_streams=phase2_rng_streams,
                 )
                 step_path = _save_step_pt(
                     run_dir, model=model, optimizer=opt, al=al, step=step_done,
                     cfg=cfg, model_cfg=model_cfg, scenario_cfg=scenario_cfg,
                     ls_rt=ls_rt, extra=_train_checkpoint_extra(),
+                    rng_streams=phase2_rng_streams,
                 )
                 if log and step_path is not None:
                     print(f"[ckpt] kept {step_path.name}", flush=True)
@@ -12471,15 +13999,20 @@ def train_phase2(
                     run_dir, model=model, optimizer=opt, al=al, step=step_done,
                     cfg=cfg, model_cfg=model_cfg, scenario_cfg=scenario_cfg,
                     ls_rt=ls_rt, extra=_train_checkpoint_extra(),
+                    rng_streams=phase2_rng_streams,
                 )
                 step_path = _save_step_pt(
                     run_dir, model=model, optimizer=opt, al=al, step=step_done,
                     cfg=cfg, model_cfg=model_cfg, scenario_cfg=scenario_cfg,
                     ls_rt=ls_rt, extra=_train_checkpoint_extra(),
+                    rng_streams=phase2_rng_streams,
                 )
                 if log and step_path is not None:
                     print(f"[ckpt] kept {step_path.name}", flush=True)
 
+    # Do not discard up to ``update_interval - 1`` exact actor labels when a
+    # short run, deadline, or early-stop ends between consolidated updates.
+    _flush_timing_critic_pending()
     wall = time.perf_counter() - t0
     summary = {
         "event": "done", "steps": last_step, "start_step": int(start_step),
@@ -12513,6 +14046,7 @@ def train_phase2(
             run_dir, model=model, optimizer=opt, al=al, step=last_step,
             cfg=cfg, model_cfg=model_cfg, scenario_cfg=scenario_cfg,
             ls_rt=ls_rt, extra=_train_checkpoint_extra(),
+            rng_streams=phase2_rng_streams,
         )
         _save_frontier_pt(run_dir, frontier_cloud)
         _maybe_frontier_cloud_plot(

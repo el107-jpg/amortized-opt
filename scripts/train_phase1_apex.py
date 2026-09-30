@@ -11,10 +11,9 @@ imitation target:
 
 * ``phase1_main`` -- target = straight-line quintic to a library terminal pose,
   init = that target + OU/white noise;
-* here          -- target = C2 spline start -> apex-above-the-drum -> terminal,
-  init = the **straight-line quintic to the same terminal pose** + OU/white
-  noise (Eric, 2026-08-10: the model must learn to bend a straight guess into
-  the apex shape, because deployment hands it straight guesses).
+* here          -- a frozen start-aware MLP predicts the terminal pose; the
+  init uses the low-acceleration direct path, and the target uses the same law
+  on start -> apex and apex -> terminal, plus the existing OU/white noise mix.
 
 Scenario counts default higher than phase 1's 450 k / 40 k because the apex
 detour is longer and so trips the impossible-transition filter more often
@@ -25,6 +24,7 @@ detour is longer and so trips the impossible-transition filter more often
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 import time
@@ -64,6 +64,20 @@ def parse_args(argv=None):
     p.add_argument("--aux-weight", type=float, default=0.1)
     p.add_argument("--d-model", type=int, default=None, help="decoder width (default 384)")
     p.add_argument("--dec-layers", type=int, default=None, help="decoder depth (default 3)")
+    p.add_argument("--d-ctx", type=int, default=None, help="context encoder width (default 256)")
+    p.add_argument("--ctx-layers", type=int, default=None, help="context encoder depth (default 2)")
+    p.add_argument("--ctx-heads", type=int, default=None, help="context encoder attention heads (default 8)")
+    p.add_argument(
+        "--no-ctx-self-attn", action="store_true",
+        help="omit encoder self-attention but retain its per-token FFN",
+    )
+    p.add_argument("--dec-heads", type=int, default=None, help="decoder attention heads (default 8)")
+    p.add_argument(
+        "--dec-cross-attn-layers", type=int, nargs="+", default=None,
+        metavar="LAYER",
+        help="decoder layers that retain context cross-attention (default all); "
+             "e.g. --dec-cross-attn-layers 0 omits it from every later layer",
+    )
     p.add_argument("--dec-rope", action="store_true",
                    help="rotary position on decoder SELF-attention (see "
                         "ModelConfig.dec_rope); off by default")
@@ -139,6 +153,11 @@ def parse_args(argv=None):
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--out", default=None, help="run directory (default runs/phase1_apex)")
     p.add_argument("--pool-device", default=None)
+    p.add_argument(
+        "--terminal-head-ckpt",
+        default="runs/terminal_pose/start_collision_20260926/start_k1_10k.pt",
+        help="pretrained start-aware terminal MLP (loaded frozen; gradients stop at its output)",
+    )
     # apex knobs
     p.add_argument("--apex-height", type=float, default=0.30)
     p.add_argument("--apex-radius", type=float, default=0.15)
@@ -148,11 +167,12 @@ def parse_args(argv=None):
     p.add_argument("--terminal-mode", default="nearest_apex",
                    choices=["nearest_apex", "nearest_yaw"])
     # init channel (Eric, 2026-08-10 update 1)
-    p.add_argument("--init-mode", default="mix",
+    p.add_argument("--init-mode", default="straight",
                    choices=["mix", "straight", "apex"],
-                   help="mix = 50/50 straight-quintic / apex-spline inits")
+                   help="decoder input channel (default: terminal-head direct path; "
+                        "mix/apex remain available as diagnostics)")
     p.add_argument("--init-mix", type=float, default=0.5,
-                   help="fraction of samples initialized from the apex spline")
+                   help="fraction of samples initialized from the apex path")
     p.add_argument("--white-noise", action="store_true",
                    help="i.i.d. Gaussian inits at matched variance (OU off). "
                         "Implemented but NOT part of the sanctioned experiment "
@@ -230,6 +250,43 @@ def main(argv=None) -> int:
     noise = NoiseConfig()
     pool_dev = args.pool_device or args.device
 
+    # Encoder and frozen terminal MLP are the two pre-decoder branches.  Build
+    # them before the pool so the terminal head can replace the old library
+    # terminal before apex auxiliary labels are generated.
+    model_cfg = A.ModelConfig(
+        max_horizon=int(args.horizon), num_drums=scen.num_drums,
+        num_future=scen.num_future,
+        terminal_head=True,
+        idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
+        waist_sp_head=bool(args.waist_sp_head),
+        waist_pr_sp_head=bool(args.waist_pr_sp_head),
+        dec_cross_attn_layers=(
+            None if args.dec_cross_attn_layers is None
+            else tuple(args.dec_cross_attn_layers)
+        ),
+        ctx_self_attn=not bool(args.no_ctx_self_attn),
+    )
+    for attr in (
+        "d_model", "dec_layers", "dec_heads", "d_ctx", "ctx_layers", "ctx_heads"
+    ):
+        val = getattr(args, attr, None)
+        if val is not None:
+            setattr(model_cfg, attr, val)
+    if args.dec_rope:
+        model_cfg.dec_rope = True
+    if args.dec_plant_feats:
+        model_cfg.dec_plant_feats = True
+    model = A.build_model(model_cfg, dev)
+    terminal_ckpt = Path(args.terminal_head_ckpt)
+    if not terminal_ckpt.is_absolute():
+        terminal_ckpt = root / terminal_ckpt
+    model.load_terminal_head(terminal_ckpt, map_location=dev)
+    print(f"[terminal] frozen head <- {terminal_ckpt}", flush=True)
+    print(f"[model] {A.param_counts(model)}", flush=True)
+    pool_initializer = model.terminal_initializer
+    if torch.device(pool_dev) != dev:
+        pool_initializer = copy.deepcopy(pool_initializer).to(pool_dev)
+
     fk = A.ChainFK(device=pool_dev, dtype=torch.float32)
     rnea = A.BatchedRNEA.from_urdf(with_armature=True, device=pool_dev, dtype=torch.float32)
 
@@ -244,6 +301,7 @@ def main(argv=None) -> int:
         init_mode=str(args.init_mode), init_mix=float(args.init_mix),
         white_noise=bool(args.white_noise),
         aux_torque_tracking=bool(args.aux_torque_tracking),
+        terminal_initializer=pool_initializer,
     )
     print(f"[data] generating {args.val_scenarios} APEX val scenarios ...", flush=True)
     val_pool = generate_apex_pool(
@@ -254,31 +312,12 @@ def main(argv=None) -> int:
         init_mode=str(args.init_mode), init_mix=float(args.init_mix),
         white_noise=bool(args.white_noise),
         aux_torque_tracking=bool(args.aux_torque_tracking),
+        terminal_initializer=pool_initializer,
     )
     t_data = time.perf_counter() - t0
     for name, pool in (("train", train_pool), ("val", val_pool)):
         print(_fmt_stats(name, pool), flush=True)
     print(f"[data] {t_data:.1f} s", flush=True)
-
-    # The IDLE context token is only worth its parameters when the pool carries
-    # a payload for it -- see the same block in ``train_phase1.py``.
-    model_cfg = A.ModelConfig(
-        max_horizon=int(args.horizon), num_drums=scen.num_drums,
-        num_future=scen.num_future,
-        idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
-        waist_sp_head=bool(args.waist_sp_head),
-        waist_pr_sp_head=bool(args.waist_pr_sp_head),
-    )
-    for attr in ("d_model", "dec_layers"):
-        val = getattr(args, attr, None)
-        if val is not None:
-            setattr(model_cfg, attr, val)
-    if args.dec_rope:
-        model_cfg.dec_rope = True
-    if args.dec_plant_feats:
-        model_cfg.dec_plant_feats = True
-    model = A.build_model(model_cfg, dev)
-    print(f"[model] {A.param_counts(model)}", flush=True)
 
     cfg = TrainConfig(
         max_steps=int(args.steps),
@@ -315,6 +354,8 @@ def main(argv=None) -> int:
         scenario_cfg=scen, noise_cfg=noise,
     )
     summary["variant"] = "apex"
+    summary["terminal_head_checkpoint"] = str(terminal_ckpt)
+    summary["terminal_head_stop_gradient"] = True
     summary["init_mode"] = str(args.init_mode)
     summary["init_mix"] = float(args.init_mix)
     summary["white_noise"] = bool(args.white_noise)

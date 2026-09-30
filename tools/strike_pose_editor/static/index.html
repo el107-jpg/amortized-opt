@@ -138,6 +138,8 @@
       <section>
         <p class="section-kicker">Physics-constrained solve</p><h2>Teacher optimization</h2>
         <p class="muted">Optimize automatically carries the selected hand's displayed contact, stick direction, waist, and IK seed into a persistent terminal task. Joint keyframes are optional extra posture guidance. Saving supervises only the selected arm plus waist.</p>
+        <label class="field" for="optimizer-backend"><span>Optimizer</span><select id="optimizer-backend"><option value="hpipm" selected>HPIPM SQP</option><option value="adam">Adam fallback</option></select></label>
+        <label class="field" for="sqp-initialization"><span>SQP initialization</span><select id="sqp-initialization"><option value="current" selected>Current trajectory</option><option value="quintic">Fresh terminal quintic</option></select></label>
         <div class="action-grid"><button id="optimize-button" class="button primary" type="button" disabled>Optimize</button><button id="reoptimize-button" class="button secondary" type="button" disabled>Reoptimize</button></div>
         <button id="save-teacher-button" class="button secondary full spaced" type="button" disabled>Save selected-hand teacher</button>
       </section>

@@ -196,7 +196,7 @@ class DrumMPCLoop:
         t4 = time.perf_counter()
 
         # ---- 7. commit ----------------------------------------------------------
-        self.mpc.commit(cmd, q, fired)
+        self.mpc.commit(cmd, q, fired, qd=qd)
 
         # ---- 8. redraw the epsilon of every env whose segment ended --------------
         if self.noise is not None and bool(fired.any()):

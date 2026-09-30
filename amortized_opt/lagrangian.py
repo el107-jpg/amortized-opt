@@ -69,8 +69,11 @@ term recomputed against a just-written ``e_prev`` would be identically zero
 on every step that actually prices the hard wall.
 
 The cost is evaluated with ``λ_used`` multiplying the ReLU residual
-(``live`` / ``violations``) and ``pen / 2 · V²`` added on the same live
-residual.  The softplus warning stays at ``CostConfig.w_*``.  The primal is a
+(``live`` / ``violations``) and ``pen / 2 · V²`` on that same residual.
+Peak groups are the exception: their linear price is already
+``λ · w_peak · smooth_max``, so the quadratic squares that smooth max
+and the hard max stays detached for the dual.  The softplus warning
+stays at ``CostConfig.w_*``.  The primal is a
 neural net, so the λ-update is NEVER skipped when ``pen`` grows -- Bertsekas
 skip-λ assumes an inner minimizer that this training loop does not have.
 

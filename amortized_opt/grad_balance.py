@@ -63,7 +63,9 @@ GRAD_BALANCE_GROUPS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         (),
     ),
     "waist": (
-        ("waist_upright", "waist_aim", "waist_yaw_vel", "waist_pr_vel",
+        ("waist_upright", "waist_aim", "waist_yaw_vel", "waist_yaw_monotonic",
+         "waist_yaw_accel_direction", "waist_yaw_initial_accel_direction",
+         "waist_pr_vel",
          "waist_pr_band", "waist_pr_terminal"),
         ("waist_pr_band",),
     ),

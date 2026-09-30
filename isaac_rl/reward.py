@@ -12,45 +12,11 @@
     differentiable half keeps the un-executed tail of the trajectory valid; the
     RL half carries the signal backprop cannot see.
 
-Four families, all logged separately so the decomposition is recorded rather
-than assumed:
-
-``hit.*``
-    From the SIMULATED contact.  A batched, executed-state twin of
-    ``amortized_opt.probe.hit_latency``: the tip (or the shaft contact point on
-    cymbals -- ``contact_sigma``) is tracked across the tick, the crossing of
-    the head plane is located to SUB-TICK resolution, and the crossing is
-    scored for legal disk, timing against the scheduled tick, and impact speed
-    band.  Section 7c is explicit that this, not the at-tick binary, is the
-    metric that ranks configurations: "in the disk at tick k" conflates *late*
-    with *missed*.
-
-``extra.*``
-    The stray-hit punishment: contact with any drum that is not the hand's
-    current goal, and contact outside the timing window.  Mirrors the existing
-    env's extra-hit mechanism (the plan doc: "refer to the current MLP RL
-    system ... just take a look at the hit counter and extra hit punishment
-    mechanisms").
-
-``plan.*``
-    ``FusedCost`` on the remainder of the plan -- torque, velocity, joint box,
-    collision, smoothness, posture, terminal.  Negated into a reward.  The plan
-    doc: "we will continue including the previous limit and smoothness terms
-    ... making sure it still generates valid paths to the drum at all times in
-    our RL reward function."
-
-``track.*``
-    PD-tracking error **with the lead accounted for**.  The command executed at
-    tick ``k`` was ``q_ref(t_k + delta)``; the *intent* is that the plant lands
-    on ``q_ref(t_k)``, i.e. on the UN-led first waypoint of that tick's plan.
-    So the error scored here is ``||q_measured(t_{k+1}) - traj_k[0]_pre_lead||``
-    -- not against the command, which would score the lead itself as error and
-    train the model to cancel its own compensation.
-
-``filter.*``
-    QP-safety-filter interventions.  Counted now, penalized in the training
-    stage (plan item 3: "filter interventions penalized so the policy does not
-    learn to lean on it").
+The PPO reward has three continuous signals: distance from the executed contact
+point to the probe's legal strike region, impact-speed error, and the existing
+smooth collision cost.  Binary hit/miss buckets and the every-tick tracking
+bonus are diagnostics only.  The remaining physics constraints stay in the
+differentiable auxiliary loss on the complete emitted trajectory.
 
 Isaac-free.  The env hands in tensors; nothing here imports a simulator.
 """
@@ -89,37 +55,32 @@ HANDS = ("left", "right")
 class RewardConfig:
     """Weights.  Every term is logged raw as well, so a weight of 0 still shows."""
 
-    # ---- executed contact (RL priority 1) ----
-    #: Landing inside the legal disk at the crossing.  The headline term.
-    w_hit: float = 10.0
-    #: Timing.  ``exp(-(latency/tau)^2)``; tau = 20 ms = one control period,
-    #: which is the resolution the 7c latency table reports in.
-    w_timing: float = 5.0
-    timing_tau_s: float = 0.02
-    #: Impact speed inside ``[speed_lo, speed_hi]``.  7c reports "speed in band"
-    #: as a separate column because a strike can be on time and inaudible.
-    w_speed: float = 2.0
-    speed_lo: float = 1.0
-    speed_hi: float = 3.5
-    #: A scheduled hit whose stick never crossed the head plane inside the disk
-    #: in the window.  This is the 63 % the RL stage exists to move.
-    w_miss: float = 5.0
-    #: +/- this many control ticks around the scheduled instant count as the
-    #: crossing window (``probe.hit_latency`` uses 5).
-    window_ticks: int = 5
+    # ---- continuous executed contact --------------------------------------
+    #: Bounded continuous quality of the executed contact's distance to the
+    #: same legal strike region used by ``probe.head_frame_error``.  The score
+    #: is ``1 / (1 + (distance / scale)^2)``.
+    w_hit_error: float = 10.0
+    hit_error_scale_m: float = 0.05
+    #: Smooth error between executed contact-point speed and ``|v_star|``.
+    w_impact_speed: float = 0.5
+    impact_speed_scale_mps: float = 0.5
 
-    # ---- stray contact ----
-    #: Contact with a drum that is not the hand's goal.
-    w_extra_hit: float = 5.0
-    #: Contact with the goal drum outside the timing window (double bounce,
-    #: early arrival that was not the scheduled strike).
-    w_early_contact: float = 2.0
+    # ---- optional sparse contact-only objective ---------------------------
+    #: ``continuous`` keeps the default distance/speed reward.  ``binary_hits``
+    #: rewards a legal contact with the currently scheduled drum and penalizes
+    #: contact with any other drum (or the goal drum outside its timing
+    #: window).  This deliberately excludes plan, tracking, and speed terms.
+    reward_mode: str = "continuous"
+    w_correct_hit: float = 10.0
+    w_wrong_hit: float = 5.0
+    hit_window_ticks: int = 5
 
     # ---- the analytic half, on the plan ----
-    #: Scale on the (negated) ``FusedCost`` total.  Small: the analytic cost is
-    #: O(1..100) in its own units and it is a CONSTRAINT-keeping term here, not
-    #: the objective -- the objective is the contact.
-    w_plan_cost: float = 0.05
+    #: Continuous collision avoidance from the existing FusedCost collision
+    #: field.  Other analytic constraints remain in the differentiable
+    #: auxiliary loss and do not enter the PPO reward.
+    w_collision: float = 1.0e-3
+    w_plan_cost: float = 0.0
     #: Which FusedCost terms enter the reward.  The terminal terms are dropped
     #: by default: in Isaac the executed contact IS the terminal objective, and
     #: keeping the kinematic terminal too re-creates exactly the conflict §7c
@@ -131,9 +92,7 @@ class RewardConfig:
         "collision", "smoothness", "posture_mid",
     )
 
-    # ---- tracking ----
-    #: Weight on ``exp(-(rms_err / scale)^2)``; scale in radians.
-    w_track: float = 1.0
+    # Retained as a diagnostic scale; tracking is not part of the reward.
     track_scale_rad: float = 0.05
 
     # ---- idle arm (RL priority 4) ----
@@ -162,6 +121,20 @@ class RewardConfig:
     w_alive: float = 0.0
 
     joint_names: tuple[str, ...] = field(default=G1_UPPER_BODY_JOINTS)
+
+    def __post_init__(self):
+        if self.reward_mode not in ("continuous", "binary_hits"):
+            raise ValueError("reward_mode must be 'continuous' or 'binary_hits'")
+        if self.hit_error_scale_m <= 0.0:
+            raise ValueError("hit_error_scale_m must be positive")
+        if self.impact_speed_scale_mps <= 0.0:
+            raise ValueError("impact_speed_scale_mps must be positive")
+        if min(self.w_hit_error, self.w_impact_speed, self.w_collision) < 0.0:
+            raise ValueError("continuous reward weights must be non-negative")
+        if min(self.w_correct_hit, self.w_wrong_hit) < 0.0:
+            raise ValueError("binary hit reward weights must be non-negative")
+        if self.hit_window_ticks < 0:
+            raise ValueError("hit_window_ticks must be non-negative")
 
 
 @dataclass
@@ -196,6 +169,7 @@ class ContactScore:
     speed: torch.Tensor        # float m/s at the interpolated pose
     axial_m: torch.Tensor      # float -- signed distance to the head, start of tick
     inplane_m: torch.Tensor    # float -- >0 = outside the disk edge, at crossing
+    hit_error_m: torch.Tensor  # float -- distance to the probe's legal hit region
     drum: torch.Tensor         # long -- the goal drum it was tested against
 
 
@@ -313,7 +287,7 @@ class ExecutedStrikeScorer:
         than at the nearer knot.
         """
         _dist0, _s0, p0 = self.best_contact(q0, ctx)
-        _dist1, _s1, p1 = self.best_contact(q1, ctx)
+        dist1, _s1, p1 = self.best_contact(q1, ctx)
         a0, _i0 = self.head_frame(p0, ctx)
         a1, _i1 = self.head_frame(p1, ctx)
         crossed = (a0 > 0.0) & (a1 <= 0.0) & (ctx.active > 0.5)
@@ -329,6 +303,7 @@ class ExecutedStrikeScorer:
             speed=speed,
             axial_m=a0,
             inplane_m=ic,
+            hit_error_m=dist1,
             drum=ctx.target_drum,
         )
 
@@ -481,82 +456,92 @@ class ExecutedReward:
         raw: dict[str, torch.Tensor] = {}
         counts: dict[str, torch.Tensor] = {}
 
-        # ---- 1. executed contact -------------------------------------------
+        # ---- 1. executed contact ------------------------------------------
         cs = self.scorer.score(q_before, q_after, ctx)
-        near = (hit_index >= 1) & (hit_index <= int(cfg.window_ticks))
-        # a crossing counts for the scheduled strike when it happens inside the
-        # window around the scheduled tick; anything else is a stray.
-        sched = cs.in_disk & (near | fired)
-        lat_s = torch.where(
-            sched,
-            ((hit_index.to(self.dtype) - 1.0) + cs.frac) * self.scorer.dt,
-            torch.zeros_like(cs.frac),
-        )
-        timing = torch.exp(-(lat_s / float(cfg.timing_tau_s)) ** 2) * sched
-        spd_ok = (cs.speed >= cfg.speed_lo) & (cs.speed <= cfg.speed_hi) & sched
-        terms["hit"] = cfg.w_hit * sched.to(self.dtype).sum(1)
-        terms["timing"] = cfg.w_timing * timing.sum(1)
-        terms["speed"] = cfg.w_speed * spd_ok.to(self.dtype).sum(1)
-        raw["hit_latency_s"] = lat_s.sum(1)
-        raw["contact_speed"] = (cs.speed * sched).sum(1)
-        counts["scheduled_hits"] = sched.to(self.dtype).sum(1)
-
-        # a hand that FIRED without a legal crossing anywhere in the window is
-        # the miss the RL stage exists to remove.  The env tracks the window
-        # across ticks and passes ``fired``; ``sched`` is this tick's crossing.
-        missed = fired & ~cs.in_disk
-        terms["miss"] = -cfg.w_miss * missed.to(self.dtype).sum(1)
-        counts["fired"] = fired.to(self.dtype).sum(1)
-        counts["missed"] = missed.to(self.dtype).sum(1)
-
-        # ---- 2. stray contact ----------------------------------------------
-        if drum_heads is not None:
+        if cfg.reward_mode == "binary_hits":
+            if drum_heads is None:
+                raise ValueError("binary_hits reward requires drum geometry")
             hits_any = self.scorer.any_drum_contact(
                 q_before, q_after, drum_heads, drum_axes, drum_radii, drum_valid,
                 ctx.contact_sigma, ctx.shaft_allowed,
-            )                                                     # (B, 2, D)
+            )
             goal_oh = torch.nn.functional.one_hot(
                 ctx.target_drum.clamp_min(0), hits_any.shape[2]
             ).bool() & (ctx.target_drum >= 0).unsqueeze(-1)
-            wrong = (hits_any & ~goal_oh).any(dim=2)
-            early = (hits_any & goal_oh).any(dim=2) & ~sched
-            terms["extra_hit"] = -cfg.w_extra_hit * wrong.to(self.dtype).sum(1)
-            terms["early_contact"] = -cfg.w_early_contact * early.to(self.dtype).sum(1)
-            counts["extra_hits"] = wrong.to(self.dtype).sum(1)
-            counts["early_contacts"] = early.to(self.dtype).sum(1)
+            on_goal = (hits_any & goal_oh).any(dim=2)
+            near = ((hit_index >= 1) &
+                    (hit_index <= int(cfg.hit_window_ticks))) | fired
+            correct = on_goal & near & (ctx.active > 0.5)
+            wrong_drum = (hits_any & ~goal_oh).any(dim=2)
+            off_time = on_goal & ~near
+            wrong = wrong_drum | off_time
+            terms["correct_hit"] = (
+                float(cfg.w_correct_hit) * correct.to(self.dtype).sum(1)
+            )
+            terms["wrong_hit"] = (
+                -float(cfg.w_wrong_hit) * wrong.to(self.dtype).sum(1)
+            )
+            counts["correct_hits"] = correct.to(self.dtype).sum(1)
+            counts["wrong_hits"] = wrong.to(self.dtype).sum(1)
+            counts["fired"] = fired.to(self.dtype).sum(1)
+            raw["contact_speed"] = (cs.speed * correct).sum(1)
         else:
-            terms["extra_hit"] = z.clone()
-            terms["early_contact"] = z.clone()
+            due = (ctx.active > 0.5) & fired
+            due_f = due.to(self.dtype)
+            hit_quality = 1.0 / (
+                1.0 + (cs.hit_error_m / float(cfg.hit_error_scale_m)).square()
+            )
+            target_speed = ctx.v_star.norm(dim=-1)
+            speed_error = (cs.speed - target_speed).abs()
+            speed_quality = 1.0 / (
+                1.0 + (speed_error / float(cfg.impact_speed_scale_mps)).square()
+            )
+            terms["hit_error"] = cfg.w_hit_error * (hit_quality * due_f).sum(1)
+            terms["impact_speed"] = (
+                cfg.w_impact_speed * hit_quality * speed_quality * due_f
+            ).sum(1)
+            denom = due_f.sum(1).clamp_min(1.0)
+            raw["hit_error_m"] = (
+                cs.hit_error_m * due_f
+            ).sum(1) / denom
+            raw["impact_speed_error_mps"] = (
+                speed_error * due_f
+            ).sum(1) / denom
+            raw["contact_speed"] = (
+                cs.speed * due_f
+            ).sum(1) / denom
+            counts["contact_evaluated"] = due_f.sum(1)
+            counts["fired"] = fired.to(self.dtype).sum(1)
 
-        # ---- 3. the analytic half, on the plan ------------------------------
-        if self.cost is not None and traj is not None:
+        # ---- 2. continuous collision avoidance on the plan -----------------
+        if cfg.reward_mode == "binary_hits":
+            terms["collision_avoidance"] = z.clone()
+        elif self.cost is not None and traj is not None:
             q0 = q_plan0 if q_plan0 is not None else q_before
             v0 = v_plan0 if v_plan0 is not None else torch.zeros_like(q0)
             lengths = group_lengths(ctx.hit_index).to(self.dtype)
             ct: CostTerms = self.cost(q0, traj, v0, ctx, lengths=lengths,
                                       elem_mask=elem_mask)
-            if cfg.plan_terms is None:
-                pen = ct.total
-            else:
-                pen = sum((ct.terms[k] for k in cfg.plan_terms if k in ct.terms),
-                          torch.zeros_like(ct.total))
-            terms["plan_cost"] = -cfg.w_plan_cost * pen
+            collision = ct.terms.get("collision", torch.zeros_like(ct.total))
+            terms["collision_avoidance"] = -cfg.w_collision * collision
             raw["plan_cost_total"] = ct.total.detach()
             for k, v in ct.terms.items():
                 raw[f"plan.{k}"] = v.detach()
             for k, v in ct.violations.items():
                 raw[f"viol.{k}"] = v.detach()
         else:
-            terms["plan_cost"] = z.clone()
+            terms["collision_avoidance"] = z.clone()
 
-        # ---- 4. tracking, with the lead accounted for -----------------------
+        # Tracking remains diagnostic only; it is deliberately absent from the
+        # reward so contact geometry cannot be outvoted by an every-tick bonus.
         err = (q_after - ref0)
         rms = err.square().mean(dim=1).sqrt()
-        terms["track"] = cfg.w_track * torch.exp(-(rms / float(cfg.track_scale_rad)) ** 2)
         raw["track_rms_rad"] = rms
 
         # ---- 4b. idle-arm home posture (RL priority 4) ------------------------
-        if self.idle is not None and traj is not None:
+        if cfg.reward_mode == "binary_hits":
+            terms["idle_home"] = z.clone()
+        elif self.idle is not None and traj is not None:
             e = self.idle(traj, ctx.active, elem_mask)
             terms["idle_home"] = -cfg.w_idle_home * (
                 e / (float(cfg.idle_home_scale_rad) ** 2))
