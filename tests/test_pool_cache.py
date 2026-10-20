@@ -32,6 +32,15 @@ from amortized_opt.warmstart_data import CONTEXT_FIELDS  # noqa: E402
 from amortized_opt.waist_aim import WaistAimConfig  # noqa: E402
 
 
+def test_saved_line_search_can_be_disabled_for_targeted_teacher_training(tmp_path):
+    saved = tmp_path/'args.json'
+    saved.write_text(json.dumps({'line_search': True}))
+    args = tp.parse_args(['--args-json', str(saved), '--no-line-search',
+                          '--dls-terminal-goal-pairs', 'right:hihat'])
+    assert args.line_search is False
+    assert args.dls_terminal_goal_pairs == ['right:hihat']
+
+
 def _args(**kw):
     base = dict(
         scenarios=100,
@@ -100,6 +109,35 @@ def test_fingerprint_moves_when_tilt_changes():
         )),
     )
     assert a != b
+
+
+def test_cache_identity_includes_all_hand_goal_coverage_and_old_mapping_is_explicit():
+    assert tp._pool_fingerprint(_args(),_scen(all_hand_drum_goals=True)) != tp._pool_fingerprint(_args(),_scen(all_hand_drum_goals=False))
+    assert tp.parse_args([]).all_hand_drum_goals
+    assert not tp.parse_args(['--no-all-hand-drum-goals']).all_hand_drum_goals
+
+
+def test_fresh_selector_resume_rate_override_is_explicit_and_positive():
+    assert tp.parse_args(['--line-search-legacy-resume-seed','3e-5']).line_search_legacy_resume_seed==3e-5
+    with pytest.raises(SystemExit):tp.parse_args(['--line-search-legacy-resume-seed','0'])
+
+
+def test_startup_coverage_checks_actual_active_targets_and_single_hand_lookahead():
+    import torch
+    from amortized_opt.rhythm import DrumKit
+    kit=DrumKit.from_layout();pairs=[(h,d) for h,hand in enumerate(('left','right')) for d in kit.eligible(hand)]
+    drums=torch.full((len(pairs),2),-1,dtype=torch.long);active=torch.zeros_like(drums,dtype=torch.bool)
+    for row,(h,d) in enumerate(pairs):drums[row,h]=d;active[row,h]=True
+    class Pool:
+        data={50:dict(drum=drums,active=active)}
+        def __len__(self):return len(drums)
+    report=tp.training_goal_coverage(Pool(),Phase2ScenarioConfig())
+    assert not report['missing_active_targets']
+    assert len(report['expected_hand_drum_pairs'])==13
+    assert report['synthetic_source_destination_pairs']==85
+    active[pairs.index((1,kit.index('hihat'))),1]=False
+    with pytest.raises(RuntimeError,match='right:hihat'):
+        tp.training_goal_coverage(Pool(),Phase2ScenarioConfig())
 
 
 def test_a_cache_without_the_marker_is_refused(tmp_path):

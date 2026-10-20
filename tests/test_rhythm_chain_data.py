@@ -20,6 +20,8 @@ from amortized_opt.rhythm_chain_data import (
     SCHEDULE_FIELDS,
     SCHEDULE_SCHEMA,
     build_dual_transition_clips,
+    build_focused_single_transition_clips,
+    training_goal_pairs,
     build_idle_entry_index,
     dual_transition_kept_count,
     generate_far_fetched_scenarios,
@@ -52,6 +54,44 @@ def test_dual_transition_kept_count_in_ballpark(kit, library):
     n = dual_transition_kept_count(kit, library, cfg=DualTransitionConfig(sep_max=0.45))
     # Nominal aims: tens, not hundreds; not empty.
     assert 20 <= n <= 80, f"unexpected kept count {n}"
+
+
+def test_focused_right_hihat_clips_supply_post_hit_and_future_goals(kit, library):
+    cfg=Phase2ScenarioConfig(far_goal_pairs=(('right','hihat'),))
+    clips=build_focused_single_transition_clips(kit,library,cfg)
+    assert len(clips)==3*len(kit.eligible('right'))
+    assert {c.hits[0].drum for c in clips}==set(kit.eligible('right'))
+    for clip in clips:
+        assert all(hit.hand=='right' for hit in clip.hits)
+        assert clip.hits[1].drum_name==clip.hits[3].drum_name=='hihat'
+        assert clip.hits[1].time>clip.hits[0].time
+        assert clip.next_hits('right',clip.hits[1].time+1e-6,1)
+
+
+def test_default_training_targets_and_single_hand_clips_cover_all_allowed_pairs(kit,library):
+    cfg=Phase2ScenarioConfig()
+    pairs=training_goal_pairs(kit,library,cfg)
+    assert len(pairs)==13
+    assert ('right','hihat') in pairs and ('left','cymbal_right') in pairs
+    assert ('left','floor_tom') not in pairs
+    clips=build_focused_single_transition_clips(kit,library,cfg)
+    assert len(clips)==85*3
+    transitions={(hit.hand,a.drum,b.drum) for clip in clips for hit in clip.hits[:1]
+                 for a,b in zip(clip.hits[:-1],clip.hits[1:])}
+    assert len(transitions)==85
+    assert {kit.names[d] for h,s,d in transitions if h=='right'}==set(kit.names)
+    assert {kit.names[d] for h,s,d in transitions if h=='left'}==set(kit.names)-{'floor_tom'}
+
+
+def test_balanced_far_generation_retains_equal_accepted_examples_for_all_targets(kit,library):
+    cfg=_phase_a_cfg()
+    raw=generate_far_fetched_scenarios(52,None,seed=515,cfg=cfg,kit=kit,library=library)
+    assert raw['stats']['accepted']==52
+    assert len(raw['stats']['goal_pair_accepted'])==13
+    assert set(raw['stats']['goal_pair_accepted'].values())=={4}
+    actual={(h,kit.names[int(row[h])]) for data in raw['buckets'].values()
+            for row,active in zip(data['drum'],data['active']) for h in range(2) if active[h]}
+    assert len(actual)==13
 
 
 def test_dual_transition_rejects_arm_split(kit, library):
@@ -346,6 +386,7 @@ def test_roller_clip_list_matches_idle_index(kit, library, rcc_clips):
     from amortized_opt.rhythm_chain_data import roller_clip_list
 
     synth = build_dual_transition_clips(kit, library)
+    synth += build_focused_single_transition_clips(kit, library)
     entries, clips = build_idle_entry_index(list(rcc_clips), synth)
     rolled = roller_clip_list(kit, library=library, rcc_clips=list(rcc_clips))
     assert [c.name for c in rolled] == [c.name for c in clips]

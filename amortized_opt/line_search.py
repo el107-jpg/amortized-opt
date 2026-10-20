@@ -119,6 +119,9 @@ class LineSearchConfig:
     #: On probe budget exhaustion, skip the update instead of committing the
     #: configured epsilon floor.  Off preserves the legacy floor-commit path.
     skip_on_probe_exhaustion: bool = False
+    #: A failed stochastic minibatch should not permanently reduce the rate
+    #: that worked on prior batches. Retry the next batch from that rate.
+    retry_retained_rate: bool = False
     enabled: bool = True
     #: Deprecated compatibility field. It is checkpointed and logged but never
     #: changes Armijo/curvature, which require the exact scalar-objective

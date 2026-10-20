@@ -116,6 +116,9 @@ class ViolationCriticConfig:
     primary_anchor_per_task: int = 1
     primary_boundary_per_task: int = 1
     primary_interior_per_task: int = 4
+    # Fill the remaining actor rows with independent tasks when disabled,
+    # retaining the anchor/boundary/interior timing curriculum.
+    primary_mpc_enabled: bool = True
     # Historical close-feasibility limits retained as the Bellman-admission
     # reference. The critic MPC parent pool itself accepts every actor row;
     # Bellman replay uses half these terminal/collision allowances and half the

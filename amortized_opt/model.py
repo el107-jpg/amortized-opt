@@ -102,11 +102,14 @@ class ModelConfig:
     #: terminal joint pose from the current kit/goals and measured (q, qdot);
     #: an analytic low-acceleration generator expands that pose into the
     #: decoder initialization.  The weights are part of the main checkpoint,
-    #: but are always stop-gradient.
+    #: and frozen by default. Joint fine-tuning can open the full seed gradient
+    #: path with terminal_head_trainable while retaining the terminal objective.
     terminal_head: bool = False
     terminal_head_num_drums: int = 7
     terminal_head_width: int = 128
     terminal_head_depth: int = 2
+    terminal_hihat_library_fallback: bool = True
+    terminal_head_trainable: bool = False
 
     d_ctx: int = 256
     ctx_layers: int = 2
@@ -1374,6 +1377,8 @@ class AmortizedOptimizer(nn.Module):
                 width=self.cfg.terminal_head_width,
                 depth=self.cfg.terminal_head_depth,
                 dt=self.cfg.dt,
+                hihat_library_fallback=self.cfg.terminal_hihat_library_fallback,
+                trainable=self.cfg.terminal_head_trainable,
             )
         else:
             self.terminal_initializer = None
@@ -1385,7 +1390,9 @@ class AmortizedOptimizer(nn.Module):
         """Load and freeze the pretrained terminal MLP."""
         if self.terminal_initializer is None:
             raise RuntimeError("ModelConfig.terminal_head is disabled")
-        return self.terminal_initializer.load_pretrained(path, map_location=map_location)
+        ck = self.terminal_initializer.load_pretrained(path, map_location=map_location)
+        self.cfg.terminal_hihat_library_fallback = self.terminal_initializer.hihat_library_fallback
+        return ck
 
     def initial_trajectory(
         self, ctx: ContextInputs, state: torch.Tensor, masks: WaypointMasks

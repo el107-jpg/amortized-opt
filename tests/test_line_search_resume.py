@@ -29,7 +29,7 @@ from amortized_opt.line_search_step import (
     init_line_search_runtime,
     runtime_state_dict,
 )
-from scripts.train_phase2 import _resume_training_states
+from scripts.train_phase2 import _line_search_resume_policy, _resume_training_states
 
 
 def _tiny_adam(lr: float = 1e-4) -> torch.optim.AdamW:
@@ -62,6 +62,60 @@ def _prime_adam_state(opt: torch.optim.AdamW) -> None:
                 p.grad = torch.zeros_like(p)
     opt.step()
     opt.zero_grad(set_to_none=True)
+
+
+def test_fresh_selector_resume_keeps_absolute_activation_and_defaults_safety():
+    delay, strict, reject, skip = _line_search_resume_policy(
+        resume_step=32_000,
+        line_search_fresh=True,
+        activate_after_updates=10_000,
+        strict_actual_update=None,
+        reject_current_probe_increase=None,
+        skip_on_probe_exhaustion=None,
+        selector_update_count=31_950,
+    )
+    assert delay == 0
+    assert strict and reject and skip
+
+
+def test_fresh_selector_resume_subtracts_prior_selector_clock_from_delay():
+    delay, strict, reject, skip = _line_search_resume_policy(
+        resume_step=32_000,
+        line_search_fresh=True,
+        activate_after_updates=40_000,
+        strict_actual_update=None,
+        reject_current_probe_increase=None,
+        skip_on_probe_exhaustion=None,
+        selector_update_count=31_500,
+    )
+    assert delay == 8_500
+    assert strict and reject and skip
+
+
+def test_new_training_retains_delay_and_legacy_safety_defaults():
+    delay, strict, reject, skip = _line_search_resume_policy(
+        resume_step=0,
+        line_search_fresh=False,
+        activate_after_updates=10_000,
+        strict_actual_update=None,
+        reject_current_probe_increase=None,
+        skip_on_probe_exhaustion=None,
+    )
+    assert delay == 10_000
+    assert not strict and not reject and not skip
+
+
+def test_fresh_resume_policy_honors_explicit_safety_overrides():
+    delay, strict, reject, skip = _line_search_resume_policy(
+        resume_step=32_000,
+        line_search_fresh=True,
+        activate_after_updates=10_000,
+        strict_actual_update=False,
+        reject_current_probe_increase=False,
+        skip_on_probe_exhaustion=False,
+    )
+    assert delay == 0
+    assert not strict and not reject and not skip
 
 
 def test_reset_optimizer_plus_fresh_selector_keeps_resume_payload_but_not_state():

@@ -118,6 +118,7 @@ from .lagrangian import (
     limit_group_name,
 )
 from .rnea import BatchedRNEA
+from .convex_distance import capsule_cylinder_signed_distance
 from .sdf import (
     DrumSceneSpec,
     SdfPenalty,
@@ -430,6 +431,7 @@ __all__ = [
     "SdfPenalty",
     "hit_region_dist",
     "segment_cylinder_sdf",
+    "capsule_cylinder_signed_distance",
     "segment_hit_region",
     "segment_segment_sdf",
     "default_layout_path",

@@ -8,7 +8,8 @@ The rules encoded here are *tuned*, not derived -- they came out of the repo's
 RL hit detector and months of trajopt tuning -- so this is a port, not a
 reimplementation.  ``tests/test_strike_conformance.py`` asserts every function
 matches the repo original to 1e-12 on randomized inputs (and skips when the repo
-is absent).
+is absent). The hi-hat aim has a deliberate 20 mm inset; its legal head region
+still matches the original.
 
 Two consumers:
 
@@ -30,7 +31,8 @@ Semantic summary (see the individual docstrings for the reasoning):
   aimed 45 % of the rim-buffered radius toward the drummer, near semicircle only.
 * **Everything else** (the snare) is a tip-only pad aimed dead centre, hit disk
   = head radius minus the rim buffer, whole disk legal.
-* Every drum requires the terminal stick elevation to sit in a two-sided band.
+* Pad strikes require the terminal stick elevation to sit in a two-sided band;
+  cymbals and the hi-hat do not.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ __all__ = [
     "CYMBAL_CONTACT_SIGMA_MIN",
     "CYMBAL_EDGE_FRACTION",
     "HIHAT_RIM_FRACTION",
+    "HIHAT_AIM_INSET_M",
     "HIHAT_SHOULDER_SIGMA",
     "STICK_ELEV_MAX_DEG",
     "STICK_ELEV_MIN_DEG",
@@ -94,8 +97,9 @@ CYMBAL_CONTACT_SIGMA_FALLBACK = 0.05
 #: along the facing direction (0 = bell, 1 = rim).
 CYMBAL_EDGE_FRACTION = 0.75
 
-#: Same, for the HI-HAT, which is aimed at the rim itself rather than the bow.
+#: Near-edge aim with room for the stick capsule to enter through the top.
 HIHAT_RIM_FRACTION = 1.0
+HIHAT_AIM_INSET_M = 0.020
 
 #: Same idea for the TOMS, as a fraction of the *usable* (rim-buffered) radius
 #: out from the centre toward the drummer.
@@ -333,7 +337,8 @@ def _strike_aim_offset(
     """
     cymbal = is_cymbal_name(name)
     if is_hihat_name(name):
-        frac = HIHAT_RIM_FRACTION
+        frac = min(HIHAT_RIM_FRACTION,
+                   max(0.0, 1.0-HIHAT_AIM_INSET_M/max(float(radius), 1e-9)))
     elif cymbal:
         frac = CYMBAL_EDGE_FRACTION
     elif is_tom_name(name):

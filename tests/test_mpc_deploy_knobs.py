@@ -51,6 +51,23 @@ def _start(gen):
     return q, np.zeros(N)
 
 
+def test_plan_trace_preserves_rollout_and_records_applied_commands(kit):
+    plain = _gen(kit, freeze_wp=5, cmd_lead_s=.04)
+    traced = _gen(kit, freeze_wp=5, cmd_lead_s=.04)
+    planner = lambda req: req.init_traj.copy()
+    a = plain.run_episode(_clip(kit), *_start(plain), seed=3,
+                          max_steps=24, planner=planner)
+    trace = []
+    b = traced.run_episode(_clip(kit), *_start(traced), seed=3,
+                           max_steps=24, planner=planner, plan_trace=trace)
+    np.testing.assert_array_equal(a.q_hist, b.q_hist)
+    np.testing.assert_array_equal(a.cmd_hist, b.cmd_hist)
+    assert a.hit_steps == b.hit_steps
+    assert len(trace) == len(b.cmd_hist)
+    np.testing.assert_array_equal(np.stack([r['traj'][0] for r in trace]), b.cmd_hist)
+    np.testing.assert_array_equal(np.stack([r['q0'] for r in trace]), b.q_hist[:-1])
+
+
 # ----------------------------------------------------------- sticky aim point --
 def test_sticky_goal_point_holds_one_aim_per_hit(kit):
     """The same scheduled hit must not be re-jittered every tick."""

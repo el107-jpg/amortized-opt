@@ -17,6 +17,7 @@ import torch
 import amortized_opt as A
 from amortized_opt.constants import N_DOF, ready_joint_pos
 from amortized_opt.cost import CostConfig, FusedCost, StrikeContext
+from amortized_opt.train_cost import phase2_cost_config
 from amortized_opt.fk import stick_axis_local
 
 _HERE = Path(__file__).resolve().parent
@@ -41,6 +42,249 @@ def fixture_run():
 @pytest.fixture(scope="module")
 def cost_cpu():
     return FusedCost(CostConfig(), max_horizon=40, device="cpu", dtype=torch.float64)
+
+
+def test_target_top_entry_uses_physical_face_and_keeps_side_wrist_other_checks(cost_cpu, monkeypatch):
+    cost = cost_cpu
+    D, S, P = cost.n_drums, 4, cost.n_points
+    tensor = lambda x: torch.as_tensor(x, dtype=torch.float64)
+    heads = torch.full((D, 3), 20., dtype=torch.float64); heads[0] = tensor([0, 0, 1])
+    axes = tensor([0, 0, 1]).expand(D, -1)
+    monkeypatch.setattr(cost, 'c_heads', heads)
+    monkeypatch.setattr(cost, 'c_axes', axes)
+    monkeypatch.setattr(cost, 'c_radii', torch.full((D,), .15, dtype=torch.float64))
+    monkeypatch.setattr(cost, 'c_half_h', torch.full((D,), .1, dtype=torch.float64))
+    bodies = heads-.1*axes
+    monkeypatch.setattr(cost, 'c_body_c', bodies)
+    monkeypatch.setattr(cost, 'c_under_c', heads-.25*axes)
+    monkeypatch.setattr(cost, 'c_heights_uc', torch.full((D,), .21, dtype=torch.float64))
+    monkeypatch.setattr(cost, 'c_under_half', torch.full((D,), .04, dtype=torch.float64))
+    tip = tensor([[0, 0, 1.1], [0, 0, 1.02], [0, 0, 1.005], [0, 0, .98]])
+    points = tip[:, None].expand(-1, P, -1).clone()
+    points[:, 1] = tip+tensor([0, 0, .4])
+    points[:, -1] = tensor([0, 0, 1.7])
+    idle = torch.full_like(points, 30.)
+    monkeypatch.setattr(cost, '_points_world', lambda frames, hand, ctx: points if hand == 'left' else idle)
+    frames = {'torso': (torch.eye(3, dtype=torch.float64)[None].expand(S, -1, -1),
+                        torch.full((S, 3), 40., dtype=torch.float64))}
+    ctx = _synthetic_ctx(1, D, 'cpu', torch.float64,
+                         kl=torch.tensor([50]), kr=torch.tensor([50]), active=(1., 0.))
+    ctx.p_star[:] = tensor([0, 0, .99])  # aim is 10 mm below physical head
+    ctx.n_out[:] = tensor([0, 0, 1]); ctx.hit_radius[:] = .12
+    ctx.disk_offset.zero_(); ctx.has_half_plane.zero_()
+    ctx.contact_sigma[:] = .2; ctx.shaft_allowed.zero_()
+    masks = {'left': torch.ones(1, S, dtype=torch.float64),
+             'right': torch.zeros(1, S, dtype=torch.float64)}
+    def clearance():
+        diag = {}
+        cost._collision(frames, 1, S, ctx, masks, {}, {}, {}, diag, {}, None)
+        return diag['collision_min_sdf'].item()
+    assert clearance() < -.01  # early target body contact under checkpoint law
+    ctx.target_top_entry_depth_m = .07
+    assert clearance() >= 0
+    ctx.p_star[:] = tensor([0, 0, .94])
+    assert clearance() >= 0  # collision face is independent of the inward aim
+    # The target's wrist sphere always remains checked.
+    points[:, -1] = tensor([0, 0, .98])
+    assert clearance() < 0
+    points[:, -1] = tensor([0, 0, 1.7])
+    # A different drum in the same path gets no target exemption.
+    bodies[1] = bodies[0]
+    assert clearance() < 0
+    bodies[1] = heads[1]-.1*axes[1]
+    # Entering laterally below the head stays a collision.
+    tip[:] = tensor([[.25, 0, .97], [.18, 0, .97], [.12, 0, .97], [.08, 0, .97]])
+    points[:, 0] = tip; points[:, 1] = tip+tensor([0, 0, .4])
+    assert clearance() < 0
+    # A randomized tilt must rotate the physical cylinder and certificate,
+    # as well as the terminal normal supplied in the goal tokens.
+    rotation = tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
+    local_tip = tensor([[0, 0, .1], [0, 0, .02], [0, 0, .005], [0, 0, -.02]])
+    head = heads[0]
+    points[:, 0] = local_tip @ rotation.T + head
+    points[:, 1] = (local_tip+tensor([0, 0, .4])) @ rotation.T + head
+    points[:, -1] = tensor([0, 0, .7]) @ rotation.T + head
+    ctx.drum_head_centers = heads[None]
+    ctx.drum_axes = (axes @ rotation.T)[None]
+    ctx.n_out[:] = axes[0] @ rotation.T
+    assert clearance() >= 0
+    ctx.drum_axes = None
+    assert clearance() < 0
+
+
+def test_v4_target_collision_exempts_downward_upper_side_but_not_deep_or_horizontal(cost_cpu,monkeypatch):
+    cost=cost_cpu.with_config(contact_scoring_mode='isaac_v4')
+    D,S,P=cost.n_drums,4,cost.n_points
+    t=lambda value:torch.as_tensor(value,dtype=torch.float64)
+    heads=torch.full((D,3),20.,dtype=torch.float64);heads[1]=t([0.,0.,1.])
+    axes=t([0.,0.,1.]).expand(D,-1)
+    monkeypatch.setattr(cost,'c_heads',heads)
+    monkeypatch.setattr(cost,'c_axes',axes)
+    monkeypatch.setattr(cost,'c_radii',torch.full((D,),.15,dtype=torch.float64))
+    monkeypatch.setattr(cost,'c_half_h',torch.full((D,),.05,dtype=torch.float64))
+    monkeypatch.setattr(cost,'c_body_c',heads-.05*axes)
+    monkeypatch.setattr(cost,'c_under_c',heads-.25*axes)
+    monkeypatch.setattr(cost,'c_heights_uc',torch.full((D,),.21,dtype=torch.float64))
+    monkeypatch.setattr(cost,'c_under_half',torch.full((D,),.04,dtype=torch.float64))
+    points=torch.zeros(S,P,3,dtype=torch.float64);points[:,-1]=t([0.,0.,3.])
+    far=torch.full_like(points,30.)
+    monkeypatch.setattr(cost,'_points_world',lambda frames,hand,ctx:points if hand=='left' else far)
+    ctx=_synthetic_ctx(1,D,'cpu',torch.float64,kl=torch.tensor([2]),
+        kr=torch.tensor([50]),active=(1.,0.))
+    ctx.target_drum[:,0]=1;ctx.shaft_allowed[:,0]=1.
+    ctx.p_star[:,0]=t([0.,0.,.99]);ctx.n_out[:,0]=t([0.,0.,1.])
+    masks={'left':torch.ones(1,S,dtype=torch.float64),
+           'right':torch.zeros(1,S,dtype=torch.float64)}
+    frames={'torso':(torch.eye(3,dtype=torch.float64)[None].expand(S,-1,-1),
+                    torch.full((S,3),40.,dtype=torch.float64))}
+    def check(path):
+        points[:,:-1]=t(path)[:,None]
+        diag={};cost._collision(frames,1,S,ctx,masks,{}, {}, {},diag,{},None)
+        return float(diag['collision_min_sdf']),float(diag['v4_upper_side_exempt_samples_left'][0])
+    good=check([[.159,0.,1.08],[.159,0.,1.001],[.155,0.,.997],[.154,0.,.996]])
+    deep=check([[.159,0.,1.08],[.159,0.,.998],[.155,0.,.994],[.154,0.,.993]])
+    horizontal=check([[.159,0.,1.08],[.159,0.,.997],[.155,0.,.997],[.154,0.,.997]])
+    top=check([[.10,0.,1.08],[.10,0.,1.02],[.10,0.,.997],[.10,0.,.98]])
+    assert good[1]>0 and good[0]>=0
+    assert deep[0]<0 and horizontal[0]<0
+    assert top[0]>=0
+
+
+def test_new_phase2_capsule_contact_objective_has_finite_terminal_and_collision_gradients():
+    cfg=phase2_cost_config(n_sub=1)
+    assert cfg.contact_scoring_mode=='isaac_v5'
+    class ZeroRNEA:
+        def to(self,*_args):return self
+        def rnea(self,q,*_args):return torch.zeros_like(q)
+    # This geometry/gradient test does not need Pinocchio's torque model.
+    cost=FusedCost(cfg,max_horizon=8,device='cpu',dtype=torch.float32,rnea=ZeroRNEA())
+    q0=torch.as_tensor(ready_joint_pos(),dtype=torch.float32)[None]
+    waypoints=q0[:,None].expand(1,8,-1).clone().requires_grad_(True)
+    ctx=_synthetic_ctx(1,cost.n_drums,'cpu',torch.float32,
+        kl=torch.tensor([5]),kr=torch.tensor([8]),active=(1.,0.))
+    ctx.target_drum[:,0]=1;ctx.shaft_allowed[:,0]=1.
+    ctx.n_out[:,0]=cost.c_axes[1]
+    ctx.p_star[:,0]=cost.c_heads[1]-.01*cost.c_axes[1]
+    ctx.hit_radius[:,0]=cost.c_radii[1]
+    ctx.v_star[:,0]=-2.4*cost.c_axes[1]
+    output=cost.forward(q0,waypoints,torch.zeros_like(q0),ctx)
+    assert torch.isfinite(output.total).all()
+    assert 'v4_upper_side_exempt_samples_left' in output.diagnostics
+    assert 'v4_speed_quality_left' in output.diagnostics
+    output.total.sum().backward()
+    assert waypoints.grad is not None and torch.isfinite(waypoints.grad).all()
+
+
+def test_v4_terminal_scores_probe_top_and_upper_side_not_legacy_deep_side(cost_cpu,monkeypatch):
+    from types import SimpleNamespace
+    cost=cost_cpu.with_config(contact_scoring_mode='isaac_v4',w_terminal_aim=0.)
+    legacy=cost_cpu.with_config(contact_scoring_mode='legacy',w_terminal_aim=0.)
+    for scorer in (cost,legacy):
+        heads=scorer.c_heads.clone();heads[1]=0.
+        monkeypatch.setattr(scorer,'c_heads',heads)
+        monkeypatch.setitem(scorer.c_mount_p,'left',torch.zeros(3,dtype=torch.float64))
+        monkeypatch.setitem(scorer.c_mount_axis,'left',torch.tensor([0.,0.,1.],dtype=torch.float64))
+        monkeypatch.setitem(scorer.c_mount_p,'right',torch.zeros(3,dtype=torch.float64))
+        monkeypatch.setitem(scorer.c_mount_axis,'right',torch.tensor([0.,0.,1.],dtype=torch.float64))
+        probes=torch.zeros_like(scorer.c_points['left'])
+        probes[0,2]=.2;probes[1:-1,2]=-.2
+        monkeypatch.setitem(scorer.c_points,'left',probes)
+        def frame(q,_name):
+            return torch.eye(3,dtype=q.dtype).expand(len(q),-1,-1),q[:,:3]
+        monkeypatch.setattr(scorer.fk,'frame',frame)
+    B,D=1,cost.n_drums
+    ctx=_synthetic_ctx(B,D,'cpu',torch.float64,kl=torch.tensor([2]),
+        kr=torch.tensor([2]),active=(1.,0.))
+    ctx.target_drum[:,0]=1;ctx.shaft_allowed[:,0]=1.
+    ctx.p_star[:,0]=torch.tensor([0.,0.,-.01],dtype=torch.float64)
+    ctx.n_out[:,0]=torch.tensor([0.,0.,1.],dtype=torch.float64)
+    ctx.hit_radius[:,0]=.15
+    ctx.v_star[:,0]=torch.tensor([0.,0.,-2.4],dtype=torch.float64)
+    def score(current_z,previous_z,radial,scorer):
+        current=torch.zeros(1,N_DOF,dtype=torch.float64)
+        previous=torch.zeros_like(current)
+        current[0,:3]=torch.tensor([radial,0.,current_z-.2])
+        previous[0,:3]=torch.tensor([radial+.004,0.,previous_z-.2])
+        class Spline:
+            x=current[:,None]
+            max_segments=2
+            def knot(self,k):return current if int(k[0])==2 else previous
+        raw,viol,live,diag,counts={},{},{},{},{}
+        scorer._terminal(Spline(),ctx,raw,viol,live,diag,counts)
+        return float(raw['terminal_region']),diag
+    upper,upper_diag=score(-.003,.001,.148,cost)
+    deep,deep_diag=score(-.006,-.002,.148,cost)
+    top,top_diag=score(.01,.03,.10,cost)
+    old_deep,_=score(-.006,-.002,.148,legacy)
+    assert upper<deep and top<deep
+    assert deep>old_deep
+    assert upper_diag['v4_speed_quality_left'][0]<.25  # 0.2 m/s normal speed
+    assert torch.isfinite(top_diag['v4_top_contact_distance_left']).all()
+    ctx.has_half_plane[:,0]=1.
+    ctx.half_plane_dir[:,0]=torch.tensor([1.,0.,0.],dtype=torch.float64)
+    near,_=score(.01,.03,.10,cost)
+    far,_=score(.01,.03,-.10,cost)
+    old_far,_=score(.01,.03,-.10,legacy)
+    assert far==pytest.approx(near,abs=1e-6)
+    assert old_far>far+.01  # Old near-half-disk rule rejects valid far top.
+    shaft=cost.c_points['left'].clone()
+    shaft[:-1]=torch.tensor([1.,0.,1.],dtype=torch.float64)
+    shaft[3]=torch.tensor([0.,0.,.2],dtype=torch.float64)
+    monkeypatch.setitem(cost.c_points,'left',shaft)
+    shaft_hit,_=score(-.003,.001,.148,cost)
+    shaft[3]=torch.tensor([1.,0.,1.],dtype=torch.float64)
+    without_shaft,_=score(-.003,.001,.148,cost)
+    assert shaft_hit+.01<without_shaft
+
+
+def test_v5_terminal_repairs_a_hit_between_isaac_shaft_probes(cost_cpu,monkeypatch):
+    v4=cost_cpu.with_config(contact_scoring_mode='isaac_v4',w_terminal_aim=0.)
+    v5=cost_cpu.with_config(contact_scoring_mode='isaac_v5',w_terminal_aim=0.)
+    dtype=torch.float64
+    for scorer in (v4,v5):
+        heads=scorer.c_heads.clone();heads[1]=torch.tensor([-.025,0.,0.],dtype=dtype)
+        monkeypatch.setattr(scorer,'c_heads',heads)
+        radii=scorer.c_radii.clone();radii[1]=.009
+        monkeypatch.setattr(scorer,'c_radii',radii)
+        monkeypatch.setitem(scorer.c_mount_p,'left',torch.zeros(3,dtype=dtype))
+        monkeypatch.setitem(scorer.c_mount_axis,'left',torch.tensor([1.,0.,0.],dtype=dtype))
+        # v4's archived shaft cloud reaches the wrong, handle-side half.
+        cloud=scorer.c_points['left'].clone()
+        cloud[0]=torch.tensor([.2,0.,0.],dtype=dtype)
+        cloud[1:-1,0]=torch.linspace(-.2,.02,cloud.shape[0]-2,dtype=dtype)
+        cloud[1:-1,1:]=0.
+        monkeypatch.setitem(scorer.c_points,'left',cloud)
+        def frame(q,_name):
+            return torch.eye(3,dtype=q.dtype).expand(len(q),-1,-1),q[:,:3]
+        monkeypatch.setattr(scorer.fk,'frame',frame)
+    ctx=_synthetic_ctx(1,v5.n_drums,'cpu',dtype,kl=torch.tensor([2]),
+                       kr=torch.tensor([2]),active=(1.,0.))
+    ctx.target_drum[:,0]=1;ctx.shaft_allowed[:,0]=1.
+    ctx.p_star[:,0]=torch.tensor([-.025,0.,0.],dtype=dtype)
+    ctx.n_out[:,0]=torch.tensor([0.,0.,1.],dtype=dtype)
+    ctx.hit_radius[:,0]=.009
+    ctx.v_star[:,0]=torch.tensor([0.,0.,-2.4],dtype=dtype)
+    previous=torch.zeros(1,N_DOF,dtype=dtype)
+    previous[0,:3]=torch.tensor([-.2,0.,.02],dtype=dtype)
+    def evaluate(scorer,y):
+        current=torch.zeros(1,N_DOF,dtype=dtype)
+        current[0,:3]=torch.tensor([-.2,y,.009],dtype=dtype)
+        current.requires_grad_(True)
+        class Spline:
+            x=current[:,None]
+            max_segments=2
+            def knot(self,k):return current if int(k[0])==2 else previous
+        raw,viol,live,diag,counts={},{},{},{},{}
+        scorer._terminal(Spline(),ctx,raw,viol,live,diag,counts)
+        return current,raw,diag
+    _,_,old=evaluate(v4,0.)
+    current,raw,new=evaluate(v5,0.)
+    assert old['v4_geometric_min_distance_left'][0]>.007
+    assert new['v4_geometric_min_distance_left'][0]<1e-6
+    moved,repair,_=evaluate(v5,.03)
+    repair['terminal_region'].backward()
+    assert torch.isfinite(moved.grad).all()
+    assert moved.grad[0,1]>0  # gradient descent moves inward toward the head
 
 
 def _pack(cases, trajs, H, dtype=torch.float64):
@@ -224,6 +468,44 @@ def test_inactive_hand_contributes_no_terminal_cost():
 
 
 # --------------------------------------------------------------- gradients --
+def test_waist_yaw_monotonic_gradient_matches_its_spline_scalar():
+    """Internal spline samples contribute on both sides of each increment."""
+    H, B = 5, 2
+    cost = FusedCost(CostConfig(n_sub=2), max_horizon=H, device="cpu",
+                     dtype=torch.float64)
+    yaw_i = cost.joint_names.index("waist_yaw_joint")
+    q0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    wp = torch.zeros(B, H, N_DOF, dtype=torch.float64)
+    wp[0, :, yaw_i] = torch.tensor(
+        [-0.22, 0.18, -0.15, 0.8, 0.9], dtype=torch.float64
+    )
+    wp.requires_grad_(True)
+    v0 = torch.zeros(B, N_DOF, dtype=torch.float64)
+    kl = torch.tensor([3, H])
+    kr = torch.tensor([H, H])
+    ctx = _synthetic_ctx(B, cost.n_drums, "cpu", torch.float64, kl=kl, kr=kr)
+    ctx.active[0] = torch.tensor([1.0, 0.0], dtype=torch.float64)
+    ctx.active[1] = 0.0
+    ctx.waist_yaw_ref = torch.full((B, H), 1.0, dtype=torch.float64)
+
+    def raw_for(x):
+        return cost.forward(q0, x, v0, ctx).raw["waist_yaw_monotonic"]
+
+    raw_for(wp).sum().backward()
+    grad = wp.grad.detach().clone()
+    eps = 1.0e-6
+    fd = torch.zeros_like(grad)
+    for k in range(H):
+        plus = wp.detach().clone()
+        minus = wp.detach().clone()
+        plus[0, k, yaw_i] += eps
+        minus[0, k, yaw_i] -= eps
+        fd[0, k, yaw_i] = (raw_for(plus).sum() - raw_for(minus).sum()) / (2 * eps)
+
+    assert raw_for(wp)[1].item() == 0.0  # inactive batch row stays masked
+    assert torch.allclose(grad, fd, atol=2e-6, rtol=2e-5)
+
+
 def test_gradcheck_small():
     torch.manual_seed(3)
     H, B = 6, 2

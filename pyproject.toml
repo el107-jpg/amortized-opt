@@ -28,6 +28,7 @@ pinocchio = ["pin>=2.7"]
 # scripts/render_mpc.py and the report scripts.
 plots = ["matplotlib>=3.8"]
 monitoring = ["tensorboard>=2.14"]
+assignment-search = ["cma>=4.4,<5", "tensorboard>=2.14"]
 editor = [
     "fastapi>=0.110",
     "uvicorn>=0.29",

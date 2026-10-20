@@ -53,7 +53,12 @@ from .constants import (
     G1_UPPER_BODY_JOINTS,
     N_DOF,
     PELVIS_IN_ENV,
+    SHAFT_HIT_SAMPLES,
     STICK_LENGTH,
+    STICK_RADIUS,
+    TIP_RADIUS,
+    UPPER_ARM_RADIUS,
+    FOREARM_RADIUS,
     ready_joint_pos,
 )
 from .cost import FusedCost
@@ -62,8 +67,8 @@ from .fk import (
     StickRandomization,
     stick_axis_local,
     stick_mount_transform,
+    stick_shaft_offsets,
 )
-from .hand_assign import LIMB_LEFT, LIMB_RIGHT, kit_graph_from_layout
 from .lagrangian import ALConfig, AugmentedLagrangian
 from .limits import urdf_position_limits
 from .phase2_data import strike_geometry_table
@@ -79,9 +84,14 @@ from .sdf import (
     segment_hit_region,
     segment_segment_sdf,
 )
+from .target_contact import v4_static_probe_distance
+from .capsule_contact import capsule_static_distance
+from .constants import SHAFT_HIT_SPAN
+from .convex_distance import capsule_cylinder_signed_distance
 from .strike import (
     CYMBAL_CONTACT_SIGMA_FALLBACK,
     HIHAT_SHOULDER_SIGMA,
+    STICK_TIP_SIGMA,
     is_cymbal_name,
     strike_axial_limits,
 )
@@ -106,7 +116,6 @@ __all__ = [
 ]
 
 HANDS: tuple[str, str] = ("left", "right")
-_LIMBS: tuple[str, str] = (LIMB_LEFT, LIMB_RIGHT)
 IDLE_HAND_FRAC: float = 0.15
 #: Per-drum block in :func:`pack_features` (pos 3 + axis 3 + radius 1).
 FEATURE_DIM_PER_DRUM: int = 7
@@ -125,13 +134,10 @@ _ELEV_CYMBAL_TARGET_Z: float = 0.50
 #: meshes.  These are conservative capsules in the same spirit as
 #: ``FIXED_LOWER_BODY_CAPSULES``.  :class:`~amortized_opt.cost.FusedCost`
 #: scores only the stick and the wrist.
-_UPPER_ARM_RADIUS: float = 0.040
-_FOREARM_RADIUS: float = 0.035
+_UPPER_ARM_RADIUS: float = UPPER_ARM_RADIUS
+_FOREARM_RADIUS: float = FOREARM_RADIUS
 _STICK_DRUM_SAMPLES: int = 8
 _WAIST_YAW_SIGMA_DEG: float = 30.0
-#: No-crossover rule, by name.  Left does not play the floor tom; right does
-#: not play the hi-hat.  Matches :meth:`KitGraph.eligible` on this layout.
-_BANNED_DRUM: dict[str, str] = {"left": "floor_tom", "right": "hihat"}
 
 
 def feature_dim(num_drums: int) -> int:
@@ -439,19 +445,11 @@ def sample_terminal_batch(
     base = kit if kit is not None else DrumKit.from_layout()
     kr = kit_rand if kit_rand is not None else _default_kit_rand()
     sr = stick_rand if stick_rand is not None else _default_stick_rand()
-    graph = kit_graph_from_layout()
     names = tuple(base.names)
     D = base.num_drums
     eligible: list[list[int]] = []
-    for hand, limb in zip(HANDS, _LIMBS):
-        banned = _BANNED_DRUM[hand]
-        eligible.append(
-            [
-                i
-                for i, nm in enumerate(names)
-                if nm != banned and graph.eligible(limb, nm)
-            ]
-        )
+    for hand in HANDS:
+        eligible.append(base.eligible(hand))
 
     pos = np.zeros((n, D, 3), dtype=np.float64)
     axes = np.zeros((n, D, 3), dtype=np.float64)
@@ -605,6 +603,10 @@ class TerminalPoseConfig:
     softmin_temp: float = _SOFTMIN_TEMP
     elev_drum_target_deg: float = _ELEV_DRUM_TARGET_DEG
     elev_cymbal_target_z: float = _ELEV_CYMBAL_TARGET_Z
+    #: Pose-only geometry surrogate. Archived role checkpoints omit this and
+    #: therefore keep their original near-half-disk/penetrated-slab objective.
+    contact_scoring_mode: str = 'legacy'
+    physics_loss_version: str = 'legacy'
 
 
 @dataclass
@@ -629,6 +631,12 @@ class TerminalPoseCost:
         drum_names: tuple[str, ...] | None = None,
     ):
         self.cfg = cfg or TerminalPoseConfig()
+        if self.cfg.physics_loss_version not in ('legacy', 'geometry_v2'):
+            raise ValueError('Unknown terminal-pose physics loss version')
+        self._capsule_distance = (capsule_cylinder_signed_distance
+            if self.cfg.physics_loss_version == 'geometry_v2' else segment_cylinder_sdf)
+        if self.cfg.contact_scoring_mode not in ('legacy','isaac_v4','isaac_v5'):
+            raise ValueError('Unknown terminal-pose contact scoring mode')
         self.device = torch.device(device)
         self.dtype = dtype
         self.fk = fk if fk is not None else ChainFK(
@@ -650,6 +658,13 @@ class TerminalPoseCost:
         )
         self.axial_lo, self.axial_hi = strike_axial_limits()
         self.butt_sigma = -0.5 * float(STICK_LENGTH)
+        mount=stick_mount_transform('left')[1]
+        axis=stick_axis_local('left')
+        shaft=np.asarray(stick_shaft_offsets('left',SHAFT_HIT_SAMPLES))
+        fractions=np.r_[1.,((shaft-mount)@axis)/float(STICK_TIP_SIGMA)]
+        self.probe_sigma_fractions=torch.as_tensor(fractions,device=self.device,dtype=dtype)
+        self.probe_radii=torch.as_tensor([TIP_RADIUS,*([STICK_RADIUS]*SHAFT_HIT_SAMPLES)],
+                                          device=self.device,dtype=dtype)
         self.yaw_i = G1_UPPER_BODY_JOINTS.index("waist_yaw_joint")
 
     def __call__(self, q, batch, weights=None) -> TerminalPoseResult:
@@ -675,6 +690,11 @@ class TerminalPoseCost:
         rad = batch.drum_radius.to(dtype)
         names = batch.drum_names or self.drum_names
         geo = strike_geometry_table(pos_p, ax_d, rad, names)
+        if cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+            edge=torch.as_tensor([is_cymbal_name(name) for name in names],
+                                 device=q.device,dtype=torch.bool)
+            geo['has_hp']=torch.where(edge[None],torch.zeros_like(geo['has_hp']),
+                                      geo['has_hp'])
 
         hit_sum = q.new_zeros(B)
         hit_dist_aux = q.new_zeros(B, 2)
@@ -702,7 +722,9 @@ class TerminalPoseCost:
             cym = batch.is_cymbal[:, hi]
             # Pads: degenerate bead segment.  Cymbals/hi-hat: real shaft
             # sigma in [shaft_lo, tip_sigma] (outer ~15 cm on a nominal stick).
-            sig_lo = torch.where(cym, shaft_lo, tip_s)
+            sig_lo = torch.where(cym,
+                tip_s-SHAFT_HIT_SPAN if cfg.contact_scoring_mode=='isaac_v5' else shaft_lo,
+                tip_s)
             sig_hi = tip_s
             a = origin_w + sig_lo.unsqueeze(-1) * axis_w
             b = origin_w + sig_hi.unsqueeze(-1) * axis_w
@@ -723,6 +745,23 @@ class TerminalPoseCost:
                 self.axial_lo, self.axial_hi,
                 return_candidates=True,
             )
+            v4_probe_dist=None
+            if cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                if cfg.contact_scoring_mode=='isaac_v5':
+                    low_sigma=tip_s-SHAFT_HIT_SPAN
+                    physical_mount=origin_w+low_sigma[:,None]*axis_w
+                    physical_tip=origin_w+tip_s[:,None]*axis_w
+                    v4_probe_dist,_,_,fractions,_=capsule_static_distance(
+                        physical_mount,physical_tip,pos_p[ar,safe],n_out,
+                        rad[ar,safe],torch.full_like(rad[ar,safe],.1))
+                    sigmas=low_sigma[:,None]+fractions*SHAFT_HIT_SPAN
+                else:
+                    sigmas=tip_s[:,None]*self.probe_sigma_fractions[None]
+                    physical_probes=origin_w[:,None]+sigmas[...,None]*axis_w[:,None]
+                    v4_probe_dist,_,_=v4_static_probe_distance(
+                        physical_probes,pos_p[ar,safe],n_out,rad[ar,safe],
+                        self.probe_radii)
+                dmin=torch.where(cym,v4_probe_dist.amin(-1),dmin)
             m = act[:, hi]
             hit_sum = hit_sum + m * dmin
             hit_dist_aux[:, hi] = dmin.detach()
@@ -732,6 +771,11 @@ class TerminalPoseCost:
             logits = -(cand_dist + 1e3 * (1.0 - cand_valid)) / float(cfg.softmin_temp)
             wgt = torch.softmax(logits, dim=-1)
             s_soft = (wgt * cand_s).sum(dim=-1)
+            if v4_probe_dist is not None:
+                v4_wgt=torch.softmax(-v4_probe_dist/float(cfg.softmin_temp),dim=-1)
+                v4_sigma=(v4_wgt*sigmas).sum(-1)
+                v4_fraction=((v4_sigma-shaft_lo)/(tip_s-shaft_lo).clamp_min(1e-6)).clamp(0.,1.)
+                s_soft=torch.where(cym,v4_fraction,s_soft)
             shaft_s_aux[:, hi] = s_soft.detach()
 
             # Pad elevation vs head normal (target 35°).
@@ -979,11 +1023,11 @@ class TerminalPoseCost:
                 "butt": butt, "tip": tip,
             }
 
-            cap_b = segment_cylinder_sdf(
+            cap_b = self._capsule_distance(
                 butt.unsqueeze(1), tip.unsqueeze(1),
                 body_c, ax, rad, hh, ra=stick_r,
             )
-            cap_u = segment_cylinder_sdf(
+            cap_u = self._capsule_distance(
                 butt.unsqueeze(1), tip.unsqueeze(1),
                 under_c, ax, rad, under_half, ra=stick_r,
             )
@@ -1011,11 +1055,11 @@ class TerminalPoseCost:
                 (shoulder, elbow, upper_r),
                 (elbow, wrist, fore_r),
             ):
-                arm_head = collect(segment_cylinder_sdf(
+                arm_head = collect(self._capsule_distance(
                     p0.unsqueeze(1), p1.unsqueeze(1), body_c, ax, rad, hh, ra=radius,
                 ))
                 hand_min = fold(hand_min, arm_head)
-                arm_under = collect(segment_cylinder_sdf(
+                arm_under = collect(self._capsule_distance(
                     p0.unsqueeze(1), p1.unsqueeze(1), under_c, ax, rad, under_half, ra=radius,
                 ))
                 hand_min = fold(hand_min, arm_under)
@@ -1053,6 +1097,21 @@ class TerminalPoseCost:
                     geo["has_hp"][ar, safe].unsqueeze(1),
                     self.axial_lo, self.axial_hi,
                 )
+                if self.cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                    probe_radii=torch.full((n_s,),stick_r,device=q.device,dtype=dtype)
+                    if self.cfg.contact_scoring_mode=='isaac_v5':
+                        probe_radii[:-1]=STICK_RADIUS
+                    v4_dist,_,_=v4_static_probe_distance(
+                        samples_p,heads[ar,safe]-off,
+                        geo['axis'][ar,safe],rad[ar,safe],probe_radii)
+                    if self.cfg.contact_scoring_mode=='isaac_v5':
+                        # ts=0 is the handle butt; with stick-length variation
+                        # the distal 20 cm need not start at exactly ts=.5.
+                        tip_sigma=batch.tip_sigma[:,hi].to(dtype)
+                        playing_start=tip_sigma/(tip_sigma+STICK_LENGTH/2)
+                        v4_dist=v4_dist.masked_fill(ts[None]<playing_start[:,None],
+                                                     float('inf'))
+                    dist=torch.where(batch.is_cymbal[:,hi,None],v4_dist,dist)
                 outside = (dist > 1e-4) & valid
                 for cyl in (_pts(bc, hhi), _pts(uc, uhi)):
                     gated = torch.where(outside, cyl, big)
@@ -1084,6 +1143,12 @@ class TerminalPoseCost:
                         p0, p1, torso_a, torso_b, radius, float(sdf.torso_r),
                     ))
                     hand_min = fold(hand_min, arm_torso)
+                elif self.cfg.physics_loss_version == 'geometry_v2':
+                    # Match trajectory checks for nonadjacent same-hand parts;
+                    # the forearm/wrist connected junction remains excluded.
+                    own_stick = collect(segment_segment_sdf(p0, p1, butt, tip, radius, stick_r))
+                    own_wrist = collect(segment_segment_sdf(p0, p1, wrist, wrist, radius, wrist_r))
+                    hand_min = fold(fold(hand_min, own_stick), own_wrist)
                 arm_head = collect(segment_segment_sdf(
                     p0, p1, head_c, head_c, radius, float(sdf.head_r),
                 ))

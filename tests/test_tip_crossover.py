@@ -150,10 +150,11 @@ def test_validate_rejects_bad_knobs():
 
 
 def test_term_and_diag_keys_append_only():
-    assert TERM_KEYS[-4] == "terminal_aim"
-    assert TERM_KEYS[-3] == "waist_pr_band"
-    assert TERM_KEYS[-2] == "waist_pr_terminal"
-    assert TERM_KEYS[-1] == "waist_upright"
+    assert TERM_KEYS[-5] == "terminal_aim"
+    assert TERM_KEYS[-4] == "waist_pr_band"
+    assert TERM_KEYS[-3] == "waist_pr_terminal"
+    assert TERM_KEYS[-2] == "waist_upright"
+    assert TERM_KEYS[-1] == "tip_up"
     assert "tip_crossover" in TERM_KEYS
     assert "tip_lateral_min" in DIAG_KEYS
     assert "tip_crossover_max" in DIAG_KEYS

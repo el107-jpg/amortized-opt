@@ -479,7 +479,11 @@ def segment_cylinder_sdf(
     half_height: torch.Tensor | float,
     ra: float | torch.Tensor = 0.0,
 ) -> torch.Tensor:
-    """Signed distance from capsule ``[a0, a1]`` (radius ``ra``) to a capped cylinder.
+    """Archived critical-point capsule/cylinder distance surrogate.
+
+    Retained for legacy objectives and recorded baseline scoring. It can miss
+    interior cap/side-corner minima. New geometry losses use
+    ``convex_distance.capsule_cylinder_signed_distance`` instead.
 
     Min of :func:`point_cylinder_sdf` along the segment, minus ``ra``.  Critical
     points: endpoints, closest approach to the axis, the two cap planes, and

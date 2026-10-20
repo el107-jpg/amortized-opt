@@ -227,6 +227,12 @@ TORSO_CAPSULE = ((0.0, 0.0, 0.05), (0.0, 0.0, 0.32), 0.12)
 HEAD_SPHERE = ((0.02, 0.0, 0.52), 0.11)
 WRIST_RADIUS = 0.0225
 
+# Shared conservative arm collision proxies. Shoulder links have 3 cm URDF
+# cylinders; distal links use meshes. These capsules are geometric surrogates,
+# not replacement Isaac colliders, and are shared by pose and trajectory costs.
+UPPER_ARM_RADIUS = 0.040
+FOREARM_RADIUS = 0.035
+
 #: Fixed lower-body collision capsules in the pelvis frame.  The optimizer has
 #: no leg DoF: the Isaac drummer configuration welds the twelve leg joints at
 #: the upstream ``UNITREE_G1_29DOF_CFG`` standing pose (hip pitch ``-0.10``,

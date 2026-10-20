@@ -34,6 +34,7 @@ equally (the plan's normalization note).
 from __future__ import annotations
 
 import json
+import os
 import math
 import re
 import time
@@ -49,6 +50,7 @@ from .model import AmortizedOptimizer, ModelConfig
 from .tokenizer import joint_group_masks
 from .warmstart import waist_slice
 from .warmstart_data import NoiseConfig, ScenarioConfig, WarmstartPool
+from .tensorboard_log import MetricsTensorboard
 
 __all__ = [
     "METRIC_NAMES",
@@ -578,6 +580,7 @@ class TrainConfig:
 
     seed: int = 0
     device: str = "cuda:1"
+    tensorboard: bool = True
 
     #: WHICH torque the aux torque head is regressed onto.  ``False`` (default)
     #: is the RNEA segment max every phase-1 checkpoint before 2026-08-16 was
@@ -784,10 +787,18 @@ def train(
 
     metrics_path = run_dir / "metrics.jsonl"
     fh = open(metrics_path, "a")
+    tb = MetricsTensorboard(run_dir / "tb", enabled=cfg.tensorboard)
+    if cfg.tensorboard and os.environ.get("TB_AUTO_REGISTER", "1") != "0":
+        registry = Path(__file__).resolve().parent.parent / "runs/tensorboard_active"
+        registry.mkdir(exist_ok=True)
+        link = registry / run_dir.name
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to((run_dir / "tb").resolve())
 
     def emit(rec: dict) -> None:
         fh.write(json.dumps(rec) + "\n")
         fh.flush()
+        tb.log_record(dict(rec, event="eval") if rec.get("event") == "val" else rec)
 
     emit({
         "event": "start",
@@ -940,6 +951,7 @@ def train(
     }
     emit(summary)
     fh.close()
+    tb.close()
     return summary
 
 

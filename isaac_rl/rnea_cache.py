@@ -217,6 +217,9 @@ def rnea_from_cache_if_needed(*, verbose: bool = True):
     @classmethod
     def _patched(cls, urdf_path=None, *, joint_names=G1_UPPER_BODY_JOINTS,
                  with_armature=True, device="cpu", dtype=torch.float32):
+        if os.environ.get("AMORTIZED_RNEA_CACHE_ONLY", "").strip() not in ("", "0", "false"):
+            return load_cached(device=device, dtype=dtype, joint_names=joint_names,
+                               urdf_path=urdf_path, with_armature=with_armature)
         try:
             return orig(urdf_path, joint_names=joint_names,
                         with_armature=with_armature, device=device, dtype=dtype)

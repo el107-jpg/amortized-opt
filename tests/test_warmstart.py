@@ -34,11 +34,10 @@ def test_library_covers_every_eligible_hand_drum_pair(library, capsys):
         print(f"\n[goal-pose library] {len(library.pairs)} (hand, drum) pairs, "
               f"yaw grid {len(library.yaw_grid_rad)} steps; "
               f"missing eligible pairs={missing}")
-    # The library is missing exactly the two no-crossover extremes, which are
-    # not eligible for that hand anyway.
+    # Right-hand hi-hat is a learned choice; only left floor tom is excluded.
     assert not missing
     assert not library.has("left", "floor_tom")
-    assert not library.has("right", "hihat")
+    assert library.has("right", "hihat")
 
 
 def test_library_selection_is_closest_in_yaw_among_valid_entries(library):

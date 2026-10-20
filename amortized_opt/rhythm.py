@@ -68,6 +68,7 @@ __all__ = [
     "shift_rcc_json",
     "quantize_time",
     "sample_hit_point",
+    "strike_speed",
     "strike_velocity",
     "goal_snapshot",
     "build_context_inputs",
@@ -270,22 +271,18 @@ class DrumKit:
 
     # -------------------------------------------------------- eligibility --
     def eligible(self, hand: str) -> list[int]:
-        """Drum indices a hand may strike (the no-crossover kit rule).
+        """Training choices: both hands may play hi-hat; left excludes floor tom.
 
-        Ported from ``control/teacher/sampler.py::drums_for_hand`` with
-        ``NO_CROSSOVER_ELIGIBILITY`` on: a hand may play every drum except the
-        one at the far end of the OTHER side, found geometrically from the drum
-        centres (left loses the min-y drum, right loses the max-y drum) so a
-        layout edit cannot silently desync this from the curriculum.
+        Hand assignment is learned, so the graph teacher's crossover rule
+        must not silently exclude right-hand hi-hat training examples.
         """
         if hand not in HAND_INDEX:
             raise ValueError(f"hand must be left|right, got {hand!r}")
         D = self.num_drums
         if D < 2:
             return list(range(D))
-        ys = self.positions[:, 1]
-        banned = int(np.argmin(ys)) if hand == "left" else int(np.argmax(ys))
-        out = [i for i in range(D) if i != banned]
+        out = [i for i, name in enumerate(self.names)
+               if not (hand == 'left' and name == 'floor_tom')]
         return out if out else list(range(D))
 
     def is_eligible(self, hand: str, drum: int) -> bool:
@@ -613,6 +610,12 @@ def sample_hit_point(
     return center + d
 
 
+def strike_speed(velocity: float, *, speed_min: float = 1.0, speed_max: float = 3.0) -> float:
+    """Map normalized rhythm loudness to the decoder's requested speed in m/s."""
+    v = float(np.clip(velocity, 0.0, 1.0))
+    return float(speed_min) + v * (float(speed_max) - float(speed_min))
+
+
 def strike_velocity(
     kit: DrumKit,
     drum: int,
@@ -627,8 +630,7 @@ def strike_velocity(
     linearly onto ``[speed_min, speed_max]`` m/s, the same 1/2/3 m/s band the
     evaluation grid uses.
     """
-    v = float(np.clip(velocity, 0.0, 1.0))
-    speed = float(speed_min) + v * (float(speed_max) - float(speed_min))
+    speed = strike_speed(velocity, speed_min=speed_min, speed_max=speed_max)
     return -speed * kit.axes[drum]
 
 

@@ -255,6 +255,47 @@ class TrajectorySpline:
         qddd = (6.0 * a3).expand_as(qdd)
         return q, qd, qdd, qddd
 
+    def subsample_foh(self, n_per_segment: int = 5) -> SplineSamples:
+        """Actual first-order-hold command, holding shorter-arm terminal poses.
+
+        This describes the servo command, not the servo's reached state.
+        """
+        n = max(int(n_per_segment), 1)
+        B, _, D = self.x.shape
+        x = self.x_held
+        fraction = torch.arange(n, device=x.device, dtype=x.dtype)/n
+        delta = x[:, 1:]-x[:, :-1]
+        q = x[:, :-1, None]+fraction[None, None, :, None]*delta[:, :, None]
+        qd = (delta/self.dt)[:, :, None].expand_as(q)
+        q = torch.cat((q.reshape(B, -1, D), x[:, -1:]), dim=1)
+        qd = torch.cat((qd.reshape(B, -1, D), qd[:, -1, -1:, :]), dim=1)
+        index = torch.arange(q.shape[1], device=x.device)[None, :, None]
+        mask = (index <= self.lengths[:, None]*n).to(x.dtype)
+        zero = torch.zeros_like(q)
+        return SplineSamples(q, qd, zero, zero, mask,
+            torch.arange(q.shape[1], device=x.device, dtype=x.dtype)*(self.dt/n), n)
+
+    def segment_position_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Exact cubic position extrema, including all interior velocity roots."""
+        a0, a1, a2, a3 = (self.coeffs[..., i] for i in range(4))
+        A, B, C = 3*a3, 2*a2, a1
+        quadratic = A.abs() > 1e-12
+        safe_A = torch.where(quadratic, A, torch.ones_like(A))
+        discriminant = B.square()-4*A*C
+        root = torch.sqrt(discriminant.clamp_min(1e-24))
+        candidates = []
+        for sign in (-1, 1):
+            s = (-B+sign*root)/(2*safe_A)
+            valid = quadratic & (discriminant >= 0) & (s >= 0) & (s <= self.dt)
+            candidates.append(torch.where(valid, s, torch.zeros_like(s)))
+        linear = (~quadratic) & (B.abs() > 1e-12)
+        s = -C/torch.where(linear, B, torch.ones_like(B))
+        candidates.append(torch.where(linear & (s >= 0) & (s <= self.dt), s, torch.zeros_like(s)))
+        candidates.extend((torch.zeros_like(a0), torch.full_like(a0, self.dt)))
+        s = torch.stack(candidates, dim=-1)
+        values = a0[..., None]+s*(a1[..., None]+s*(a2[..., None]+s*a3[..., None]))
+        return values.amin(-1), values.amax(-1)
+
     def subsample(self, n_per_segment: int = 1, *, include_end: bool = True) -> SplineSamples:
         """Uniform grid of ``n_per_segment`` samples per segment.
 

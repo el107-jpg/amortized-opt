@@ -663,6 +663,8 @@ def generate_apex_scenarios(
     names = tuple(cfg.joint_names)
     kit = kit or DrumKit.from_layout()
     library = library or GoalPoseLibrary(joint_names=names)
+    from .warmstart_data import phase1_synthetic_goal_clips, draw_phase1_clip, record_phase1_goal_counts
+    synthetic_clips = phase1_synthetic_goal_clips(kit, library, cfg)
     if sampler is None:
         from .starts import StartSampler
 
@@ -711,7 +713,7 @@ def generate_apex_scenarios(
             si += 1
 
             kit_s = kit.randomized(rng, cfg.kit_randomization) if cfg.randomize_kit else kit
-            clip = clips[int(rng.integers(len(clips)))]
+            clip = draw_phase1_clip(clips, synthetic_clips, rng, cfg)
             t_now = _draw_time(clip, rng, cfg)
             snap = goal_snapshot(
                 clip, kit_s, t_now, num_future=cfg.num_future, rng=rng,
@@ -989,6 +991,7 @@ def generate_apex_scenarios(
                 rec[f].append(v.astype(np.int64) if f in _LONG_FIELDS
                               else (v.astype(bool) if f in _BOOL_FIELDS else v.astype(np.float32)))
             stats["accepted"] += 1
+            record_phase1_goal_counts(stats, r['kit'], r['snap'], r['active'])
             if all(r["active"]):
                 stats["dual_active"] += 1
                 if hit["left"] != hit["right"]:

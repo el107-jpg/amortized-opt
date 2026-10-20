@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TensorBoard for recent phase-2 runs (avoids scanning all of runs/).
+# Register recent runs in the single shared TensorBoard on port 6006.
 #
 # TensorBoard 2.21 defaults to --host localhost and --load_fast=auto. The
 # localhost bind is unreachable without a tunnel; the Rust data server often
@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PORT="${PORT:-6008}"
+TB_PORT=6006
 MAX_RUNS="${MAX_RUNS:-8}"
 MAX_AGE_HOURS="${MAX_AGE_HOURS:-48}"
 LOAD_FAST="${LOAD_FAST:-false}"
@@ -24,9 +24,8 @@ if [[ -z "$TB_BIN" || ! -x "$TB_BIN" ]]; then
   exit 1
 fi
 
-VIEW_DIR="${VIEW_DIR:-runs/.tb_view}"
-rm -rf "$VIEW_DIR"
-mkdir -p "$VIEW_DIR"
+REGISTRY_DIR="$(pwd)/runs/tensorboard_active"
+mkdir -p "$REGISTRY_DIR"
 
 link_run() {
   local name="$1" dir="$2"
@@ -34,8 +33,24 @@ link_run() {
     echo "missing tb dir: $dir" >&2
     exit 1
   fi
-  ln -sfn "$(cd "$dir" && pwd)" "$VIEW_DIR/$name"
+  local target entry
+  target="$(cd "$dir" && pwd)"
+  entry="$REGISTRY_DIR/$name"
+  if [[ -e "$entry" || -L "$entry" ]]; then
+    if [[ "$(readlink -f "$entry")" != "$target" ]]; then
+      echo "registration already exists for $name; preserving $entry" >&2
+      return 1
+    fi
+  else
+    ln -s "$target" "$entry"
+  fi
 }
+
+# Preserve runs previously exposed by the old separate-port view.
+for entry in runs/.tb_view/*; do
+  [[ -d "$entry" ]] || continue
+  link_run "$(basename "$entry")" "$entry"
+done
 
 if [[ -n "${LOGDIR_SPEC:-}" ]]; then
   IFS=',' read -ra parts <<< "$LOGDIR_SPEC"
@@ -57,12 +72,25 @@ else
       | sort -nr | awk '{print $2}'
   )
   if [[ "$n" -eq 0 ]]; then
-    echo "No tb logs newer than ${MAX_AGE_HOURS}h under runs/*/tb" >&2
-    exit 1
+    echo "No recent logs to add; keeping existing registrations." >&2
   fi
 fi
 
-echo "$TB_BIN --logdir ${VIEW_DIR} --port ${PORT} --bind_all --load_fast=${LOAD_FAST}" >&2
-echo "runs: $(ls -1 "$VIEW_DIR" | tr '\n' ' ')" >&2
-echo "Open http://localhost:${PORT}  (or this host:${PORT}; 6006/6007 are often taken)" >&2
-exec "$TB_BIN" --logdir "$VIEW_DIR" --port "${PORT}" --bind_all --load_fast="${LOAD_FAST}"
+if curl -fsS --max-time 5 "http://127.0.0.1:${TB_PORT}/data/runs" >/dev/null 2>&1; then
+  echo "Using the existing shared TensorBoard: http://localhost:${TB_PORT}" >&2
+  exit 0
+fi
+
+# Prevent concurrent launchers from creating another server. Never fall back
+# to an alternative port when the shared port is occupied or starting up.
+exec 9>runs/.tensorboard6006.lock
+if ! flock -n 9; then
+  echo "Shared TensorBoard is already starting or running on ${TB_PORT}." >&2
+  exit 0
+fi
+if ss -H -ltn "sport = :${TB_PORT}" | rg -q .; then
+  echo "Port ${TB_PORT} is occupied but TensorBoard is not responding; no alternate server started." >&2
+  exit 1
+fi
+echo "Starting shared TensorBoard: http://localhost:${TB_PORT}" >&2
+exec "$TB_BIN" --logdir "$REGISTRY_DIR" --port "$TB_PORT" --bind_all --load_fast="$LOAD_FAST"

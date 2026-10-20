@@ -78,11 +78,18 @@ def test_aim_and_disk_match(repo):
         # default-value check.
         p_m, R_m = S.strike_aim_on_head(c, a, r, name=name, surface_offset=0.005)
         p_r, R_r = repo.strike_aim_on_head(c, a, r, name=name)
+        if S.is_hihat_name(name):
+            # Local aim is 20 mm inward; the world-space legal disk is unchanged.
+            t = S.strike_half_plane_dir(c, a, name=name)
+            np.testing.assert_allclose(p_m, p_r-S.HIHAT_AIM_INSET_M*t, atol=1e-12)
+            p_m = p_m+S.HIHAT_AIM_INSET_M*t
         worst_aim = max(worst_aim, float(np.max(np.abs(p_m - p_r))))
         worst_r = max(worst_r, abs(float(R_m) - float(R_r)))
 
         o_m = S.strike_disk_center_offset(c, a, r, name=name)
         o_r = repo.strike_disk_center_offset(c, a, r, name=name)
+        if S.is_hihat_name(name):
+            o_m = o_m-S.HIHAT_AIM_INSET_M*t
         assert (o_m is None) == (o_r is None), name
         if o_m is not None:
             worst_off = max(worst_off, float(np.max(np.abs(o_m - o_r))))

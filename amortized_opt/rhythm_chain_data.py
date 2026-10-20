@@ -48,6 +48,8 @@ __all__ = [
     "PROVENANCE_FIELDS",
     "DualTransitionConfig",
     "build_dual_transition_clips",
+    "build_focused_single_transition_clips",
+    "training_goal_pairs",
     "dual_transition_kept_count",
     "IdleEntry",
     "build_idle_entry_index",
@@ -171,6 +173,7 @@ def roller_clip_list(
     if dual_cfg is None:
         dual_cfg = DualTransitionConfig()
     synth = build_dual_transition_clips(kit, library, cfg=dual_cfg)
+    synth += build_focused_single_transition_clips(kit, library, cfg)
     return rcc + list(synth)
 
 
@@ -367,6 +370,53 @@ def build_dual_transition_clips(
                         )
                     )
     return clips
+
+
+def build_focused_single_transition_clips(kit, library, cfg=None):
+    """Supply post-hit and future coverage for focused single-hand goals.
+
+    Each fixed hand repeatedly transitions source -> focus -> source. These
+    are generator training scenarios, not an assignment rule or a hand mask.
+    They append after ordinary synthetic clips to preserve provenance ids.
+    """
+    pairs = training_goal_pairs(kit, library, cfg)
+    if (_cfg_get(cfg, 'far_goal_pairs', None) is None
+            and not _cfg_get(cfg, 'all_hand_drum_goals', True)):
+        return []
+    clips = []
+    for hand, name in pairs:
+        if name not in kit.names or not library.has(hand, name):
+            continue
+        destination = kit.index(name)
+        for source in kit.eligible(hand):
+            if not library.has(hand, kit.names[source]):
+                continue
+            for gap in (.4, .6, .8):
+                drums = (source, destination, source, destination, source)
+                hits = [Hit(i*gap, i*gap, int(d), kit.names[d], hand, .75)
+                        for i, d in enumerate(drums)]
+                clips.append(RhythmClip(name=f'synth_single_{hand}_{kit.names[source]}_{name}_{gap:g}',
+                    hits=hits, duration=4*gap+.5))
+    return clips
+
+
+def training_goal_pairs(kit, library, cfg=None):
+    """One target policy for far examples and MPC/post-hit clip lookahead."""
+    explicit = _cfg_get(cfg, 'far_goal_pairs', None)
+    if explicit is not None:
+        pairs = list(explicit)
+    elif _cfg_get(cfg, 'all_hand_drum_goals', True):
+        pairs = [(hand, kit.names[d]) for hand in HANDS for d in kit.eligible(hand)]
+    else:
+        pairs = [(hand, name) for name, hand in _eval_style_drum_hand().items()
+                 if name in kit.names and library.has(hand, name)]
+    if len(set(pairs)) != len(pairs):
+        raise ValueError('Training hand/drum targets must be unique')
+    if any(hand not in HANDS or name not in kit.names or
+           kit.index(name) not in kit.eligible(hand) or not library.has(hand, name)
+           for hand, name in pairs):
+        raise ValueError('Training goal pairs must have eligible hand/drum poses')
+    return pairs
 
 
 def dual_transition_kept_count(
@@ -609,6 +659,7 @@ class RhythmChainScenarioConfig:
     hit_time_jitter_s: float = 0.05
     tip_speed_max: float = 4.0
     synth_transition_frac: float = 0.25
+    all_hand_drum_goals: bool = True
     num_future: int = 1
     schedule_slots: int = 2
     dual: DualTransitionConfig = field(default_factory=DualTransitionConfig)
@@ -1104,6 +1155,7 @@ def generate_rhythm_idle_scenarios(
         kit_rand = KitRandomization()
 
     synth_clips = build_dual_transition_clips(kit, library, cfg=dual_cfg)
+    synth_clips += build_focused_single_transition_clips(kit, library, cfg)
     entries, all_clips = build_idle_entry_index(list(clips), synth_clips)
     rcc_ents = [e for e in entries if not e.synth]
     synth_ents = [e for e in entries if e.synth]
@@ -1372,20 +1424,31 @@ def generate_far_fetched_scenarios(
     exclude_tol = float(_cfg_get(cfg, "far_exclude_eval_q_tol", 1e-3))
     eval_q0 = _eval_grid_q0s()
     hold = np.clip(ready_joint_pos(names), q_lo, q_hi)
-    drum_hand = _eval_style_drum_hand()
-    eval_names = [nm for nm in drum_hand if nm in kit.names and library.has(drum_hand[nm], nm)]
-    if not eval_names:
+    pairs = training_goal_pairs(kit, library, cfg)
+    if not pairs:
         return _pack_buckets(out, stats)
 
+    balanced = bool(_cfg_get(cfg, 'all_hand_drum_goals', True))
+    quotas = np.full(len(pairs), int(n)//len(pairs), dtype=int)
+    quotas[rng.permutation(len(pairs))[:int(n)%len(pairs)]] += 1
+    accepted_by_pair = np.zeros(len(pairs), dtype=int)
+    stats['goal_pair_requested'] = {f'{h}:{name}': int(quotas[i]) for i,(h,name) in enumerate(pairs)}
+    stats['attempted'] = 0
     n_box_try = 256
-    for _ in range(int(n)):
+    for attempt in range(int(n)*64 if balanced else int(n)):
+        if balanced:
+            pending = np.flatnonzero(accepted_by_pair < quotas)
+            if not len(pending): break
+            pair_i = int(pending[attempt % len(pending)])
+        else:
+            pair_i = int(rng.integers(len(pairs)))
+        stats['attempted'] += 1
         kit_s = (
             kit.randomized(rng, kit_rand)
             if _cfg_get(cfg, "randomize_kit", True) and kit_rand is not None
             else kit
         )
-        name = eval_names[int(rng.integers(len(eval_names)))]
-        hand = drum_hand[name]
+        hand, name = pairs[pair_i]
         other = "right" if hand == "left" else "left"
         if name not in kit_s.names or not library.has(hand, name):
             stats["reject_library"] += 1
@@ -1485,5 +1548,12 @@ def generate_far_fetched_scenarios(
         )
         stats["accepted"] += 1
         stats["single_idle"] += 1
+        accepted_by_pair[pair_i] += 1
 
+    stats['goal_pair_accepted'] = {f'{h}:{name}': int(accepted_by_pair[i]) for i,(h,name) in enumerate(pairs)}
+    if balanced and (accepted_by_pair < quotas).any():
+        missing = {f'{h}:{name}': int(quotas[i]-accepted_by_pair[i])
+                   for i,(h,name) in enumerate(pairs) if accepted_by_pair[i] < quotas[i]}
+        rejects = {key:value for key,value in stats.items() if key.startswith('reject_')}
+        raise RuntimeError(f'Balanced hand/drum generation exhausted its retry budget: {missing}; rejects={rejects}')
     return _pack_buckets(out, stats)

@@ -121,6 +121,9 @@ class ScenarioConfig:
     dt: float = CONTROL_DT
     num_drums: int = 8
     num_future: int = 3
+    #: Include single-hand target clips for every eligible hand/drum goal.
+    all_hand_drum_goals: bool = True
+    synthetic_goal_frac: float = 0.5
 
     #: Domain randomization of the kit (plan: per-drum <= 4 cm horizontal, whole
     #: kit <= 7.5 cm horizontal / 3.5 cm vertical).
@@ -251,6 +254,51 @@ def _draw_time(clip: RhythmClip, rng: np.random.Generator, cfg: ScenarioConfig) 
     return float(rng.uniform(0.0, max(clip.duration, cfg.dt)))
 
 
+def phase1_synthetic_goal_clips(kit, library, cfg):
+    """Supply target supervision absent from the historical RCC corpus."""
+    if not getattr(cfg, "all_hand_drum_goals", True):
+        return []
+    from .rhythm_chain_data import build_focused_single_transition_clips
+    return build_focused_single_transition_clips(kit, library, cfg)
+
+
+def draw_phase1_clip(clips, synthetic, rng, cfg):
+    fraction = float(getattr(cfg, "synthetic_goal_frac", 0.5))
+    if not 0 <= fraction <= 1:
+        raise ValueError("synthetic_goal_frac must lie in [0,1]")
+    use_synthetic = bool(synthetic) and (not clips or rng.uniform() < fraction)
+    choices = synthetic if use_synthetic else clips
+    if not choices:
+        raise ValueError("Phase-1 generation has no goal clips")
+    return choices[int(rng.integers(len(choices)))]
+
+
+def record_phase1_goal_counts(stats, kit, snap, active):
+    for hand, live in zip(HANDS, active):
+        if live:
+            key = f"active_goal/{hand}/{kit.names[int(snap.goal[hand].drum)]}"
+            stats[key] = stats.get(key, 0) + 1
+
+
+def phase1_goal_coverage(pool, cfg):
+    """Count accepted active targets and fail closed on missing supervision."""
+    kit = DrumKit.from_layout()
+    counts = np.zeros((2, kit.num_drums), dtype=int)
+    for data in pool.data.values():
+        goal = data["drum"].detach().cpu().numpy()
+        active = data["active"].detach().cpu().numpy().astype(bool)
+        for h in (0, 1):
+            np.add.at(counts[h], goal[:, h][active[:, h]], 1)
+    expected = [(h, d) for h, hand in enumerate(HANDS) for d in kit.eligible(hand)]
+    missing = [f"{HANDS[h]}:{kit.names[d]}" for h, d in expected if counts[h, d] == 0]
+    if cfg.all_hand_drum_goals and missing:
+        raise RuntimeError(f"Accepted phase-1 pool is missing targets {missing}; "
+                           "increase proposals or fix rejection sampling")
+    return dict(rows=len(pool), expected_targets=len(expected), missing_targets=missing,
+                active_goal_counts={hand: dict(zip(kit.names, counts[h].tolist()))
+                                    for h, hand in enumerate(HANDS)})
+
+
 def generate_scenarios(
     n: int,
     clips: list[RhythmClip],
@@ -275,6 +323,7 @@ def generate_scenarios(
     names = tuple(cfg.joint_names)
     kit = kit or DrumKit.from_layout()
     library = library or GoalPoseLibrary(joint_names=names)
+    synthetic_clips = phase1_synthetic_goal_clips(kit, library, cfg)
     if sampler is None:
         from .starts import StartSampler
 
@@ -335,6 +384,7 @@ def generate_scenarios(
             rec[f].append(v.astype(np.int64) if f in _LONG_FIELDS
                           else (v.astype(bool) if f in _BOOL_FIELDS else v.astype(np.float32)))
         stats["accepted"] += 1
+        record_phase1_goal_counts(stats, kit_s, snap, active)
         if all(active):
             stats["dual_active"] += 1
             if hit["left"] != hit["right"]:
@@ -384,7 +434,7 @@ def generate_scenarios(
             print(f"  ... {i}/{n}", flush=True)
 
         kit_s = kit.randomized(rng, cfg.kit_randomization) if cfg.randomize_kit else kit
-        clip = clips[int(rng.integers(len(clips)))]
+        clip = draw_phase1_clip(clips, synthetic_clips, rng, cfg)
         t_now = _draw_time(clip, rng, cfg)
         snap = goal_snapshot(
             clip, kit_s, t_now,

@@ -81,7 +81,7 @@ mkdir -p "$TMPDIR" runs
 DEV="${DEV:-cuda:1}"
 # The distributional assist/control path replaces voxel storage with its
 # bounded previous-generation MPC ring and critic-selected timing tables.
-TIMING_CRITIC_MODE="${TIMING_CRITIC_MODE:-off}"
+TIMING_CRITIC_MODE="${TIMING_CRITIC_MODE:-control}"
 if [[ "$TIMING_CRITIC_MODE" == "assist" || "$TIMING_CRITIC_MODE" == "control" ]]; then
   VOXEL_POOL="${VOXEL_POOL:-0}"
 else
@@ -288,14 +288,31 @@ LINE_SEARCH_EPSILON_MIN_START="${LINE_SEARCH_EPSILON_MIN_START:-}"
 LINE_SEARCH_EPSILON_MIN_RAMP_UPDATES="${LINE_SEARCH_EPSILON_MIN_RAMP_UPDATES:-0}"
 LINE_SEARCH_EPSILON_MAX="${LINE_SEARCH_EPSILON_MAX:-}"
 LINE_SEARCH_FRESH="${LINE_SEARCH_FRESH:-0}"
-# Production SaLSa-transfer defaults from the completed ablation: select on
-# the smoothed probe, always commit the finite staged Adam update, and let AL
-# move without forcing a selector reset.  The stricter transactional checks
-# remain opt-in diagnostics; enabling skip-on-exhaustion can otherwise freeze
-# both parameters and Adam moments on a changing batch stream.
-LINE_SEARCH_STRICT_ACTUAL_UPDATE="${LINE_SEARCH_STRICT_ACTUAL_UPDATE:-0}"
-LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE="${LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE:-0}"
-LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION="${LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION:-0}"
+# Fresh selector continuations default to transactional safety because they
+# reset the acceptance history against an already-trained model. Explicit env
+# values still select either policy; ordinary/new runs retain the legacy
+# throughput defaults.
+if [[ ${LINE_SEARCH_STRICT_ACTUAL_UPDATE+x} != x ]]; then
+  if [[ "$LINE_SEARCH_FRESH" == "1" && -n "$RESUME" ]]; then
+    LINE_SEARCH_STRICT_ACTUAL_UPDATE=1
+  else
+    LINE_SEARCH_STRICT_ACTUAL_UPDATE=0
+  fi
+fi
+if [[ ${LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE+x} != x ]]; then
+  if [[ "$LINE_SEARCH_FRESH" == "1" && -n "$RESUME" ]]; then
+    LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE=1
+  else
+    LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE=0
+  fi
+fi
+if [[ ${LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION+x} != x ]]; then
+  if [[ "$LINE_SEARCH_FRESH" == "1" && -n "$RESUME" ]]; then
+    LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION=1
+  else
+    LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION=0
+  fi
+fi
 LINE_SEARCH_FORCE_AL_RESET="${LINE_SEARCH_FORCE_AL_RESET:-0}"
 LINE_SEARCH_ACTUAL_DIAGNOSTIC_EVERY="${LINE_SEARCH_ACTUAL_DIAGNOSTIC_EVERY:-0}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
@@ -420,24 +437,45 @@ if [[ "$LINE_SEARCH" == "1" ]]; then
   fi
   if [[ "$LINE_SEARCH_STRICT_ACTUAL_UPDATE" == "1" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-strict-actual-update)
+  else
+    LINE_SEARCH_FLAGS+=(--no-line-search-strict-actual-update)
   fi
   if [[ "$LINE_SEARCH_REJECT_CURRENT_PROBE_INCREASE" == "1" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-reject-current-probe-increase)
+  else
+    LINE_SEARCH_FLAGS+=(--no-line-search-reject-current-probe-increase)
   fi
   if [[ "$LINE_SEARCH_SKIP_ON_PROBE_EXHAUSTION" == "1" ]]; then
     LINE_SEARCH_FLAGS+=(--line-search-skip-on-probe-exhaustion)
+  else
+    LINE_SEARCH_FLAGS+=(--no-line-search-skip-on-probe-exhaustion)
   fi
   GRAD_BALANCE=""
   GRAD_BALANCE_FLAG=(--grad-balance=)
 fi
-TERMINAL_INIT_NOISE="${TERMINAL_INIT_NOISE:-0}"
+TERMINAL_INIT_NOISE="${TERMINAL_INIT_NOISE:-1}"
 TERMINAL_INIT_NOISE_RAMP_STEPS="${TERMINAL_INIT_NOISE_RAMP_STEPS:-5}"
-TERMINAL_INIT_NOISE_FLAGS=()
+MPC_INIT_NOISE="${MPC_INIT_NOISE:-1}"
+INIT_NOISE_TAU_STEPS="${INIT_NOISE_TAU_STEPS:-20}"
+INIT_NOISE_MAGNITUDE_DISTRIBUTION="${INIT_NOISE_MAGNITUDE_DISTRIBUTION:-half_normal}"
+INIT_NOISE_SIGMA_SCALE="${INIT_NOISE_SIGMA_SCALE:-0.30}"
+INIT_NOISE_SIGMA_WHITE="${INIT_NOISE_SIGMA_WHITE:-0.003}"
+TERMINAL_INIT_NOISE_FLAGS=(
+  --terminal-init-noise-ramp-steps "$TERMINAL_INIT_NOISE_RAMP_STEPS"
+  --init-noise-tau-steps "$INIT_NOISE_TAU_STEPS"
+  --init-noise-magnitude-distribution "$INIT_NOISE_MAGNITUDE_DISTRIBUTION"
+  --init-noise-sigma-scale "$INIT_NOISE_SIGMA_SCALE"
+  --init-noise-sigma-white "$INIT_NOISE_SIGMA_WHITE"
+)
 if [[ "$TERMINAL_INIT_NOISE" == "1" ]]; then
-  TERMINAL_INIT_NOISE_FLAGS=(
-    --terminal-init-noise
-    --terminal-init-noise-ramp-steps "$TERMINAL_INIT_NOISE_RAMP_STEPS"
-  )
+  TERMINAL_INIT_NOISE_FLAGS+=(--terminal-init-noise)
+else
+  TERMINAL_INIT_NOISE_FLAGS+=(--no-terminal-init-noise)
+fi
+if [[ "$MPC_INIT_NOISE" == "1" ]]; then
+  TERMINAL_INIT_NOISE_FLAGS+=(--mpc-init-noise)
+else
+  TERMINAL_INIT_NOISE_FLAGS+=(--no-mpc-init-noise)
 fi
 if [[ "$VOXEL_POOL" == "1" ]]; then
   # Probe rows intentionally carry zero dual price.  The current gradient
@@ -480,9 +518,9 @@ JIT_T="${JIT_T:-0.05}"
 JIT_V="${JIT_V:-0.2}"
 RARE_BOOST="${RARE_BOOST:-0.25}"
 
-# evalbox = far family is the rolling-eval box grid (rest, one strike, no
-# future), not ready+yaw+arm-noise with a required future hit.
-POOL_TAG="${TAG}_mix306010_evalbox"
+# Far starts retain the eval-style rest/box geometry, with balanced targets
+# over all 13 eligible hand/drum combinations instead of the eval hand map.
+POOL_TAG="${TAG}_mix306010_allhand13"
 if [[ "$TILT_DEG" != "0" ]]; then POOL_TAG="${POOL_TAG}_tilt${TILT_DEG}"; fi
 if [[ "$RADIUS_FRAC" != "0" ]]; then POOL_TAG="${POOL_TAG}_rad${RADIUS_FRAC}"; fi
 if [[ "$JIT_T" != "0" || "$JIT_V" != "0" ]]; then POOL_TAG="${POOL_TAG}_jit${JIT_T}x${JIT_V}"; fi

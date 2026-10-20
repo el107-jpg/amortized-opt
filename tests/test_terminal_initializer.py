@@ -82,6 +82,25 @@ def test_phase2_reseeds_only_fresh_rows():
     torch.testing.assert_close(batch["init"][1], old[1])
 
 
+def test_seed_from_terminal_keeps_the_supplied_pose():
+    model = AmortizedOptimizer(ModelConfig(
+        max_horizon=40, num_drums=7, terminal_head=True,
+        d_ctx=32, ctx_heads=4, d_model=32, dec_heads=4, dec_layers=1,
+    ))
+    ctx, state, masks = _batch()
+    terminal = torch.zeros(3, N_DOF)
+    terminal[:, 3:10] = 0.2
+    terminal[:, 10:17] = -0.15
+    seed = model.terminal_initializer.seed_from_terminal(ctx, state, masks, terminal)
+    torch.testing.assert_close(seed[:, 19, 3:10], terminal[:, 3:10])
+    torch.testing.assert_close(seed[:, 29, 10:17], terminal[:, 10:17])
+    moved = state.clone()
+    moved[:, 4] += 0.25
+    redrawn = model.terminal_initializer.seed_from_terminal(ctx, moved, masks, terminal)
+    assert not torch.allclose(seed[:, 0], redrawn[:, 0])
+    torch.testing.assert_close(redrawn[:, 19, 3:10], terminal[:, 3:10])
+
+
 def test_phase2_terminal_noise_is_start_anchored_and_fresh_only():
     model = AmortizedOptimizer(ModelConfig(
         max_horizon=40, num_drums=7, terminal_head=True,

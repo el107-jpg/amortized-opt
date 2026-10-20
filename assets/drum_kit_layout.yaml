@@ -8,6 +8,9 @@
 # by cfg.cymbal_edge_margin_m instead of shrinking by the usual rim margin, so a
 # stick catching the edge registers. Membrane drums omit it: their rim is a
 # rimshot, not the head.
+# The cymbal/hi-hat CYLINDERS remain 10 cm thick for robust GPU PhysX contact.
+# isaac_rl.cymbal_contact_scoring qualifies the whole top face but only the
+# upper 5 mm of the vertical side; body thickness is not the hit-credit depth.
 drums:
   snare:
     id: 0

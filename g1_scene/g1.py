@@ -585,14 +585,18 @@ def _ensure_composed_usd(src_usd: Path, *, freeze_legs: bool = False) -> Path:
     Stale = older than the source G1 USD *or* older than this module (so editing
     the stick geometry/composition here forces a rebuild without manual cleanup).
     """
+    import fcntl
+    from amortized_opt import constants
     out_usd = _composed_usd_path(freeze_legs)
-    if not out_usd.is_file():
-        needs_build = True
-    else:
-        newest_input = max(src_usd.stat().st_mtime, Path(__file__).stat().st_mtime)
-        needs_build = out_usd.stat().st_mtime < newest_input
-    if needs_build:
-        _compose_g1_with_sticks(src_usd, out_usd, freeze_legs=freeze_legs)
+    out_usd.parent.mkdir(parents=True, exist_ok=True)
+    # Geometry is imported from constants. Its edits must invalidate the USD,
+    # and concurrent rollout workers must not compose into the same file.
+    with out_usd.with_suffix('.lock').open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        newest_input = max(src_usd.stat().st_mtime, Path(__file__).stat().st_mtime,
+                           Path(constants.__file__).stat().st_mtime)
+        if not out_usd.is_file() or out_usd.stat().st_mtime < newest_input:
+            _compose_g1_with_sticks(src_usd, out_usd, freeze_legs=freeze_legs)
     return out_usd
 
 

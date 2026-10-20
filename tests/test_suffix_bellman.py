@@ -158,3 +158,30 @@ def test_gradient_topology(scene):
     )
     assert g_parent is None
     assert g_child is not None and g_child.abs().item() > 0.0
+
+
+def test_rebuilt_child_keeps_verified_teacher_and_gradient(scene):
+    cost, _ = scene
+    hit, active, q0, v0, traj = _parent()
+    traj.requires_grad_(True)
+    offs = torch.tensor([3,2,0,4])
+    masks_p = _masks(hit,active)
+    masks_s = _masks(torch.where(active,hit-offs[:,None],hit),active)
+    class FreshChild(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.delta = torch.nn.Parameter(torch.tensor(.01))
+            self.received_state = None
+        def initial_trajectory(self,ctx,state,masks):
+            self.received_state = state.clone()
+            return torch.full_like(masks.elem_mask,.2)*masks.elem_mask
+        def forward(self,init,state,enc,masks):
+            return SimpleNamespace(traj=init+self.delta)
+    child = FreshChild()
+    cfg = Phase2Config(terminal_init_all_rows=True)
+    fn = make_suffix_step(child,cost,cfg,compile_mode=None)
+    tie,_,qs,vs,init = fn(traj,q0,v0,None,masks_p.elem_mask,masks_s,offs,child_context=object())
+    torch.testing.assert_close(init,.2*masks_s.elem_mask)
+    torch.testing.assert_close(child.received_state,torch.cat([qs,vs],-1))
+    gp,gc = torch.autograd.grad(tie,(traj,child.delta),allow_unused=True)
+    assert gp is None and gc is not None

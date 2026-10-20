@@ -55,7 +55,7 @@ from amortized_opt.lead import LEAD_PRESETS, lead_fraction, lead_waypoints, reso
 from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from amortized_opt.model import ContextEncoding
 from amortized_opt.tokenizer import ContextInputs, build_waypoint_masks
-from amortized_opt.train_cost import ramp_seed
+from amortized_opt.train_cost import group_lengths, ramp_seed
 from amortized_opt.strike_seed import accelerating_path_torch
 from amortized_opt.warmstart import GoalPoseLibrary, arm_slice, seed_waist_pr_to_sp, waist_slice
 
@@ -143,6 +143,31 @@ class MPCConfig:
     #: on the runaway above the plant tracked the command within a degree, so
     #: the leash never engages on that path.
     yaw_cond_leash: float = 0.35
+    #: Backtracking acceptance for the learned trajectory proposal.  The
+    #: decoder remains the fast proposal generator; a full FusedCost supplied
+    #: to IsaacMPC decides whether that proposal is safe to commit.
+    descent_accept: bool = False
+    descent_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625)
+    descent_min_abs: float = 1.0e-4
+    descent_min_rel: float = 1.0e-6
+    #: Drop the shifted previous plan.  Every tick rebuilds the decoder init
+    #: as the constant-acceleration joint-space line from the measured state
+    #: to a terminal pose.  That pose is the terminal generator's output from
+    #: the first tick of the current goal segment, held fixed until the
+    #: segment changes.  A hand whose goal has not changed keeps its arm
+    #: columns; a new goal refreshes that hand and the shared waist.
+    fresh_accel_init: bool = False
+    #: With ``fresh_accel_init``, call the terminal generator again on every
+    #: tick from the measured state, instead of holding the goal-start pose.
+    fresh_terminal_every_tick: bool = False
+    #: Refine once when the scheduled goal changes, then track a fixed plan
+    #: until the next goal boundary. Failed feasibility leaves a pose hold.
+    commit_plan: bool = False
+    plan_max_passes: int = 32
+    plan_gate_tol: float = 1.0e-6
+    #: "isaac" executes one decoder proposal and lets the plant's existing
+    #: hit detector judge it. Analytic constraints remain diagnostic only.
+    plan_acceptance: str = "physics"
 
 
 @dataclass
@@ -172,6 +197,7 @@ class IsaacMPC:
         dtype: torch.dtype = torch.float32,
         library: GoalPoseLibrary | None = None,
         kit_names: tuple[str, ...] | None = None,
+        descent_cost=None,
     ):
         self.model = model
         self.sched = schedule
@@ -183,6 +209,35 @@ class IsaacMPC:
         self.dt = float(self.cfg.dt)
         self.names = tuple(self.cfg.joint_names)
         self.n = len(self.names)
+        self.descent_cost = descent_cost
+        if self.cfg.descent_accept and self.descent_cost is None:
+            raise ValueError("descent_accept=True requires descent_cost")
+        if self.cfg.commit_plan:
+            if self.cfg.plan_acceptance not in ("physics", "isaac"):
+                raise ValueError("plan_acceptance must be physics or isaac")
+            if self.B != 1 or self.descent_cost is None:
+                raise ValueError("commit_plan requires one environment and a full physics cost")
+            if self.cfg.plan_max_passes < 1:
+                raise ValueError("plan_max_passes must be positive")
+            if self.cfg.iterations != 1:
+                raise ValueError("commit_plan checks feasibility after each single decoder pass")
+            if self.cfg.descent_accept:
+                raise ValueError("commit_plan uses feasibility acceptance, not descent acceptance")
+        self._committed_reference = None
+        self._committed_goal_key = None
+        self.plan_segments = []
+        self.plan_attempts = []
+        self.plan_feasible = False
+        alphas = tuple(float(a) for a in self.cfg.descent_alphas)
+        if any(not (0.0 < a <= 1.0) for a in alphas):
+            raise ValueError("descent_alphas must lie in (0, 1]")
+        if any(a <= b for a, b in zip(alphas, alphas[1:])):
+            raise ValueError("descent_alphas must be strictly descending")
+        self._descent_alphas = alphas
+        self.descent_trials = 0
+        self.descent_rejects = 0
+        self.last_descent_alpha = torch.ones(
+            self.B, device=self.device, dtype=self.dtype)
 
         lo, hi = urdf_position_limits(self.names)
         self.q_lo = torch.as_tensor(lo, device=self.device, dtype=dtype)
@@ -231,6 +286,8 @@ class IsaacMPC:
         self._fk: ChainFK | None = None
         self._chain_fk()  # build outside inference_mode; reset runs inside it
         self._arm_dls_pending = torch.zeros(self.B, dtype=torch.bool, device=self.device)
+        self._frozen_terminal: torch.Tensor | None = None
+        self._frozen_goal_key: torch.Tensor | None = None
 
     def _chain_fk(self) -> ChainFK:
         if (
@@ -304,6 +361,14 @@ class IsaacMPC:
         hidx = self.sched.hit_index()
         self._reseed(env_ids, hidx >= 1, q0, hidx)
         self._arm_dls_pending.index_fill_(0, env_ids, True)
+        self._committed_reference = None
+        self._committed_goal_key = None
+        self.plan_segments = []
+        self.plan_attempts = []
+        self.plan_feasible = False
+        if self._frozen_goal_key is not None:
+            self._frozen_goal_key = self._frozen_goal_key.clone()
+            self._frozen_goal_key[env_ids] = -1
 
     # -------------------------------------------------------------- masks --
     def masks(self, hit_index: torch.Tensor):
@@ -322,7 +387,125 @@ class IsaacMPC:
             joint_names=self.names,
         )
 
+    @torch.no_grad()
+    def _descent_accept(
+        self,
+        init: torch.Tensor,
+        proposal: torch.Tensor,
+        q: torch.Tensor,
+        qd: torch.Tensor,
+        elem_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Backtrack toward ``init`` until the full cost strictly decreases.
+
+        Selection is per environment.  The first passing alpha is the largest
+        admissible step because ``descent_alphas`` is strictly descending.  If
+        none pass, alpha zero returns the shifted warm start exactly.
+        """
+        if not self.cfg.descent_accept:
+            one = torch.ones(q.shape[0], device=q.device, dtype=q.dtype)
+            nan = torch.full_like(one, float("nan"))
+            return proposal, {
+                "descent_alpha": one,
+                "descent_base_cost": nan,
+                "descent_proposal_cost": nan,
+                "descent_accepted_cost": nan,
+            }
+        strike = self.sched.strike_context()
+        lengths = group_lengths(strike.hit_index).to(q.dtype)
+
+        def score(traj: torch.Tensor) -> torch.Tensor:
+            out = self.descent_cost(
+                q, traj, qd, strike, lengths=lengths, elem_mask=elem_mask,
+            )
+            return out.total.detach().to(dtype=q.dtype)
+
+        base_cost = score(init)
+        accepted = init.clone()
+        accepted_cost = base_cost.clone()
+        alpha_out = torch.zeros_like(base_cost)
+        unresolved = torch.ones_like(base_cost, dtype=torch.bool)
+        proposal_cost = torch.full_like(base_cost, float("nan"))
+        delta = proposal - init
+        required = torch.maximum(
+            torch.full_like(base_cost, float(self.cfg.descent_min_abs)),
+            base_cost.abs() * float(self.cfg.descent_min_rel),
+        )
+        limit = base_cost - required
+        for i, alpha in enumerate(self._descent_alphas):
+            candidate = init + float(alpha) * delta
+            candidate = candidate * elem_mask.to(candidate.dtype)
+            value = score(candidate)
+            if i == 0:
+                proposal_cost = value
+            finite = torch.isfinite(value)
+            improves = finite & (
+                (~torch.isfinite(base_cost)) | (value <= limit)
+            )
+            take = unresolved & improves
+            if bool(take.any()):
+                accepted[take] = candidate[take]
+                accepted_cost[take] = value[take]
+                alpha_out[take] = float(alpha)
+                unresolved[take] = False
+        self.descent_trials += int(q.shape[0])
+        self.descent_rejects += int(unresolved.sum().item())
+        self.last_descent_alpha = alpha_out
+        return accepted, {
+            "descent_alpha": alpha_out,
+            "descent_base_cost": base_cost,
+            "descent_proposal_cost": proposal_cost,
+            "descent_accepted_cost": accepted_cost,
+        }
+
     # --------------------------------------------------------------- tick --
+    def _hold_plan_end(self, traj, q, hit_index):
+        """Retain idle joints and hold each group's terminal past its horizon."""
+        held = traj.clone()
+        for cols, k in [
+            (self.arm_cols[0], hit_index[:, 0]),
+            (self.arm_cols[1], hit_index[:, 1]),
+            (self.waist_cols, hit_index.max(dim=1).values),
+        ]:
+            end = (k - 1).clamp(0, self.H - 1)
+            last = held[:, :, cols].gather(
+                1, end[:, None, None].expand(-1, 1, len(cols)))
+            last = torch.where((k >= 1)[:, None, None], last, q[:, None, cols])
+            beyond = torch.arange(self.H, device=q.device)[None, :, None] >= end[:, None, None]
+            held[:, :, cols] = torch.where(beyond, last, held[:, :, cols])
+        return held
+
+    def _plan_gate(self, traj, q, qd, masks):
+        strike = self.sched.strike_context()
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            score = self.descent_cost(
+                q, traj, qd, strike, lengths=group_lengths(strike.hit_index).to(q.dtype),
+                elem_mask=masks.elem_mask,
+            )
+        values = {name: float(value.detach().max().item())
+                  for name, value in score.violations.items()}
+        # These are the same hard families used by the frozen-model probes.
+        hard = [v for name, v in values.items() if name in ("terminal", "collision")
+                or name.startswith(("torque", "joint_box", "velocity"))]
+        ok = (bool(torch.isfinite(traj).all()) and bool(torch.isfinite(score.total).all())
+              and bool(hard) and all(math.isfinite(v) and v <= self.cfg.plan_gate_tol for v in hard))
+        return ok, {"pass": len(self.plan_attempts) + 1, "feasible": ok,
+                    "total_cost": float(score.total.item()), "violations": values,
+                    "diagnostics": {name: float(value.detach().mean().item())
+                                    for name, value in score.diagnostics.items()
+                                    if name.startswith("contact_")}}
+
+    def _committed_tick(self, q, hit_index, masks):
+        reference = self._committed_reference
+        self.last_ref0 = reference[:, 0].clone()
+        cmd = self._command(reference, hit_index)
+        traj = reference.clone()
+        traj[:, 0] = cmd
+        self._pending = (traj, hit_index)
+        self.n_ticks += 1
+        return TickResult(cmd, traj, masks.elem_mask, hit_index, hit_index >= 0,
+                          {}, torch.ones(self.B, device=q.device, dtype=torch.bool), False)
+
     @torch.no_grad()
     def plan(self, q: torch.Tensor, qd: torch.Tensor) -> TickResult:
         """One refinement + one admissible command.  Does NOT step the clock."""
@@ -333,43 +516,63 @@ class IsaacMPC:
         active = hit_index >= 0
         masks = self.masks(hit_index)
 
+        if cfg.commit_plan:
+            key = self._encode_key(hit_index)
+            if (self._committed_reference is not None
+                    and torch.equal(key, self._committed_goal_key)):
+                return self._committed_tick(q, hit_index, masks)
+            if self._committed_reference is not None:
+                # A new scheduled request starts a new planning transaction.
+                self.init = self._committed_reference.clone()
+                self._arm_dls_pending.fill_(True)
+            self.plan_attempts = []
+            self.plan_feasible = False
+            self._committed_goal_key = key.clone()
+            if not bool((hit_index >= 1).any()):
+                # Stay idle outside the planning horizon, with no model calls.
+                self._committed_reference = q[:, None, :].expand(-1, self.H, -1).clone()
+                return self._committed_tick(q, hit_index, masks)
+
         enc, did_encode = self._encoding(hit_index, q)
         core = self.model.module if hasattr(self.model, "module") else self.model
         state = torch.cat([q, qd], dim=-1)
-        if getattr(enc, "waist_pr_sp", None) is not None:
-            self.init = seed_waist_pr_to_sp(
-                self.init, q, qd, enc.waist_pr_sp,
-                joint_names=self.names, dt=self.dt,
-                ease_wp=self.cfg.waist_upright_ease_wp,
-            )
-        if bool(self._arm_dls_pending.any()):
-            _tth, _d, gp, _w, _v, gactive = self.sched.goal()
-            live = (
-                self._arm_dls_pending.unsqueeze(-1)
-                & gactive
-                & (hit_index >= 1)
-            )
-            if core.terminal_initializer is not None:
-                seed = core.initial_trajectory(self._ctx, state, masks).to(self.dtype)
-                for h in (0, 1):
-                    rows = live[:, h]
-                    self.init[:, :, self.arm_cols[h]] = torch.where(
-                        rows[:, None, None], seed[:, :, self.arm_cols[h]],
-                        self.init[:, :, self.arm_cols[h]],
+        if cfg.fresh_accel_init:
+            self._apply_fresh_accel_init(core, state, masks, hit_index)
+        else:
+            if getattr(enc, "waist_pr_sp", None) is not None:
+                self.init = seed_waist_pr_to_sp(
+                    self.init, q, qd, enc.waist_pr_sp,
+                    joint_names=self.names, dt=self.dt,
+                    ease_wp=self.cfg.waist_upright_ease_wp,
+                )
+            if bool(self._arm_dls_pending.any()):
+                _tth, _d, gp, _w, _v, gactive = self.sched.goal()
+                live = (
+                    self._arm_dls_pending.unsqueeze(-1)
+                    & gactive
+                    & (hit_index >= 1)
+                )
+                if core.terminal_initializer is not None:
+                    seed = core.initial_trajectory(self._ctx, state, masks).to(self.dtype)
+                    for h in (0, 1):
+                        rows = live[:, h]
+                        self.init[:, :, self.arm_cols[h]] = torch.where(
+                            rows[:, None, None], seed[:, :, self.arm_cols[h]],
+                            self.init[:, :, self.arm_cols[h]],
+                        )
+                    any_live = live.any(dim=-1)
+                    self.init[:, :, self.waist_cols] = torch.where(
+                        any_live[:, None, None], seed[:, :, self.waist_cols],
+                        self.init[:, :, self.waist_cols],
                     )
-                any_live = live.any(dim=-1)
-                self.init[:, :, self.waist_cols] = torch.where(
-                    any_live[:, None, None], seed[:, :, self.waist_cols],
-                    self.init[:, :, self.waist_cols],
-                )
-            else:
-                self.init = correct_quintic_init_arms(
-                    self._chain_fk(), self.init, q, hit_index, gp,
-                    active=live, steps=1,
-                    q_bounds=(self.q_lo, self.q_hi),
-                    joint_names=self.names, qd0=qd, dt=self.dt,
-                )
-            self._arm_dls_pending.zero_()
+                else:
+                    self.init = correct_quintic_init_arms(
+                        self._chain_fk(), self.init, q, hit_index, gp,
+                        active=live, steps=1,
+                        q_bounds=(self.q_lo, self.q_hi),
+                        joint_names=self.names, qd0=qd, dt=self.dt,
+                    )
+                self._arm_dls_pending.zero_()
         init = self.init * masks.elem_mask
 
         was = core.training
@@ -381,8 +584,41 @@ class IsaacMPC:
         )
         with amp:
             out = core.refine(init, state, enc, masks, iterations=int(cfg.iterations))
+            if cfg.commit_plan:
+                for pass_index in range(cfg.plan_max_passes):
+                    candidate = self._hold_plan_end(out.traj.to(self.dtype), q, hit_index)
+                    ok, attempt = self._plan_gate(candidate, q, qd, masks)
+                    self.plan_attempts.append(attempt)
+                    print(f"[committed-plan] {attempt}", flush=True)
+                    if cfg.plan_acceptance == "isaac":
+                        self.plan_feasible = ok
+                        break
+                    if ok:
+                        self.plan_feasible = True
+                        break
+                    if pass_index + 1 < cfg.plan_max_passes:
+                        # Same physical state, context, and clock throughout.
+                        out = core.refine(candidate * masks.elem_mask, state, enc, masks, iterations=1)
+                execute = self.plan_feasible or (
+                    cfg.plan_acceptance == "isaac" and bool(torch.isfinite(candidate).all()))
+                self._committed_reference = (candidate.clone() if execute
+                                             else q[:, None, :].expand(-1, self.H, -1).clone())
+                self.plan_segments.append({
+                    "tick": self.n_ticks, "time_s": self.n_ticks * self.dt,
+                    "goal_key": key.detach().cpu().tolist(),
+                    "hit_index": hit_index.detach().cpu().tolist(),
+                    "feasible": self.plan_feasible,
+                    "executed": execute,
+                    "acceptance": cfg.plan_acceptance,
+                    "decoder_passes": len(self.plan_attempts),
+                    "attempts": list(self.plan_attempts),
+                })
         if was:
             core.train()
+        if cfg.commit_plan:
+            result = self._committed_tick(q, hit_index, masks)
+            result.encoded = did_encode
+            return result
         traj = out.traj.to(self.dtype)
 
         # ---- the freeze window, per hand (MPCGenerator.run_episode) --------
@@ -404,6 +640,13 @@ class IsaacMPC:
                     m, self.init[:, :, self.waist_cols], traj[:, :, self.waist_cols])
             frozen = hit_any
 
+        # The learned pass is a proposal, not an unconditional replacement.
+        # Score after freeze because that is the trajectory that would be
+        # committed; otherwise the freeze could invalidate the guarantee.
+        traj, descent_aux = self._descent_accept(
+            init, traj, q, qd, masks.elem_mask,
+        )
+
         # ---- reference lead, then slew, then box ---------------------------
         # ``last_ref0`` is the plan's own first waypoint BEFORE the lead: the
         # pose the planner nominated for the END of this control period.  That,
@@ -421,7 +664,8 @@ class IsaacMPC:
             active=active,
             aux={"vel": out.vel, "acc": out.acc, "torque": out.torque,
                  "fk_pos": out.fk_pos, "fk_vel": out.fk_vel,
-                 "point_mask": out.point_mask, "token_mask": out.token_mask},
+                 "point_mask": out.point_mask, "token_mask": out.token_mask,
+                 **descent_aux},
             frozen=frozen, encoded=did_encode,
         )
 
@@ -564,10 +808,62 @@ class IsaacMPC:
         """
         traj, _hidx = self._pending
         self.prev_cmd = cmd.to(self.dtype)
+        if self.cfg.commit_plan:
+            # Shift the un-led plan, never the controller's adjusted commands.
+            ref = self._committed_reference
+            self._committed_reference = torch.cat([ref[:, 1:], ref[:, -1:]], dim=1)
+            self.init = self._committed_reference.clone()
+            return
+        if self.cfg.fresh_accel_init:
+            # The next plan() redraws the analytic line from the measured
+            # state.  Shifting the refined trajectory here would put the
+            # previous plan back in the warm start.
+            return
         self.init = torch.cat([traj[:, 1:], traj[:, -1:]], dim=1)
         new_index = self.sched.hit_index()
         if bool(fired.any()):
             self._reseed(None, fired & (new_index >= 1), q.to(self.dtype), new_index, qd=qd)
+
+    def _apply_fresh_accel_init(self, core, state, masks, hit_index) -> None:
+        """Redraw the analytic seed onto the goal-start terminal pose."""
+        initializer = getattr(core, "terminal_initializer", None)
+        if initializer is None:
+            raise RuntimeError(
+                "fresh_accel_init requires a model with a terminal pose head"
+            )
+        if self._ctx is None:
+            raise RuntimeError("fresh_accel_init ran before the context was built")
+        key = self._encode_key(hit_index)
+        if self.cfg.fresh_terminal_every_tick:
+            self._frozen_terminal = initializer.terminal_pose(
+                self._ctx, state, masks
+            ).to(self.dtype)
+            self._frozen_goal_key = key.clone()
+            self.init = initializer.seed_from_terminal(
+                self._ctx, state, masks, self._frozen_terminal
+            ).to(self.dtype)
+            return
+        if self._frozen_terminal is None or self._frozen_goal_key is None:
+            self._frozen_terminal = initializer.terminal_pose(
+                self._ctx, state, masks
+            ).to(self.dtype)
+            self._frozen_goal_key = key.clone()
+        elif bool((key != self._frozen_goal_key).any()):
+            pred = initializer.terminal_pose(self._ctx, state, masks).to(self.dtype)
+            changed = key != self._frozen_goal_key
+            frozen = self._frozen_terminal
+            for h in (0, 1):
+                take = changed[:, h].view(-1, 1)
+                cols = self.arm_cols[h]
+                frozen[:, cols] = torch.where(take, pred[:, cols], frozen[:, cols])
+            take_w = changed.any(dim=-1).view(-1, 1)
+            wc = self.waist_cols
+            frozen[:, wc] = torch.where(take_w, pred[:, wc], frozen[:, wc])
+            self._frozen_terminal = frozen
+            self._frozen_goal_key = key.clone()
+        self.init = initializer.seed_from_terminal(
+            self._ctx, state, masks, self._frozen_terminal
+        ).to(self.dtype)
 
     def _reseed(self, env_ids, mask: torch.Tensor, q: torch.Tensor,
                 hit_index: torch.Tensor, *, qd: torch.Tensor | None = None) -> None:

@@ -249,6 +249,7 @@ def simulate_pd(
     saturate_derate: str = "linear",
     return_torque: bool = False,
     torque_reduce: str = "max",
+    return_substeps: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Batched differentiable PD (or PID) rollout. Pure tensors, no dataclasses.
 
@@ -265,6 +266,10 @@ def simulate_pd(
     sampled at the CONTROL knots and ``integral`` is ``(B, n)`` (the final
     accumulated integral error).  ``integral`` is ``None`` when ``ki`` is None or
     identically zero.
+
+    ``return_substeps=True`` appends dense ``(qa_sub, va_sub)`` of shape
+    ``(B, K*substeps+1, n)`` including the measured start. With torque enabled
+    these follow the torque tensor. Default returns and stepping are unchanged.
 
     Demanded torque
     ---------------
@@ -359,6 +364,8 @@ def simulate_pd(
     qs: list[torch.Tensor] = [qa]
     vs: list[torch.Tensor] = [va]
     taus: list[torch.Tensor] = []
+    dense_q = [qa] if return_substeps else []
+    dense_v = [va] if return_substeps else []
     for i in range(1, K + 1):
         x_prev = x_cmd[:, i - 1]
         x_new = x_cmd[:, i]
@@ -384,6 +391,9 @@ def simulate_pd(
             acc = torch.matmul(Mi, err.unsqueeze(-1)).squeeze(-1)
             qa = qa + h * va
             va = va + h * acc
+            if return_substeps:
+                dense_q.append(qa)
+                dense_v.append(va)
             if has_ki:
                 integral = integral + err_pos * h
                 if windup is not None:
@@ -397,13 +407,15 @@ def simulate_pd(
                 st = torch.stack(sub, dim=1)                       # (B, S, n)
                 j = st.abs().argmax(dim=1, keepdim=True)
                 taus.append(st.gather(1, j).squeeze(1))
+    dense = ((torch.stack(dense_q, dim=1), torch.stack(dense_v, dim=1))
+             if return_substeps else ())
     if return_torque:
         tau = (
             torch.stack(taus, dim=1) if taus
             else x_cmd.new_zeros(B, 0, n)
         )
-        return torch.stack(qs, dim=1), torch.stack(vs, dim=1), integral, tau
-    return torch.stack(qs, dim=1), torch.stack(vs, dim=1), integral
+        return (torch.stack(qs, dim=1), torch.stack(vs, dim=1), integral, tau)+dense
+    return (torch.stack(qs, dim=1), torch.stack(vs, dim=1), integral)+dense
 
 
 # ------------------------------------------------------------------- wrapper --
@@ -524,6 +536,7 @@ class BatchedPDSim:
         integral0: torch.Tensor | None = None,
         return_torque: bool = False,
         torque_reduce: str = "max",
+        return_substeps: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Full rollout over the commanded trajectory; see :func:`simulate_pd`.
 
@@ -561,6 +574,7 @@ class BatchedPDSim:
             saturate_derate=self.cfg.saturate_derate,
             return_torque=return_torque,
             torque_reduce=torque_reduce,
+            return_substeps=return_substeps,
         )
 
     def step(

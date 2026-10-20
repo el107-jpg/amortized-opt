@@ -116,6 +116,8 @@ parser.add_argument(
 parser.add_argument(
     "--no_overlay", action="store_true", default=False, help="Disable the beat/timestep overlay."
 )
+parser.add_argument("--compact_overlay", action="store_true",
+                    help="Show only timing and hit-credit counters, leaving the robot and kit unobstructed.")
 parser.add_argument(
     "--no_sticks", action="store_true", default=False, help="Disable the stick-tip hit markers."
 )
@@ -158,6 +160,42 @@ parser.add_argument(
 parser.add_argument(
     "--freeze_wp", type=int, default=0,
     help="Freeze window in waypoints (default 0, OFF -- 7c decision 2)."
+)
+parser.add_argument(
+    "--fresh-accel-init", action="store_true", default=False,
+    help="Initialize every replan from a constant-acceleration joint-space "
+         "line drawn from the measured position to the terminal pose captured "
+         "when the current goal began. Does not warm-start from the shifted "
+         "previous plan, and does not rerun the terminal generator each tick.",
+)
+parser.add_argument(
+    "--fresh-terminal-every-tick", action="store_true", default=False,
+    help="With the constant-acceleration line init, rerun the terminal "
+         "generator every tick from the measured position. Implies "
+         "--fresh-accel-init.",
+)
+parser.add_argument(
+    "--descent_accept", action=argparse.BooleanOptionalAction, default=False,
+    help="Require the decoder proposal to decrease the checkpoint's complete "
+         "trajectory cost; backtrack toward the shifted warm start otherwise.",
+)
+parser.add_argument("--commit_plan", action="store_true",
+                    help="Generate/refine one feasible plan per scheduled goal segment, then track it without replanning until the goal changes.")
+parser.add_argument("--direct_pid", action="store_true",
+                    help="One decoder pass from a clean terminal seed per goal segment, followed by fixed-trajectory PID tracking; no per-tick neural replanning or iterative refinement.")
+parser.add_argument("--plan_max_passes", type=int, default=32,
+                    help="Maximum decoder passes before abandoning an infeasible strike and holding the start pose.")
+parser.add_argument("--plan_gate_substeps", type=int, default=4,
+                    help="Physics feasibility collocations per 20 ms waypoint in committed-plan mode.")
+parser.add_argument("--plan_acceptance", choices=("physics", "isaac"), default="physics",
+                    help="isaac: execute one plan per goal segment and judge it using the existing Isaac hit detector; physics cost is diagnostic only.")
+parser.add_argument("--tracking_kick_s", type=float, default=0.5,
+                    help="Time of an optional single measured joint-velocity disturbance.")
+parser.add_argument("--tracking_kick_std", type=float, default=0.0,
+                    help="Gaussian velocity kick standard deviation in rad/s for upper-body joints (0 disables).")
+parser.add_argument(
+    "--descent_alphas", default="1,0.5,0.25,0.125,0.0625",
+    help="Descending proposal blend factors tried by --descent_accept.",
 )
 parser.add_argument(
     "--pin_waist", action="store_true", default=False,
@@ -248,6 +286,10 @@ parser.add_argument(
          "path, writes under runs/diagnostics/.",
 )
 parser.add_argument(
+    "--hit_diagnostics_full_plans", action="store_true",
+    help="Include complete un-led planned joint trajectories and masks in hit diagnostics for drift calibration.",
+)
+parser.add_argument(
     "--repo_ff", action="store_true", default=False,
     help="Keep the original G1DrummerEnv extras: foh_vel_target_ema=0.5 and "
          "distal inertial feedforward. Default is aligned to pd_sim / isaac_rl "
@@ -260,8 +302,40 @@ parser.add_argument(
          "eat the arms' commanded inertial load.",
 )
 # append AppLauncher cli args
+parser.add_argument("--assignment_train_config", default=None,
+                    help="Run event-level arm-assignment PPO using this JSON config.")
+parser.add_argument("--assignment_checkpoint", default=None,
+                    help="Use an unrestricted learned arm assignment policy for playback.")
+parser.add_argument("--hand_plan_checkpoint", default=None,
+                    help="Use the two-layer neural four-group hand-plan scorer for playback.")
+parser.add_argument("--hand_plan_trace", default=None,
+                    help="Save neural candidate scores, measured states and actual selected hands.")
+parser.add_argument("--hand_plan_commit_mode", choices=("block","receding"), default="block",
+                    help="Commit all four hit groups (default), or re-score after each group.")
+parser.add_argument("--assignment_comparison_config", default=None,
+                    help="Run a paired graph/chart hand-assignment evaluation in Isaac from this JSON config.")
+parser.add_argument("--domain_probe_config", default=None,
+                    help="Explicit physical drum/stick/dynamics randomization profile for a robustness evaluation.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.hand_plan_checkpoint and args_cli.assignment_checkpoint:
+    parser.error("Choose either neural four-group scoring or the legacy assignment policy")
+args_cli.domain_profile = (
+    json.loads(Path(args_cli.domain_probe_config).read_text())
+    if args_cli.domain_probe_config else None
+)
+if args_cli.direct_pid:
+    args_cli.commit_plan = True
+    args_cli.plan_max_passes = 1
+    args_cli.plan_acceptance = "isaac"
+    args_cli.fresh_accel_init = True
+    args_cli.fresh_terminal_every_tick = True
+    args_cli.descent_accept = False
+if (args_cli.assignment_comparison_config and args_cli.hit_diagnostics is None
+        and not args_cli.domain_probe_config):
+    # Enable the scorer at agent construction; the comparison supplies a
+    # separate diagnostic filename for each subsequent episode.
+    args_cli.hit_diagnostics = "auto"
 if args_cli.video:
     args_cli.enable_cameras = True
 
@@ -276,6 +350,10 @@ import gymnasium as gym  # noqa: E402
 import isaaclab_tasks  # noqa: E402, F401
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
+# Scene binding below imports this checkout's isaac_rl package before the
+# remaining amortized imports. Make the project available to both paths.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 
 def _require_repo():  # noqa: E402
     """Import the repo task + viz, or explain exactly what is missing.
@@ -287,6 +365,8 @@ def _require_repo():  # noqa: E402
     """
     try:
         import g1_drummer.tasks  # noqa: F401
+        from isaac_rl.decoder_scene import bind_registered_task_geometry
+        bind_registered_task_geometry()
         from g1_drummer.viz import BeatOverlay, StickVisualizer, enable_hit_telemetry
     except ModuleNotFoundError as exc:
         raise SystemExit(
@@ -301,8 +381,7 @@ def _require_repo():  # noqa: E402
 
 BeatOverlay, StickVisualizer, enable_hit_telemetry = _require_repo()
 
-# --- amortized imports (repo root on sys.path) ---------------------------------
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# --- amortized imports (repo root already on sys.path) -------------------------
 
 import amortized_opt as A  # noqa: E402
 from amortized_opt.lead import LEAD_PRESETS, resolve_lead  # noqa: E402
@@ -394,6 +473,9 @@ def _install_train_ready(u) -> None:
 def play_kit(args) -> A.DrumKit:
     """Layout kit, optionally shifted along env +x for a playback-only trial."""
     kit = A.DrumKit.from_layout()
+    profile = getattr(args, "domain_profile", None)
+    if profile is not None:
+        kit = replace(kit, positions=kit.positions+np.asarray(profile["drum_offsets_m"]))
     dx = float(getattr(args, "drum_dx", 0.0) or 0.0)
     if abs(dx) < 1e-12:
         return kit
@@ -606,6 +688,7 @@ def load_model(ckpt_path: Path, device: torch.device):
         "ppo_mean_correction_scale": (
             mean_scale if "actor" in ck and "model_cfg" not in ck else 0.0
         ),
+        "cost_config": (src.get("train_cfg") or {}).get("cost"),
     }
     return model, cfg, ck, mcfg
 
@@ -772,6 +855,40 @@ class AmortizedMPCAgent:
             None if self._dynamics_lead
             else resolve_lead(_lead_s_arg)
         )
+        descent_cost = None
+        descent_on = bool(getattr(args, "descent_accept", False))
+        commit_on = bool(getattr(args, "commit_plan", False))
+        if commit_on and self._dynamics_lead:
+            raise ValueError("--commit_plan requires fixed reference lead")
+        descent_alphas = tuple(
+            float(x.strip()) for x in str(args.descent_alphas).split(",")
+            if x.strip()
+        )
+        if descent_on or commit_on:
+            saved_cost = cfg.get("cost_config")
+            if self._rnea is None:
+                raise RuntimeError(
+                    "--descent_accept requires RNEA, but the Isaac cache/build "
+                    "did not provide one"
+                )
+            if isinstance(saved_cost, dict):
+                cost_cfg = A.CostConfig(**saved_cost)
+            else:
+                from amortized_opt.train_cost import phase2_cost_config
+                cost_cfg = phase2_cost_config()
+            if commit_on:
+                from dataclasses import replace
+                # Training disables this objective; execution still needs the
+                # analytic spline velocity rating checked by the hard gate.
+                cost_cfg = replace(cost_cfg, n_sub=int(args.plan_gate_substeps), w_velocity=1.0)
+            descent_cost = A.FusedCost(
+                cost_cfg, rnea=self._rnea, max_horizon=int(cfg["buckets"][-1]),
+                device=dev, dtype=torch.float32, dt=self.dt,
+            )
+            source = "checkpoint" if isinstance(saved_cost, dict) else "phase2 default"
+            label = "committed-plan feasibility" if commit_on else "descent acceptance"
+            print(f"[agent] {label} ON: full {source} cost, "
+                  f"collocations/waypoint={cost_cfg.n_sub}", flush=True)
         mpc_cfg = MPCConfig(
             horizon=int(cfg["buckets"][-1]),
             dt=self.dt,
@@ -785,7 +902,34 @@ class AmortizedMPCAgent:
             # loop the segment-cadence encoder has to be exercised in.
             amp_dtype=amp,
             waist_upright_ease_wp=cfg.get("waist_upright_ease_wp"),
+            descent_accept=descent_on,
+            descent_alphas=descent_alphas,
+            fresh_accel_init=bool(getattr(args, "fresh_accel_init", False))
+            or bool(getattr(args, "fresh_terminal_every_tick", False)),
+            fresh_terminal_every_tick=bool(
+                getattr(args, "fresh_terminal_every_tick", False)
+            ),
+            commit_plan=commit_on,
+            plan_max_passes=int(args.plan_max_passes),
+            plan_acceptance=args.plan_acceptance,
         )
+        if mpc_cfg.fresh_accel_init:
+            if getattr(model, "terminal_initializer", None) is None:
+                raise RuntimeError(
+                    "--fresh-accel-init requires a checkpoint with a terminal pose head"
+                )
+            if mpc_cfg.fresh_terminal_every_tick:
+                print(
+                    "[init] fresh constant-acceleration line each tick; "
+                    "terminal pose regenerated from the measured position",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[init] fresh constant-acceleration line each tick; "
+                    "terminal pose frozen when each goal segment starts",
+                    flush=True,
+                )
         self.mpc = IsaacMPC(
             model,
             schedule=self.schedule,
@@ -794,6 +938,7 @@ class AmortizedMPCAgent:
             dtype=torch.float32,
             library=None,  # auto-created by IsaacMPC
             kit_names=kit.names,
+            descent_cost=descent_cost,
         )
 
         # --- real-contact strike compliance ---------------------------------
@@ -1058,6 +1203,8 @@ class AmortizedMPCAgent:
         self._step = 0
         self._n_hits = 0
         self._initialized = True
+        self._tracking_kick = None
+        self._executed_trace = []
         self._viol_joint.clear()
         self._viol_torque.clear()
         self._viol_collision.clear()
@@ -1084,8 +1231,22 @@ class AmortizedMPCAgent:
         u = self.u
         dev = self.device
 
+        if (float(getattr(self.args, "tracking_kick_std", 0.0)) > 0.0
+                and self._tracking_kick is None
+                and now >= float(self.args.tracking_kick_s)):
+            generator = torch.Generator().manual_seed(int(self.args.seed) + 9461)
+            delta = torch.randn(len(self._joint_ids), generator=generator) * float(self.args.tracking_kick_std)
+            positions = u.robot.data.joint_pos.clone()
+            velocities = u.robot.data.joint_vel.clone()
+            velocities[0, self._joint_ids] += delta.to(velocities.device)
+            u.robot.write_joint_state_to_sim(positions, velocities)
+            self._tracking_kick = {"time_s": now, "std_rad_s": self.args.tracking_kick_std,
+                                   "delta_rad_s": delta.tolist()}
+            print(f"[tracking-kick] {self._tracking_kick}", flush=True)
+
         q = u.robot.data.joint_pos[0, self._joint_ids].to(torch.float32)
         qd = u.robot.data.joint_vel[0, self._joint_ids].to(torch.float32)
+
         self._contact_step.zero_()
 
         # Run the MPC
@@ -1220,6 +1381,18 @@ class AmortizedMPCAgent:
         q = u.robot.data.joint_pos[0, self._joint_ids].to(torch.float32)
         qd = u.robot.data.joint_vel[0, self._joint_ids].to(torch.float32)
 
+        if self._hit_diag_enabled and self.args.hit_diagnostics_full_plans:
+            applied = getattr(u.robot.data, "applied_torque", None)
+            self._executed_trace.append({
+                "time_s": self._step * self.dt,
+                "q": q.detach().cpu().float().tolist(),
+                "qd": qd.detach().cpu().float().tolist(),
+                "cmd": self._q_des.detach().cpu().float().tolist(),
+                "reference": self.mpc.last_ref0[0].detach().cpu().float().tolist(),
+                "applied_torque_ratio": (float((applied[0, self._joint_ids].detach().cpu().abs() / self._tau_lim).max())
+                                         if applied is not None else None),
+            })
+
         w = q[self._waist_i]
         self._waist_lo = torch.minimum(self._waist_lo, w)
         self._waist_hi = torch.maximum(self._waist_hi, w)
@@ -1351,12 +1524,18 @@ class AmortizedMPCAgent:
             tr = torque[0].detach().cpu().float().abs() / self._tau_lim.view(1, -1)
             tr = torch.where(mask, tr, torch.zeros_like(tr))
             torque_ratio = float(tr.max().item())
-        return {
+        stats = {
             "finite": bool(torch.isfinite(traj[mask]).all().item()),
             "joint_box_excess_deg": float(q_exc.max().item() * 180.0 / np.pi),
             "velocity_ratio": float(v_ratio.max().item()),
             "predicted_torque_ratio": torque_ratio,
         }
+        for key in ("descent_alpha", "descent_base_cost",
+                    "descent_proposal_cost", "descent_accepted_cost"):
+            value = result.aux.get(key)
+            if isinstance(value, torch.Tensor) and value.numel():
+                stats[key] = float(value[0].detach().cpu().item())
+        return stats
 
     def _record_hit_plan(
         self, now: float, result, q: torch.Tensor, qd: torch.Tensor,
@@ -1407,6 +1586,11 @@ class AmortizedMPCAgent:
                     ),
                 },
             }
+            if bool(getattr(self.args, "hit_diagnostics_full_plans", False)):
+                reference = result.traj[0].detach().clone()
+                reference[0] = self.mpc.last_ref0[0].detach()
+                row["plan_q"] = reference.cpu().float().tolist()
+                row["plan_elem_mask"] = result.elem_mask[0].detach().cpu().float().tolist()
             trace = self._hit_diag_trace.setdefault(key, [])
             trace.append(row)
             if len(trace) > 50:
@@ -1489,6 +1673,29 @@ class AmortizedMPCAgent:
         if not self._hit_diag_enabled:
             return None
         payload = self.hit_diagnostics()
+        if self.args.hit_diagnostics_full_plans:
+            payload["executed_trace"] = self._executed_trace
+            payload["tracking_kick"] = self._tracking_kick
+        if self.mpc.cfg.commit_plan:
+            payload["committed_plan"] = {
+                "feasible": self.mpc.plan_feasible,
+                "decoder_passes": len(self.mpc.plan_attempts),
+                "attempts": self.mpc.plan_attempts,
+                "gate_substeps": self.args.plan_gate_substeps,
+                "gate_tolerance": self.mpc.cfg.plan_gate_tol,
+                "ki": self._ki, "ki_windup": self._ki_windup,
+                "acceptance": self.mpc.cfg.plan_acceptance,
+                "failed_plan_behavior": ("execute finite proposal; judge actual Isaac hits"
+                    if self.mpc.cfg.plan_acceptance == "isaac" else "hold initial pose"),
+                "network_idle_between_goal_changes": True,
+                "segments": self.mpc.plan_segments,
+                "total_decoder_passes": sum(s["decoder_passes"] for s in self.mpc.plan_segments),
+                "velocity_limits_checked": True,
+            }
+        if bool(getattr(self.args, "hit_diagnostics_full_plans", False)):
+            payload["metadata"] = {"checkpoint": str(self.args.ckpt), "dt": self.dt,
+                "joint_names": list(self._joint_names), "plan_reference": "first knot restored before command lead",
+                "freeze_wp": self.args.freeze_wp, "contact_compliance": self.args.contact_compliance}
         requested = str(self.args.hit_diagnostics)
         if requested == "auto":
             stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1529,15 +1736,21 @@ class AmortizedMPCAgent:
                 f" | compliance contact=L{int(active[0])}/R{int(active[1])} "
                 f"hand_ticks={self._contact_hand_ticks}"
             )
+        descent_str = ""
+        if bool(getattr(self.args, "descent_accept", False)):
+            alpha = float(self.mpc.last_descent_alpha[0].detach().cpu().item())
+            rejected = self.mpc.descent_rejects
+            trials = max(self.mpc.descent_trials, 1)
+            descent_str = f" | descent a={alpha:g} reject={100*rejected/trials:.0f}%"
         return (
-            f"[t={now:5.2f}s] amortized MPC | "
+            f"[t={now:5.2f}s] {'decoder + direct PID' if self.args.direct_pid else 'amortized MPC'} | "
             f"tth L={tth0}wp R={tth1}wp | "
             f"hits={self._n_hits} | "
             f"track cmd={self._last_track_cmd_rms*1e3:.0f}mrad "
             f"plan={self._last_track_plan_rms*1e3:.0f}mrad | "
             f"waist cmd y/p/r={cmd_w[0]:+.0f}/{cmd_w[1]:+.0f}/{cmd_w[2]:+.0f}deg "
             f"meas p2p={p2p[0]:.0f}/{p2p[1]:.0f}/{p2p[2]:.0f}deg | "
-            f"lead={lead_tag}{off_str}{pid_str}{compliance_str}"
+            f"lead={lead_tag}{off_str}{pid_str}{compliance_str}{descent_str}"
         )
 
     def violation_summary(self) -> dict:
@@ -1615,7 +1828,29 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
     # InferenceMode").  Reset in the same mode the episode runs in.
     with torch.inference_mode():
         env.reset()
+        if hasattr(agent, "_domain_reset"):
+            agent._domain_reset()
         agent.reset()
+        if getattr(agent, "hand_plan_model", None) is not None:
+            from isaac_rl.neural_hand_plan_playback import NeuralHandPlanAssignment
+            from isaac_rl.assignment_train import install_beats
+            online_assignment = NeuralHandPlanAssignment(agent,agent.hand_plan_model,agent._clip,
+                                                         trace_path=agent.args.hand_plan_trace,
+                                                         mode=agent.args.hand_plan_commit_mode)
+            install_beats(u,online_assignment.queue)
+            online_assignment.advance(0.0)
+            q = u.robot.data.joint_pos[0,agent._joint_ids].to(agent.device).float()
+            agent.mpc.reset(torch.tensor([0],device=agent.device),q.unsqueeze(0))
+        elif getattr(agent, "assignment_policy", None) is not None:
+            from isaac_rl.assignment_train import OnlineAssignment, install_beats
+            online_assignment = OnlineAssignment(agent, agent.assignment_policy, agent._clip,
+                                                 deterministic=True)
+            install_beats(u, online_assignment.queue)
+            online_assignment.advance(0.0)
+            q = u.robot.data.joint_pos[0, agent._joint_ids].to(agent.device).float()
+            agent.mpc.reset(torch.tensor([0], device=agent.device), q.unsqueeze(0))
+        else:
+            online_assignment = None
         # _assign_clips sizes env_max_steps from the env's rhythm clip
         # (clamped to max_episode_length-1). Playback duration is --steps,
         # so overwrite. +1 because episode_length_buf is incremented before
@@ -1633,6 +1868,8 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
         start = time.time()
         now = int(u.episode_length_buf[0].item()) * dt
         with torch.inference_mode():
+            if online_assignment is not None:
+                online_assignment.advance(now)
             action = agent.act(now)
             _obs, _rew, terminated, truncated, _info = env.step(action)
         agent.post_step()
@@ -1656,6 +1893,8 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
             vs = agent.violation_summary()
             _print_episode_stats(vs)
             agent.write_hit_diagnostics()
+            if online_assignment is not None and hasattr(online_assignment,"finish"):
+                online_assignment.finish()
             return {}
         if k % 50 == 0:
             print(f"  step {k}/{steps} {agent.status_line(now)}", flush=True)
@@ -1664,6 +1903,8 @@ def run_episode(env, agent, max_steps=None, frame_sink=None, sticks=None,
     if vs["steps"] > 0:
         _print_episode_stats(vs)
     agent.write_hit_diagnostics()
+    if online_assignment is not None and hasattr(online_assignment,"finish"):
+        online_assignment.finish()
     return {}
 
 
@@ -1703,6 +1944,9 @@ def main():
         use_fabric=not args_cli.disable_fabric,
     )
     env_cfg.seed = args_cli.seed
+    from isaac_rl.decoder_scene import configure_tip_geometry,configure_drum_kit_geometry
+    configure_drum_kit_geometry(env_cfg)
+    configure_tip_geometry(env_cfg)
     kd_scale = (
         float(args_cli.pd_damping_scale)
         if args_cli.pd_damping_scale is not None
@@ -1842,11 +2086,18 @@ def main():
         f"pin_waist_lean={bool(getattr(env_cfg, 'pin_waist_lean', False))}"
     )
 
+    if args_cli.domain_profile is not None:
+        # Apply after the rhythm overlay's __post_init__, which rebuilds robot_cfg.
+        from isaac_rl.domain_probe import prepare_scene
+        prepare_scene(env_cfg, args_cli.domain_profile)
     env = gym.make(
         args_cli.task, cfg=env_cfg,
         render_mode="rgb_array" if args_cli.video else None,
     )
     u = env.unwrapped
+    if args_cli.domain_profile is not None:
+        from isaac_rl.domain_probe import install_geometry
+        install_geometry(u, args_cli.domain_profile)
     if abs(drum_dx) > 1e-12:
         u.drum_pos[:, 0] += drum_dx
         u.drum_pos_env[:, :, 0] += drum_dx
@@ -1871,6 +2122,39 @@ def main():
         play_clip=play_clip, play_clip_path=clip_path,
     )
     print("[player] Agent built OK.", flush=True)
+    if args_cli.domain_profile is not None:
+        from isaac_rl.domain_probe import install_policy_geometry, apply_dynamics
+        install_policy_geometry(agent, args_cli.domain_profile)
+        agent._domain_reset = lambda: apply_dynamics(agent, args_cli.domain_profile)
+    if args_cli.assignment_comparison_config:
+        from isaac_rl.min_time_isaac_probe import run_comparison
+        try:
+            run_comparison(env, agent, args_cli.assignment_comparison_config, simulation_app)
+        finally:
+            env.close()
+        return
+    if args_cli.assignment_train_config:
+        from isaac_rl.assignment_train import run_training
+        try:
+            run_training(env, agent, args_cli.assignment_train_config)
+        finally:
+            env.close()
+        return
+    if args_cli.hand_plan_checkpoint:
+        from isaac_rl.neural_hand_plan_playback import load_hand_plan_policy
+        agent.hand_plan_model, agent.hand_plan_metadata = load_hand_plan_policy(args_cli.hand_plan_checkpoint,dev)
+        print("[hand-plan] two-layer neural scorer loaded: "+json.dumps(agent.hand_plan_metadata),flush=True)
+    if args_cli.assignment_checkpoint:
+        from isaac_rl.arm_assignment import AssignmentConfig, AssignmentPolicy
+        blob = torch.load(args_cli.assignment_checkpoint, map_location=dev, weights_only=False)
+        Policy = AssignmentPolicy
+        if blob.get("format") in ("arm_assignment_dqn_v1", "arm_assignment_dqn_init_v1", "arm_assignment_search_q_v1"):
+            from isaac_rl.assignment_dqn import AssignmentQPolicy
+            Policy = AssignmentQPolicy
+        agent.assignment_policy = Policy(AssignmentConfig(**blob["policy_config"])).to(dev)
+        agent.assignment_policy.load_state_dict(blob["policy"])
+        agent.assignment_policy.eval()
+        agent.assignment_bpm = float(json.loads(clip_path.read_text()).get("metadata", {}).get("original_bpm", 120))
     if hasattr(u, "beat_valid"):
         n_env = int(u.beat_valid[0].sum().item())
         print(
@@ -1895,7 +2179,12 @@ def main():
             raise ValueError(
                 f"Unknown --angles {unknown}; choose from {list(ANGLE_OFFSETS)}."
             )
-        overlay = BeatOverlay(env, tag="amortized") if not args_cli.no_overlay else None
+        video_tag = "decoder + direct PID" if args_cli.direct_pid else (
+            "fixed plan + PID" if args_cli.commit_plan else "amortized")
+        overlay = BeatOverlay(env, tag=video_tag) if not args_cli.no_overlay else None
+        if overlay is not None and args_cli.compact_overlay:
+            full_lines = overlay._lines
+            overlay._lines = lambda: full_lines()[:2]
         sticks = StickVisualizer(env) if not args_cli.no_sticks else None
         stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         kd = getattr(args_cli, "pd_damping_scale", None)

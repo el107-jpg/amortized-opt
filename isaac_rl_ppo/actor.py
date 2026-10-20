@@ -21,11 +21,11 @@ The pipeline for one control tick
    decoder's waypoint-0 hidden state), ``std`` a learned state-independent
    per-dim parameter.  Log-prob and entropy are stock ``Normal`` -- the PPO
    math is exact and untouched.
-3. The sample is turned into an executed command by the DEPLOYED path: the
-   per-joint reference lead, the slew bound and the joint-box clamp, in that
-   order.  The noise is applied as an additive joint-space offset AFTER the
-   lead (see :func:`executed_command`), so the lead stays exactly the fitted
-   ``cmd_lead_s`` vector and the head cannot silently learn a second one.
+3. The sample is expressed in un-led first-waypoint coordinates. Its offset
+   from the raw first waypoint is applied to the deployed command AFTER the
+   per-joint reference lead, slew bound and joint-box clamp (see
+   :func:`executed_command`). This sends the mean correction and exploration
+   to the plant while keeping the fitted lead outside the policy distribution.
 
 What is trainable
 -----------------
@@ -151,8 +151,13 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
         self.rank = int(rank)
         self.scaling = float(alpha) / float(rank)
-        self.lora_a = nn.Parameter(torch.empty(rank, base.in_features))
-        self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank))
+        device, dtype = base.weight.device, base.weight.dtype
+        self.lora_a = nn.Parameter(torch.empty(
+            rank, base.in_features, device=device, dtype=dtype,
+        ))
+        self.lora_b = nn.Parameter(torch.zeros(
+            base.out_features, rank, device=device, dtype=dtype,
+        ))
         nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
@@ -292,8 +297,10 @@ def executed_command(
     """Turn the deterministic command + the exploration offset into a command.
 
     ``cmd_det`` is what the deployed path produced: ``lead -> slew -> box`` on
-    the untouched plan.  The exploration offset is added AFTERWARDS and the slew
-    and box bounds are re-imposed on the result.
+    the untouched plan. ``delta`` is the sampled un-led waypoint minus the
+    planner's raw un-led waypoint, so it includes both the mean correction and
+    exploration. The offset is added AFTERWARDS and the slew and box bounds are
+    re-imposed on the result.
 
     Why after the lead and not on ``traj[:, 0]``:  the lead is an interpolation
     between waypoints 0 and 1 with a PER-JOINT fraction, so perturbing waypoint

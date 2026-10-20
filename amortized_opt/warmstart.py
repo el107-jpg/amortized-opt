@@ -306,8 +306,8 @@ class GoalPoseLibrary:
     "closest joint position out of a library per drum that satisfies terminal
     position conditions".
 
-    Note the library is already hand-eligible: ``left/floor_tom`` and
-    ``right/hihat`` simply do not exist in it, matching the no-crossover rule.
+    Left/floor_tom is excluded. Right/hihat is included so the learned
+    assignment and trajectory models can receive crossover examples.
     """
 
     def __init__(

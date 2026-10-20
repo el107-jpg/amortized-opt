@@ -1,16 +1,17 @@
-"""Frozen terminal-pose head and analytic trajectory initialization.
+"""Terminal-pose head and analytic trajectory initialization.
 
 The transformer encoder and this small MLP run side by side.  The MLP sees
 the same current goals/kit geometry plus the measured start state, predicts a
 terminal joint pose, and :func:`strike_seed` expands that pose into the
-decoder's initial trajectory.  The terminal branch is deliberately frozen and
+decoder's initial trajectory.  By default the terminal branch is frozen and
 its result is detached: trajectory losses train the decoder, never the IK
-network.
+network. Joint fine-tuning can explicitly enable this entire gradient path.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from functools import wraps
 
 import numpy as np
 import torch
@@ -27,8 +28,16 @@ from .tokenizer import ContextInputs, WaypointMasks
 __all__ = ["TerminalInitializer"]
 
 
+def _terminal_grad_mode(fn):
+    @wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        with torch.set_grad_enabled(self.trainable and torch.is_grad_enabled()):
+            return fn(self, *args, **kwargs)
+    return wrapped
+
+
 class TerminalInitializer(nn.Module):
-    """A stop-gradient terminal MLP followed by the analytic strike seed."""
+    """Terminal MLP plus analytic strike seed, frozen unless explicitly trainable."""
 
     def __init__(
         self,
@@ -37,11 +46,15 @@ class TerminalInitializer(nn.Module):
         width: int = 128,
         depth: int = 2,
         dt: float = 0.02,
+        hihat_library_fallback: bool = True,
+        trainable: bool = False,
         joint_names=G1_UPPER_BODY_JOINTS,
     ):
         super().__init__()
         self.num_drums = int(num_drums)
         self.dt = float(dt)
+        self.hihat_library_fallback = bool(hihat_library_fallback)
+        self.trainable = bool(trainable)
         self.joint_names = tuple(joint_names)
         if len(self.joint_names) != N_DOF:
             raise ValueError(f"terminal initializer requires {N_DOF} joints")
@@ -65,19 +78,32 @@ class TerminalInitializer(nn.Module):
         cymbal = [is_cymbal_name(n) for n in kit.names]
         cymbal.extend([False] * (self.num_drums - len(cymbal)))
         self.register_buffer("cymbal_by_drum", torch.as_tensor(cymbal, dtype=torch.bool))
-        self.freeze()
+        # Old frozen heads never saw right-hand hi-hat. A verified library
+        # seed supplies that missing branch without an iterative runtime IK.
+        # Checkpoint keys remain unchanged.
+        self.hihat_index = kit.names.index('hihat') if 'hihat' in kit.names else -1
+        from .warmstart import GoalPoseLibrary
+        library = GoalPoseLibrary()
+        rows = library.entries('right', 'hihat') if library.has('right', 'hihat') else []
+        self.register_buffer('_hihat_right_poses', torch.tensor(
+            np.asarray([r.q for r in rows]).reshape(-1, N_DOF), dtype=torch.float32), persistent=False)
+        self.set_trainable(self.trainable)
+
+    def set_trainable(self, enabled: bool) -> "TerminalInitializer":
+        self.trainable = bool(enabled)
+        self.head.requires_grad_(self.trainable)
+        self.head.train(self.training if self.trainable else False)
+        return self
 
     def freeze(self) -> "TerminalInitializer":
         """Freeze the terminal solver; the analytic seed has no learned state."""
-        self.head.requires_grad_(False)
-        self.head.eval()
-        return self
+        return self.set_trainable(False)
 
     def train(self, mode: bool = True):
-        # Parent ``model.train()`` must not put the pretrained head back into a
-        # train-time regime if the architecture later gains stochastic layers.
+        # Frozen heads stay in eval mode; explicitly trainable heads follow
+        # the parent model's train/eval mode.
         super().train(mode)
-        self.head.eval()
+        self.head.train(mode if self.trainable else False)
         return self
 
     def load_pretrained(self, path: str | Path, *, map_location="cpu") -> dict:
@@ -96,7 +122,9 @@ class TerminalInitializer(nn.Module):
         if int(ck.get("depth", self.head.depth)) != self.head.depth:
             raise ValueError("terminal checkpoint depth does not match ModelConfig")
         self.head.load_state_dict(ck["model"], strict=True)
-        self.freeze()
+        if ck.get("all_hand_drum_goals", False):
+            self.hihat_library_fallback = False
+        self.set_trainable(self.trainable)
         return ck
 
     def _features(
@@ -143,23 +171,53 @@ class TerminalInitializer(nn.Module):
             q0, v0, masks.hit_tth.float(),
         )
 
-    @torch.no_grad()
+    @_terminal_grad_mode
     def terminal_pose(
         self, ctx: ContextInputs, state: torch.Tensor, masks: WaypointMasks
     ) -> torch.Tensor:
-        """Predict a detached terminal pose in float32."""
+        """Predict in float32; gradients are opt-in through the whole seed path."""
         device_type = "cuda" if state.is_cuda else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
-            return self.head(self._features(ctx, state, masks)).detach()
+            pose = self.head(self._features(ctx, state, masks))
+            if not self.hihat_library_fallback or self.hihat_index < 0 or not len(self._hihat_right_poses):
+                return pose
+            live = (ctx.goal_valid[:, 1].bool() & (ctx.goal_drum[:, 1] == self.hihat_index) &
+                    (ctx.goal_pos[:, 1].norm(dim=-1) > 1e-6))
+            pose = pose.clone()
+            from .ik import arm_joint_indices
+            yaw = torch.where(ctx.aim_valid, ctx.aim_yaw, pose[:, 0])
+            rows = self._hihat_right_poses.to(pose)
+            nearest = (yaw[:, None]-rows[None, :, 0]).abs().argmin(-1)
+            chosen = rows[nearest]
+            columns = arm_joint_indices('right')
+            # Dense selection avoids CPU/GPU synchronization or per-row loops.
+            pose[:, columns] = torch.where(live[:, None], chosen[:, columns], pose[:, columns])
+            single = live & ~ctx.goal_valid[:, 0].bool()
+            pose[:, :3] = torch.where(single[:, None], chosen[:, :3], pose[:, :3])
+            return pose
 
-    @torch.no_grad()
-    def forward(
-        self, ctx: ContextInputs, state: torch.Tensor, masks: WaypointMasks
+    @_terminal_grad_mode
+    def seed_from_terminal(
+        self,
+        ctx: ContextInputs,
+        state: torch.Tensor,
+        masks: WaypointMasks,
+        terminal: torch.Tensor,
     ) -> torch.Tensor:
-        """Return the detached decoder seed, shape ``(B, H, 17)``."""
+        """Expand a supplied terminal pose into the analytic decoder seed.
+
+        Active arms follow the ramped-constant-acceleration joint-space line.
+        Waist and idle arms settle with the same seed's rest quintic.  The
+        terminal is not recomputed here, so a caller can freeze one pose and
+        redraw the line from a later measured state.
+        """
         q0 = state[:, :N_DOF].float()
         v0 = state[:, N_DOF:].float()
-        terminal = self.terminal_pose(ctx, state, masks)
+        terminal = terminal.to(device=q0.device, dtype=torch.float32)
+        if terminal.shape != q0.shape:
+            raise ValueError(
+                f"terminal shape {tuple(terminal.shape)} != state joints {tuple(q0.shape)}"
+            )
         B, H = state.shape[0], masks.elem_mask.shape[1]
         left = (masks.tau0_left.float() / self.dt).round().clamp_min(1)
         right = (masks.tau0_right.float() / self.dt).round().clamp_min(1)
@@ -180,4 +238,13 @@ class TerminalInitializer(nn.Module):
             self.head.q_lo.to(seed).view(1, 1, -1),
             self.head.q_hi.to(seed).view(1, 1, -1),
         )
-        return (seed * masks.elem_mask.float()).detach()
+        return seed * masks.elem_mask.float()
+
+    @_terminal_grad_mode
+    def forward(
+        self, ctx: ContextInputs, state: torch.Tensor, masks: WaypointMasks
+    ) -> torch.Tensor:
+        """Return the detached decoder seed, shape ``(B, H, 17)``."""
+        return self.seed_from_terminal(
+            ctx, state, masks, self.terminal_pose(ctx, state, masks)
+        )

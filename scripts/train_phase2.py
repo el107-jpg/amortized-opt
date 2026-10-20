@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from amortized_opt.gaussian_bridge import GaussianBridgeNoise
 
 def configure_inductor() -> None:
     """Settings under which inductor DOES compile this stack on this toolchain.
@@ -86,6 +87,42 @@ from amortized_opt.train_cost import (  # noqa: E402
 )
 
 
+def _resolve_contact_scoring_mode(requested: str, checkpoint: dict | None,
+                                  *, resume: bool) -> str:
+    """Fresh training adopts capsule v5; resumes keep their saved objective."""
+    if requested != 'auto':
+        return requested
+    if not resume:
+        return 'isaac_v5'
+    archived_cost=(((checkpoint or {}).get('train_cfg') or {}).get('cost') or {})
+    return archived_cost.get('contact_scoring_mode','legacy')
+
+
+def _resolve_physics_loss_settings(requested, checkpoint, *, resume,
+                                    n_sub=None, motion=None, temporal_bound=None):
+    """Version all geometry changes; never change an archived resume objective."""
+    from amortized_opt.cost import CostConfig
+    archived = (((checkpoint or {}).get('train_cfg') or {}).get('cost') or {})
+    previous = archived.get('physics_loss_version', 'legacy')
+    version = (previous if resume else 'geometry_v2') if requested == 'auto' else requested
+    if resume and version != previous:
+        raise ValueError('Changing physics loss requires a new --init run; --resume keeps its objective')
+    base = (CostConfig(**{key: value for key, value in archived.items()
+                         if key in CostConfig.__dataclass_fields__}) if resume else
+            phase2_cost_config() if version == 'geometry_v2' else CostConfig())
+    settings = {name: getattr(base, name) for name in (
+        'n_sub', 'geometry_motion_mode', 'collision_temporal_bound',
+        'impact_velocity_mode', 'w_stick_stick')}
+    for key, value in (('n_sub', n_sub), ('geometry_motion_mode', motion),
+                       ('collision_temporal_bound', temporal_bound)):
+        if value is not None:
+            if resume and value != settings[key]:
+                raise ValueError(f'Changing {key} on --resume changes the physics objective; use --init')
+            settings[key] = value
+    settings['physics_loss_version'] = version
+    return settings
+
+
 def _resume_training_states(
     checkpoint: dict,
     *,
@@ -105,10 +142,48 @@ def _resume_training_states(
     )
 
 
+def _line_search_resume_policy(
+    *,
+    resume_step: int | None,
+    line_search_fresh: bool,
+    activate_after_updates: int,
+    strict_actual_update: bool | None,
+    reject_current_probe_increase: bool | None = None,
+    skip_on_probe_exhaustion: bool | None = None,
+    selector_update_count: int | None = None,
+) -> tuple[int, bool, bool, bool]:
+    """Resolve activation and actual-step safety for a fresh selector resume.
+
+    The activation setting is a training-step threshold. A fresh selector
+    starts its local successful-update counter at zero, so subtract the
+    checkpoint step to preserve that threshold across the reset. New runs and
+    resumes that restore selector state keep the configured delay unchanged.
+    """
+    fresh_resume = bool(line_search_fresh and resume_step is not None)
+    delay = max(int(activate_after_updates), 0)
+    if fresh_resume:
+        prior_updates = (
+            int(resume_step) if selector_update_count is None
+            else int(selector_update_count)
+        )
+        delay = max(delay - max(prior_updates, 0), 0)
+    strict = fresh_resume if strict_actual_update is None else bool(strict_actual_update)
+    reject = (
+        fresh_resume if reject_current_probe_increase is None
+        else bool(reject_current_probe_increase)
+    )
+    skip = (
+        fresh_resume if skip_on_probe_exhaustion is None
+        else bool(skip_on_probe_exhaustion)
+    )
+    return delay, strict, reject, skip
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    p.add_argument("--args-json", help="saved argument mapping; explicit CLI flags take precedence")
     p.add_argument("--device", default="cuda:1")
     p.add_argument("--steps", type=int, default=60_000)
     p.add_argument("--batch", type=int, default=512)
@@ -151,6 +226,21 @@ def parse_args(argv=None):
     p.add_argument("--scenarios", type=int, default=250_000)
     p.add_argument("--workers", type=int, default=48)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--train-terminal-head", action=argparse.BooleanOptionalAction, default=None,
+                   help="allow decoder losses to backpropagate through the terminal seed")
+    p.add_argument("--terminal-role-checkpoint", default=None,
+                   help="original terminal training checkpoint supplying role-loss weights and task sampling")
+    p.add_argument("--w-terminal-role", type=float, default=1.0)
+    p.add_argument("--terminal-role-w-com", type=float, default=None,
+                   help="override only the terminal generator's COM objective weight")
+    p.add_argument("--terminal-role-batch", type=int, default=64)
+    p.add_argument("--terminal-role-dynamic-al", action=argparse.BooleanOptionalAction, default=False,
+                   help="adapt terminal hit/collision AL after successful actor updates")
+    p.add_argument("--terminal-role-al-lam-max", type=float, default=None,
+                   help="terminal AL multiplier ceiling; preserve current multipliers on resume")
+    p.add_argument("--terminal-head-grad-fraction-cap", type=float, default=0.3)
+    p.add_argument("--terminal-head-grad-cap-mode", choices=("combined_l2", "parameter_rms"),
+                   default="combined_l2", help="cap total L2 share or size-normalized head/rest RMS gradient ratio")
     p.add_argument("--horizon", type=int, default=100)
     p.add_argument("--buckets", type=int, nargs="+", default=[25, 50, 100])
     p.add_argument("--num-future", type=int, default=1,
@@ -171,6 +261,20 @@ def parse_args(argv=None):
                    help="Phase A lead time before the indexed hit (seconds)")
     p.add_argument("--synth-transition-frac", type=float, default=0.25,
                    help="within Phase A, fraction drawn from synth dual clips")
+    p.add_argument('--far-goal-pairs', nargs='+', default=None, metavar='HAND:DRUM',
+                   help='focused far-family coverage, e.g. left:hihat right:hihat')
+    p.add_argument('--all-hand-drum-goals', action=argparse.BooleanOptionalAction, default=True,
+                   help='balanced accepted far rows and single-hand MPC clips for every eligible hand/drum target')
+    p.add_argument('--target-top-entry-depth-mm', type=float, default=None,
+                   help='require target capsule entry through its top, with this shallow depth band')
+    p.add_argument('--contact-scoring-mode',choices=('auto','legacy','isaac_v4','isaac_v5'),default='auto',
+                   help='fresh runs use v4 top/upper-side contact losses; auto resumes archived cost mode')
+    p.add_argument('--w-actor-retention', type=float, default=0.,
+                   help='frozen starting-actor trajectory tie outside new right-hi-hat goals')
+    p.add_argument('--actor-retention-checkpoint', default=None,
+                   help='fixed teacher across resumes; default is the starting actor')
+    p.add_argument('--actor-retention-hihat-departures', action=argparse.BooleanOptionalAction, default=False,
+                   help='allow both hi-hat arrivals and departures to learn; retain unrelated contexts')
     p.add_argument("--tip-speed-max", type=float, default=4.0)
     p.add_argument("--post-hit-cache", default=None,
                    help="optional legacy npz of distilled KIND_POST_HIT rows "
@@ -220,7 +324,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--timing-critic-mode",
         choices=("off", "shadow", "assist", "control"),
-        default="off",
+        default="control",
         help="task-time violation critic rollout mode; assist retimes a guarded "
              "slice and control retimes all eligible rows after shadow warmup",
     )
@@ -272,6 +376,9 @@ def parse_args(argv=None):
     p.add_argument("--timing-primary-anchor-per-task", type=int, default=1)
     p.add_argument("--timing-primary-boundary-per-task", type=int, default=1)
     p.add_argument("--timing-primary-interior-per-task", type=int, default=4)
+    p.add_argument("--timing-primary-mpc", action=argparse.BooleanOptionalAction,
+                   default=True, help="use trajectory-suffix MPC actor rows; "
+                   "disable to fill those slots with independent fresh tasks")
     p.add_argument("--timing-primary-mpc-terminal-limit", type=float, default=0.040)
     p.add_argument(
         "--timing-primary-mpc-collision-sdf-limit", type=float, default=-0.010,
@@ -325,14 +432,11 @@ def parse_args(argv=None):
                         "THE POOL -- same cache caveat as --drum-tilt-deg")
     p.add_argument("--pair-frac", type=float, default=0.0,
                    help="fraction of scenarios from the PAIR family: both "
-                        "hands striking, (left, right) drum combination drawn "
-                        "UNIFORMLY over the 21 distinct pairs + 5 same-drum "
-                        "ones, hands assigned by lateral position so the arms "
-                        "never cross.  The rhythm clips cover only 5 of the 31 "
-                        "reachable pairs (hihat+snare alone is 83.6 %%) and "
-                        "never put floor_tom or cymbal_left in a two-handed "
-                        "row at all, so without this the model sees one "
-                        "two-hand configuration and nothing else")
+                   "hands striking, (left, right) drum combination drawn "
+                        "uniformly over all 36 distinct plus 6 same-drum "
+                        "eligible assignments, including crossed hands. "
+                        "In rhythm-pool mode these scenarios are added to "
+                        "the idle/far pools and every pair is audited")
     p.add_argument("--cold-start-frac", type=float, default=0.0,
                    help="fraction of scenarios whose waist yaw is drawn "
                         "independently of the goals (legacy pool only; 0 under "
@@ -429,6 +533,12 @@ def parse_args(argv=None):
     p.add_argument("--dls-terminal-frac", type=float, default=None,
                    help="deterministic batch fraction receiving an arm-only "
                         "DLS terminal lookahead (0 disables it)")
+    p.add_argument("--dls-terminal-goal-pairs", nargs="+", default=None,
+                   help="restrict terminal teaching to named HAND:DRUM goals")
+    p.add_argument('--dls-terminal-start-pairs', nargs='+', default=None,
+                   help='also teach named HAND:DRUM departure states')
+    p.add_argument('--dls-terminal-region-target', action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument('--dls-terminal-reject-worse', action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--w-dls-terminal-cost", type=float, default=None,
                    help="full-physics cost weight on the DLS-corrected "
                         "straight-through trajectory")
@@ -487,9 +597,24 @@ def parse_args(argv=None):
     p.add_argument("--bptt-decoder-passes", type=int, default=None,
                    help="total decoder applications across the two-solve BPTT chain")
     p.add_argument("--w-bptt", type=float, default=None)
+    p.add_argument(
+        "--w-tip-up", type=float, default=None,
+        help="ReLU weight on a downward stick tip at the strike. Snare and "
+             "floor tom are exempt. Default keeps the cost weight at 0.",
+    )
+    p.add_argument(
+        "--lora-rank", type=int, default=0,
+        help="Fine-tune decoder attention/FFN with LoRA of this rank. 0 keeps "
+             "full-parameter training. Alpha is 2x rank so the step-0 delta is 0.",
+    )
     p.add_argument("--decoder-only", action="store_true",
                    help="freeze encoder and terminal initializer; optimize decoder only")
-    p.add_argument("--n-sub", type=int, default=1)
+    p.add_argument("--n-sub", type=int, default=None,
+                   help="geometry samples per 20 ms segment; fresh default 5, resume preserves saved value")
+    p.add_argument('--physics-loss-version', choices=('auto','legacy','geometry_v2'), default='auto')
+    p.add_argument('--geometry-motion-mode', choices=('spline','foh','pd'), default=None,
+                   help='fresh default foh; pd evaluates the saturated nominal PD surrogate')
+    p.add_argument('--collision-temporal-bound', action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--w-torque", type=float, default=None,
                    help="override phase2_cost_config's torque price "
                         "(default 20; characteristic 1 N·m)")
@@ -605,6 +730,8 @@ def parse_args(argv=None):
                    help="plain objective weight on active-arm COM-proxy height "
                         "and horizontal reach beyond their deadbands (m^-2). "
                         "Measured in the torso frame; q0 is excluded")
+    p.add_argument("--w-elbow-down", type=float, default=None,
+                   help="trajectory elbow-down posture objective weight")
     p.add_argument("--arm-compact-mode", choices=("linear", "hinge_sq"),
                    default=None,
                    help="linear continuously prices COM-proxy height+radius; "
@@ -1027,11 +1154,15 @@ def parse_args(argv=None):
     # grad_balance="" before make_cost_step (plan §1–2 / §14). Cosine LR
     # ownership is gated later in the loop (TODO plan §7). Commit-gate /
     # viol_acc policy for selection failure is plan §14 — not CLI-owned.
-    p.add_argument("--line-search", action="store_true",
+    p.add_argument("--line-search", action=argparse.BooleanOptionalAction, default=False,
                    help="enable SaLSa-style LR line search; forces "
                         "--grad-balance off (baked before make_cost_step, "
                         "plan §14) and takes LR ownership from cosine once "
                         "the executor is wired (plan §7)")
+    p.add_argument("--line-search-cosine-before-activation",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="use --warmup-steps and --lr-horizon before delayed "
+                        "line-search activation; inherit the last scheduled rate at the handoff")
     p.add_argument("--line-search-mode", default=None,
                    choices=["salsa_transfer", "fixed_epsilon"],
                    help="salsa_transfer = Armijo probe search (default); "
@@ -1067,6 +1198,8 @@ def parse_args(argv=None):
     p.add_argument("--line-search-epsilon-seed", type=float, default=None,
                    help="explicit epsilon seed; default uses --lr / resume "
                         "migration")
+    p.add_argument('--line-search-legacy-resume-seed', type=float, default=None,
+                   help='explicit selector rate for a fresh-selector resume retaining Adam moments')
     p.add_argument("--line-search-epsilon-min", type=float, default=None,
                    help="absolute ε floor (default epsilon_min_mult × seed)")
     p.add_argument("--line-search-epsilon-min-start", type=float, default=None,
@@ -1093,20 +1226,64 @@ def parse_args(argv=None):
     p.add_argument("--line-search-actual-diagnostic-every", type=int, default=None,
                    help="evaluate the fully replayed actual executed candidate "
                         "every N successful-update slots (0 disables; default 0)")
-    p.add_argument("--line-search-strict-actual-update", action="store_true",
+    p.add_argument("--line-search-retry-retained-rate", action="store_true",
+                   help="after a skipped stochastic batch, retry from the last "
+                        "accepted rate rather than the smallest failed trial")
+    p.add_argument("--line-search-strict-actual-update",
+                   dest="line_search_strict_actual_update",
+                   action="store_true", default=None,
                    help="require a finite non-increasing replayed objective "
                         "along the actual executed candidate; backtrack or skip")
+    p.add_argument("--no-line-search-strict-actual-update",
+                   dest="line_search_strict_actual_update",
+                   action="store_false",
+                   help="disable strict actual-step validation (including "
+                        "the fresh-resume default)")
     p.add_argument("--line-search-reject-current-probe-increase",
-                   action="store_true",
+                   dest="line_search_reject_current_probe_increase",
+                   action="store_true", default=None,
                    help="reject a current probe increase even when its smoothed "
                         "acceptance EMA would pass")
+    p.add_argument("--no-line-search-reject-current-probe-increase",
+                   dest="line_search_reject_current_probe_increase",
+                   action="store_false",
+                   help="allow smoothed probe acceptance after a current-batch "
+                        "increase (including the fresh-resume default)")
     p.add_argument("--line-search-skip-on-probe-exhaustion",
-                   action="store_true",
+                   dest="line_search_skip_on_probe_exhaustion",
+                   action="store_true", default=None,
                    help="skip the update instead of floor-committing when no "
                         "probe candidate is accepted")
-    p.add_argument("--terminal-init-noise", action="store_true",
-                   help="apply phase-1-matched OU+white noise to fresh frozen-"
+    p.add_argument("--no-line-search-skip-on-probe-exhaustion",
+                   dest="line_search_skip_on_probe_exhaustion",
+                   action="store_false",
+                   help="floor-commit when probe trials exhaust (including "
+                        "the fresh-resume default)")
+    p.add_argument("--terminal-init-noise", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="apply configured OU+white noise to fresh frozen-"
                         "terminal-head seeds after reseeding")
+    p.add_argument("--terminal-init-all-rows", action="store_true",
+                   help="rebuild every decoder initialization, including MPC and Bellman states; requires no input noise")
+    p.add_argument("--mpc-noise-bridge-config", help="calibrated Gaussian bridge JSON for MPC initialization noise")
+    p.add_argument("--mpc-state-noise-scale", type=float, default=0.0,
+                   help="scale of calibrated elapsed-time MPC state drift; zero keeps existing state noise")
+    p.add_argument("--mpc-noise-tau-steps", type=float, default=None)
+    p.add_argument("--mpc-noise-magnitude-distribution", choices=["log_uniform", "half_normal"], default=None)
+    p.add_argument("--mpc-noise-sigma-scale", type=float, default=None)
+    p.add_argument("--mpc-noise-sigma-white", type=float, default=None)
+    p.add_argument("--mpc-init-noise", action=argparse.BooleanOptionalAction,
+                   default=True, help="perturb shifted MPC decoder inputs; keep clean seeds")
+    p.add_argument("--init-noise-tau-steps", type=float, default=20.0,
+                   help="OU correlation length in waypoints (default 20 = 400 ms)")
+    p.add_argument("--init-noise-magnitude-distribution", choices=["log_uniform", "half_normal"],
+                   default="half_normal", help="distribution of per-trajectory OU sigma")
+    p.add_argument("--init-noise-sigma-scale", type=float, default=0.30,
+                   help="half-normal OU sigma scale in radians (default .30)")
+    p.add_argument("--init-noise-sigma-min", type=float, default=0.02)
+    p.add_argument("--init-noise-sigma-max", type=float, default=0.30)
+    p.add_argument("--init-noise-sigma-white", type=float, default=0.003,
+                   help="independent waypoint noise sigma in radians (default .003)")
     p.add_argument("--terminal-init-noise-ramp-steps", type=int, default=5,
                    help="knots used by the zero-position/zero-velocity cubic "
                         "noise envelope (default 5)")
@@ -1228,7 +1405,33 @@ def parse_args(argv=None):
                    help="spike ratio vs prior-train median for auto-frontier")
     p.add_argument("--frontier-auto-viol-window", type=int, default=10,
                    help="train rows in the auto-frontier violation window")
-    return p.parse_args(argv)
+    preliminary = argparse.ArgumentParser(add_help=False)
+    preliminary.add_argument("--args-json")
+    config_arg, _ = preliminary.parse_known_args(argv)
+    if config_arg.args_json:
+        saved = json.loads(Path(config_arg.args_json).read_text())
+        known = {action.dest for action in p._actions}
+        unknown = sorted(set(saved) - known)
+        if unknown:
+            p.error(f"unknown arguments in --args-json: {unknown}")
+        p.set_defaults(**saved)
+    args = p.parse_args(argv)
+    if not math.isfinite(args.w_actor_retention) or args.w_actor_retention < 0:
+        p.error('--w-actor-retention must be finite and nonnegative')
+    if args.target_top_entry_depth_mm is not None and (
+        not math.isfinite(args.target_top_entry_depth_mm) or args.target_top_entry_depth_mm <= 0):
+        p.error('--target-top-entry-depth-mm must be finite and positive')
+    if args.far_goal_pairs and any(len(pair.split(':', 1)) != 2 or
+        pair.split(':', 1)[0] not in ('left', 'right') for pair in args.far_goal_pairs):
+        p.error('--far-goal-pairs entries must be HAND:DRUM')
+    if not math.isfinite(args.mpc_state_noise_scale) or args.mpc_state_noise_scale < 0:
+        p.error("--mpc-state-noise-scale must be finite and nonnegative")
+    if args.mpc_state_noise_scale and not args.mpc_noise_bridge_config:
+        p.error("--mpc-state-noise-scale requires --mpc-noise-bridge-config")
+    if args.line_search_legacy_resume_seed is not None and (
+            not math.isfinite(args.line_search_legacy_resume_seed) or args.line_search_legacy_resume_seed<=0):
+        p.error('--line-search-legacy-resume-seed must be finite and positive')
+    return args
 
 
 def _validate_voxel_cli(args) -> None:
@@ -1311,7 +1514,7 @@ def _schedule_schema() -> str:
 
 #: Bump when the fingerprint *key set* or semantics change.  Value mismatches
 #: (tilt, seed, …) fail without a bump; this is for adding/renaming keys.
-POOL_FINGERPRINT_VERSION = 1
+POOL_FINGERPRINT_VERSION = 4
 
 
 def _pool_fingerprint(args, scen) -> str:
@@ -1336,6 +1539,8 @@ def _pool_fingerprint(args, scen) -> str:
         "rhythm_idle_frac": float(scen.rhythm_idle_frac),
         "post_hit_frac": float(scen.post_hit_frac),
         "far_fetched_frac": float(scen.far_fetched_frac),
+        "far_goal_pairs": scen.far_goal_pairs,
+        "all_hand_drum_goals": bool(scen.all_hand_drum_goals),
         "eval_like_frac": float(scen.eval_like_frac),
         "cold_start_frac": float(scen.cold_start_frac),
         "pair_frac": float(scen.pair_frac),
@@ -1359,6 +1564,11 @@ def _pool_fingerprint(args, scen) -> str:
         ),
         "idle_settle_wp": int(scen.idle_settle_wp),
     }
+    from amortized_opt.strike import HIHAT_AIM_INSET_M
+    from amortized_opt.warmstart import DRUM_GOAL_POSES_PATH
+    import hashlib
+    payload['hihat_aim_inset_m'] = HIHAT_AIM_INSET_M
+    payload['goal_library_sha256'] = hashlib.sha256(Path(DRUM_GOAL_POSES_PATH).read_bytes()).hexdigest()
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -1443,8 +1653,11 @@ def _save_npz_buckets(
 
 
 def _make_rhythm_pool(args, scen, noise, device):
-    """Generate Phase A + far-fetched (+ optional post-hit cache) and wrap."""
-    from amortized_opt.phase2_data import Phase2Pool, _merge
+    """Generate rhythm, far, and optional paired-hand scenarios and wrap."""
+    from amortized_opt.phase2_data import (
+        Phase2Pool, _merge, add_empty_schedule_provenance,
+        generate_cost_pool,
+    )
     from amortized_opt.rhythm import default_rcc_dir, load_rcc_pool
     from amortized_opt.rhythm_chain_data import (
         generate_far_fetched_scenarios,
@@ -1453,14 +1666,16 @@ def _make_rhythm_pool(args, scen, noise, device):
 
     n_idle = max(0, int(round(float(args.scenarios) * float(args.rhythm_idle_frac))))
     n_far = max(0, int(round(float(args.scenarios) * float(args.far_fetched_frac))))
-    if n_idle + n_far <= 0:
+    n_pair = max(0, int(round(float(args.scenarios) * float(args.pair_frac))))
+    if n_idle + n_far + n_pair <= 0:
         raise SystemExit(
-            "rhythm pool needs --rhythm-idle-frac and/or --far-fetched-frac > 0 "
+            "rhythm pool needs --rhythm-idle-frac, --far-fetched-frac, "
+            "and/or --pair-frac > 0 "
             "(or pass --legacy-pool)"
         )
     kit = A.DrumKit.from_layout()
     clips = load_rcc_pool(default_rcc_dir("train"), kit)
-    print(f"[data] rhythm pool: idle={n_idle}, far={n_far} "
+    print(f"[data] rhythm pool: idle={n_idle}, far={n_far}, pair={n_pair} "
           f"(RCC clips={len(clips)})", flush=True)
     t0 = time.perf_counter()
     parts = []
@@ -1474,6 +1689,21 @@ def _make_rhythm_pool(args, scen, noise, device):
         parts.append(generate_far_fetched_scenarios(
             n_far, clips, seed=int(args.seed) + 17, cfg=scen, kit=kit,
         ))
+    if n_pair > 0:
+        print(f"[data] generating {n_pair} paired-hand scenarios...", flush=True)
+        pair_cfg = replace(scen, eval_like_frac=0.0, cold_start_frac=0.0,
+                           pair_frac=1.0)
+        pair_pool = generate_cost_pool(
+            n_pair, seed=int(args.seed) + 31, cfg=pair_cfg, noise=noise,
+            workers=args.workers, device="cpu",
+        )
+        pair_buckets = {b: {k: v.detach().cpu().numpy() for k, v in data.items()}
+                        for b, data in pair_pool.data.items()}
+        parts.append({
+            "buckets": add_empty_schedule_provenance(
+                pair_buckets, schedule_slots=scen.schedule_slots),
+            "stats": dict(pair_pool.stats),
+        })
     ph = Path(args.post_hit_cache) if args.post_hit_cache else None
     if ph is not None and ph.exists():
         print(f"[data] merging post-hit cache {ph}", flush=True)
@@ -1491,10 +1721,65 @@ def _make_rhythm_pool(args, scen, noise, device):
     return pool, True
 
 
+def training_goal_coverage(pool, scen):
+    """Audit accepted supervision and the clip goals MPC will promote."""
+    from amortized_opt.rhythm_chain_data import training_goal_pairs, build_focused_single_transition_clips
+    from amortized_opt.warmstart import GoalPoseLibrary
+    from amortized_opt.phase2_data import pair_combinations
+    kit = A.DrumKit.from_layout()
+    library = GoalPoseLibrary(joint_names=scen.joint_names)
+    expected = training_goal_pairs(kit, library, scen)
+    active_counts = np.zeros((2, kit.num_drums), dtype=int)
+    pair_counts = np.zeros((kit.num_drums, kit.num_drums), dtype=int)
+    future_counts = active_counts.copy()
+    for data in pool.data.values():
+        if 'drum' not in data or 'active' not in data:
+            raise RuntimeError('Training coverage audit requires drum and active labels')
+        drums = data['drum'].detach().cpu().numpy()
+        active = data['active'].detach().cpu().numpy().astype(bool)
+        for h in (0,1):
+            np.add.at(active_counts[h], drums[:,h][active[:,h]], 1)
+        both = active[:, 0] & active[:, 1]
+        np.add.at(pair_counts, (drums[both, 0], drums[both, 1]), 1)
+        if 'sched_drum' in data and 'sched_valid' in data:
+            future = data['sched_drum'].detach().cpu().numpy()
+            valid = data['sched_valid'].detach().cpu().numpy().astype(bool)
+            for h in (0,1): np.add.at(future_counts[h], future[:,h][valid[:,h]], 1)
+    clips = build_focused_single_transition_clips(kit, library, scen)
+    transitions = set()
+    for clip in clips:
+        for h,hand in enumerate(('left','right')):
+            sequence = [hit.drum for hit in clip.hits if hit.hand==hand]
+            transitions.update((h,a,b) for a,b in zip(sequence[:-1],sequence[1:]))
+    missing = [f'{hand}:{name}' for hand,name in expected
+               if active_counts[('left','right').index(hand),kit.index(name)]==0]
+    if scen.all_hand_drum_goals and missing:
+        raise RuntimeError(f'Training pool has no active examples for {missing}; regenerate a sufficiently large all-hand pool')
+    distinct, same = pair_combinations(kit)
+    expected_pairs = distinct + [(d, d) for d in same]
+    missing_pairs = [f'{kit.names[a]}|{kit.names[b]}' for a, b in expected_pairs
+                     if pair_counts[a, b] == 0]
+    if scen.pair_frac > 0 and missing_pairs:
+        raise RuntimeError(f'Training pool lacks paired-hand examples for {missing_pairs}; increase --scenarios or inspect acceptance')
+    return dict(expected_hand_drum_pairs=[f'{h}:{n}' for h,n in expected],
+        active_goal_counts={hand:dict(zip(kit.names,active_counts[h].tolist())) for h,hand in enumerate(('left','right'))},
+        expected_left_right_pairs=[f'{kit.names[a]}|{kit.names[b]}' for a,b in expected_pairs],
+        paired_goal_counts={f'{kit.names[a]}|{kit.names[b]}':int(pair_counts[a,b])
+                            for a,b in expected_pairs},
+        missing_paired_goals=missing_pairs,
+        future_schedule_counts={hand:dict(zip(kit.names,future_counts[h].tolist())) for h,hand in enumerate(('left','right'))},
+        synthetic_single_hand_clips=len(clips),synthetic_source_destination_pairs=len(transitions),
+        synthetic_transitions=[dict(hand=('left','right')[h],source=kit.names[a],destination=kit.names[b])
+                               for h,a,b in sorted(transitions)],
+        pool_rows=len(pool),missing_active_targets=missing,
+        scope='Accepted static supervision and explicit synthetic MPC/post-hit clip inventory; Bellman admission still requires its normal success gates')
+
+
 def load_or_make_pool(args, scen, noise, device):
     cache = Path(args.pool_cache) if args.pool_cache else None
     use_rhythm = (not args.legacy_pool) and (
         float(args.rhythm_idle_frac) > 0.0 or float(args.far_fetched_frac) > 0.0
+        or float(args.pair_frac) > 0.0
     )
     fingerprint = _pool_fingerprint(args, scen)
     if cache is not None and cache.exists():
@@ -1618,6 +1903,7 @@ def main(argv=None) -> int:
     )
     use_rhythm = (not args.legacy_pool) and (
         float(args.rhythm_idle_frac) > 0.0 or float(args.far_fetched_frac) > 0.0
+        or float(args.pair_frac) > 0.0
     )
     scen_kw = dict(
         waist_cfg=waist_cfg,
@@ -1637,15 +1923,17 @@ def main(argv=None) -> int:
         lead_s=float(args.lead_s),
         tip_speed_max=float(args.tip_speed_max),
         synth_transition_frac=float(args.synth_transition_frac),
+        all_hand_drum_goals=bool(args.all_hand_drum_goals),
         rhythm_idle_frac=float(args.rhythm_idle_frac),
         post_hit_frac=float(args.post_hit_frac),
         far_fetched_frac=float(args.far_fetched_frac),
+        far_goal_pairs=(None if args.far_goal_pairs is None else
+                        tuple(tuple(pair.split(':', 1)) for pair in args.far_goal_pairs)),
     )
     if use_rhythm:
         scen_kw.update(
             eval_like_frac=0.0,
             cold_start_frac=0.0,
-            pair_frac=0.0,
         )
     scen = Phase2ScenarioConfig(**scen_kw)
     print(f"[data] kit randomization: {kit_rand} "
@@ -1658,8 +1946,42 @@ def main(argv=None) -> int:
           f"post_hit={args.post_hit_frac:.2f} far={args.far_fetched_frac:.2f} "
           f"eval_like={args.eval_like_frac:.2f} "
           f"({'rhythm' if use_rhythm else 'legacy'} pool)", flush=True)
-    noise = Phase2Noise()
+    noise = Phase2Noise(
+        tau_steps=float(args.init_noise_tau_steps),
+        magnitude_distribution=str(args.init_noise_magnitude_distribution),
+        sigma_scale=float(args.init_noise_sigma_scale),
+        sigma_corr_min=float(args.init_noise_sigma_min),
+        sigma_corr_max=float(args.init_noise_sigma_max),
+        sigma_white=float(args.init_noise_sigma_white),
+    )
+    print(f"[data] init noise: OU tau={noise.tau_steps:g} knots, "
+          f"magnitude={noise.magnitude_distribution}, scale={noise.sigma_scale:g} rad, "
+          f"white={noise.sigma_white:g} rad, fresh={int(args.terminal_init_noise)}, "
+          f"MPC={int(args.mpc_init_noise)}", flush=True)
+    overrides = {key: getattr(args, "mpc_noise_" + key) for key in
+                 ("tau_steps", "magnitude_distribution", "sigma_scale", "sigma_white")
+                 if getattr(args, "mpc_noise_" + key) is not None}
+    mpc_noise = replace(noise, **overrides) if overrides else None
+    state_noise = None
+    if args.mpc_noise_bridge_config:
+        bridge = GaussianBridgeNoise(**json.loads(Path(args.mpc_noise_bridge_config).read_text()))
+        mpc_noise = replace(noise,process="gaussian_bridge",bridge=bridge)
+        if args.mpc_state_noise_scale:
+            state_noise = replace(bridge,scale=bridge.scale*args.mpc_state_noise_scale)
+    if mpc_noise is not None:
+        print(f"[data] MPC noise override: {mpc_noise}", flush=True)
+    if args.terminal_init_all_rows:
+        if args.terminal_init_noise or args.mpc_init_noise:
+            raise SystemExit("--terminal-init-all-rows requires --no-terminal-init-noise --no-mpc-init-noise")
+        print("[data] rebuilding every actor/Bellman initialization without noise", flush=True)
     pool = load_or_make_pool(args, scen, noise, dev)
+    if use_rhythm:
+        coverage = training_goal_coverage(pool, scen)
+        coverage_path = (Path(args.pool_cache).with_suffix('.coverage.json') if args.gen_pool_only
+                         else run_dir/'data_coverage.json')
+        coverage_path.write_text(json.dumps(coverage, indent=2)+'\n')
+        print(f"[data] accepted goal coverage: {len(coverage['expected_hand_drum_pairs'])} hand/drum targets; "
+              f"{coverage['synthetic_source_destination_pairs']} single-hand source/destination pairs", flush=True)
     if args.gen_pool_only:
         print(f"[data] pool cached at {args.pool_cache}; exiting (--gen-pool-only)",
               flush=True)
@@ -1681,6 +2003,48 @@ def main(argv=None) -> int:
         ck = None
         model_cfg = A.ModelConfig(max_horizon=int(args.horizon),
                                   num_drums=scen.num_drums, num_future=scen.num_future)
+    archived_contact_mode=(_resolve_contact_scoring_mode('auto',ck,resume=True)
+                           if args.resume else None)
+    args.contact_scoring_mode=_resolve_contact_scoring_mode(
+        args.contact_scoring_mode,ck,resume=bool(args.resume))
+    if args.resume and args.contact_scoring_mode!=archived_contact_mode:
+        raise SystemExit('Changing the contact objective requires a new --init run; '
+                         '--resume must keep the archived optimizer/AL objective')
+    print(f'[contact-scoring] differentiable target loss: {args.contact_scoring_mode}',flush=True)
+    try:
+        physics_settings = _resolve_physics_loss_settings(args.physics_loss_version, ck,
+            resume=bool(args.resume), n_sub=args.n_sub, motion=args.geometry_motion_mode,
+            temporal_bound=args.collision_temporal_bound)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    print(f'[physics-loss] {physics_settings}', flush=True)
+    if int(args.lora_rank) > 0 and args.resume:
+        args.reset_optimizer = True
+        args.line_search_fresh = True
+        print(
+            "[lora] fresh adapter: optimizer and line-search selector reset",
+            flush=True,
+        )
+    prior_selector_updates = None
+    if args.resume and isinstance(ck, dict):
+        extra = ck.get("extra") or {}
+        selector = extra.get("line_search") if isinstance(extra, dict) else None
+        controller = selector.get("controller") if isinstance(selector, dict) else None
+        if isinstance(controller, dict) and "successful_update_count" in controller:
+            prior_selector_updates = int(controller["successful_update_count"])
+    (line_search_activation_delay, line_search_strict_actual,
+     line_search_reject_probe_increase, line_search_skip_on_exhaustion) = (
+        _line_search_resume_policy(
+            resume_step=(int(ck.get("step") or 0)
+                         if args.resume and ck else None),
+            line_search_fresh=bool(args.line_search and args.line_search_fresh),
+            activate_after_updates=int(args.line_search_activate_after_updates),
+            strict_actual_update=args.line_search_strict_actual_update,
+            reject_current_probe_increase=args.line_search_reject_current_probe_increase,
+            skip_on_probe_exhaustion=args.line_search_skip_on_probe_exhaustion,
+            selector_update_count=prior_selector_updates,
+        )
+    )
     # apply CLI overrides
     overridden = False
     for attr in ("d_model", "dec_layers", "d_ctx", "ctx_layers", "dec_ffn_mult"):
@@ -1855,13 +2219,22 @@ def main(argv=None) -> int:
                   f"{final_floor} over "
                   f"{int(args.line_search_epsilon_min_ramp_updates)} updates",
                   flush=True)
-        if int(args.line_search_activate_after_updates) > 0:
+        if line_search_activation_delay > 0:
             print(f"[cfg] line_search delayed until after update "
-                  f"{int(args.line_search_activate_after_updates)}; ordinary "
-                  "AdamW follows the live epsilon floor before activation",
+                  f"{line_search_activation_delay}; ordinary "
+                  + ("AdamW follows linear warmup/cosine before activation"
+                     if args.line_search_cosine_before_activation else
+                     "AdamW follows the live epsilon floor before activation"),
+                  flush=True)
+        if args.resume and args.line_search_fresh:
+            print("[cfg] fresh selector resume safety: "
+                  f"strict_actual={int(line_search_strict_actual)} "
+                  f"reject_probe_increase={int(line_search_reject_probe_increase)} "
+                  f"skip_on_probe_exhaustion={int(line_search_skip_on_exhaustion)}; "
+                  f"activation_updates_remaining={line_search_activation_delay}",
                   flush=True)
     if args.terminal_init_noise:
-        print(f"[cfg] fresh terminal init noise ON: OU+white, start-anchored "
+        print(f"[cfg] fresh terminal init noise ON: configured OU+white, start-anchored "
               f"over {int(args.terminal_init_noise_ramp_steps)} knots", flush=True)
     if float(args.torque_grad_cap) > 0.0:
         print(f"[cfg] torque_grad_cap={float(args.torque_grad_cap):g} "
@@ -1880,6 +2253,14 @@ def main(argv=None) -> int:
                   f"random -- use --no-idle-token to load it strictly", flush=True)
             overridden = True
 
+    if args.train_terminal_head is not None:
+        model_cfg.terminal_head_trainable = bool(args.train_terminal_head)
+    if model_cfg.terminal_head_trainable:
+        if not model_cfg.terminal_head or args.decoder_only or int(args.lora_rank) > 0:
+            raise SystemExit("Joint terminal training requires a terminal head and full actor training")
+        if not args.terminal_role_checkpoint or args.w_terminal_role <= 0:
+            raise SystemExit("Joint terminal training requires --terminal-role-checkpoint and positive --w-terminal-role")
+        model_cfg.terminal_hihat_library_fallback = False
     model = A.build_model(model_cfg, dev)
     if ck is not None:
         if overridden:
@@ -1918,7 +2299,7 @@ def main(argv=None) -> int:
         else:
             model.load_state_dict(ck["model"])
         print(f"[init] {args.resume or args.init} @ step {ck.get('step')}", flush=True)
-    if args.decoder_only:
+    if args.decoder_only and int(args.lora_rank) <= 0:
         for name, parameter in model.named_parameters():
             parameter.requires_grad_(name.startswith("decoder."))
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1928,9 +2309,29 @@ def main(argv=None) -> int:
             "(encoder and terminal initializer detached)",
             flush=True,
         )
+    if int(args.lora_rank) > 0:
+        from isaac_rl_ppo.actor import apply_lora
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        rank = int(args.lora_rank)
+        paths = apply_lora(
+            model.decoder, rank=rank, alpha=2.0 * rank,
+            targets=("o_proj", "w12", "w3"),
+        )
+        if not paths:
+            raise SystemExit("decoder LoRA targets matched no linear layers")
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(
+            f"[lora] decoder LoRA rank={rank} alpha={2 * rank} "
+            f"layers={len(paths)} trainable={trainable}",
+            flush=True,
+        )
     print(f"[model] {A.param_counts(model)}", flush=True)
 
     cfg = Phase2Config(
+        w_actor_retention=float(args.w_actor_retention),
+        actor_retention_checkpoint=args.actor_retention_checkpoint,
+        actor_retention_hihat_departures=args.actor_retention_hihat_departures,
         max_steps=int(args.steps), batch_size=int(args.batch), lr=float(args.lr),
         token_budget=(
             512 * 50 if args.token_budget is None else int(args.token_budget)
@@ -2001,6 +2402,7 @@ def main(argv=None) -> int:
             primary_base_tasks_per_512=int(
                 args.timing_primary_base_tasks_per_512
             ),
+            primary_mpc_enabled=bool(args.timing_primary_mpc),
             primary_anchor_per_task=int(
                 args.timing_primary_anchor_per_task
             ),
@@ -2056,7 +2458,12 @@ def main(argv=None) -> int:
         ),
         roller_regoal=not args.no_roller_regoal,
         cost=phase2_cost_config(
-            n_sub=int(args.n_sub),
+            **{key: value for key, value in physics_settings.items() if key != 'w_stick_stick'},
+            w_stick_stick=(physics_settings['w_stick_stick'] if args.w_stick_stick is None
+                           else float(args.w_stick_stick)),
+            contact_scoring_mode=args.contact_scoring_mode,
+            target_top_entry_depth_m=(None if args.target_top_entry_depth_mm is None
+                                     else float(args.target_top_entry_depth_mm)/1000),
             **({} if args.w_torque is None else {"w_torque": float(args.w_torque)}),
             **({} if args.w_velocity is None
                else {"w_velocity": float(args.w_velocity)}),
@@ -2082,8 +2489,6 @@ def main(argv=None) -> int:
                else {"w_collision_peak": float(args.w_collision_peak)}),
             **({} if args.w_joint_box_peak is None
                else {"w_joint_box_peak": float(args.w_joint_box_peak)}),
-            **({} if args.w_stick_stick is None
-               else {"w_stick_stick": float(args.w_stick_stick)}),
             **({} if args.w_tip_crossover is None
                else {"w_tip_crossover": float(args.w_tip_crossover)}),
             **({} if args.w_terminal_aim is None
@@ -2098,8 +2503,12 @@ def main(argv=None) -> int:
                else {"waist_pr_box": float(args.waist_pr_box)}),
             **({} if args.w_waist_upright is None
                else {"w_waist_upright": float(args.w_waist_upright)}),
+            **({} if args.w_tip_up is None
+               else {"w_tip_up": float(args.w_tip_up)}),
             **({} if args.w_arm_compact is None
                else {"w_arm_compact": float(args.w_arm_compact)}),
+            **({} if args.w_elbow_down is None
+               else {"w_elbow_down": float(args.w_elbow_down)}),
             **({} if args.arm_compact_mode is None
                else {"arm_compact_mode": str(args.arm_compact_mode)}),
             **({} if args.arm_compact_height_max is None
@@ -2183,6 +2592,15 @@ def main(argv=None) -> int:
         replay_frac_new=float(args.replay_frac_new),
         proficiency_viol_cap=float(args.proficiency_viol_cap),
         line_search=bool(args.line_search),
+        terminal_role_checkpoint=args.terminal_role_checkpoint,
+        terminal_role_w_com=args.terminal_role_w_com,
+        terminal_role_dynamic_al=bool(args.terminal_role_dynamic_al),
+        terminal_role_al_lam_max=args.terminal_role_al_lam_max,
+        w_terminal_role=float(args.w_terminal_role),
+        terminal_role_batch=int(args.terminal_role_batch),
+        terminal_head_grad_fraction_cap=float(args.terminal_head_grad_fraction_cap),
+        terminal_head_grad_cap_mode=str(args.terminal_head_grad_cap_mode),
+        line_search_cosine_before_activation=bool(args.line_search_cosine_before_activation),
         line_search_cfg=LineSearchConfig(
             **({} if args.line_search_mode is None
                else {"mode": str(args.line_search_mode)}),
@@ -2209,10 +2627,11 @@ def main(argv=None) -> int:
                else {"expansion_factor": float(args.line_search_expansion)}),
             **({} if args.line_search_warmup_updates is None
                else {"warmup_updates": int(args.line_search_warmup_updates)}),
-            **({"activate_after_updates":
-                int(args.line_search_activate_after_updates)}),
+            **({"activate_after_updates": line_search_activation_delay}),
             **({} if args.line_search_epsilon_seed is None
                else {"epsilon_seed": float(args.line_search_epsilon_seed)}),
+            **({} if args.line_search_legacy_resume_seed is None
+               else {"legacy_resume_seed": float(args.line_search_legacy_resume_seed)}),
             **({} if args.line_search_epsilon_min is None
                else {"epsilon_min": float(args.line_search_epsilon_min)}),
             **({} if args.line_search_epsilon_min_start is None
@@ -2231,21 +2650,28 @@ def main(argv=None) -> int:
             **({} if args.line_search_actual_diagnostic_every is None
                else {"actual_update_diagnostic_every":
                      int(args.line_search_actual_diagnostic_every)}),
-            **({} if not args.line_search_strict_actual_update
+            retry_retained_rate=bool(args.line_search_retry_retained_rate),
+            **({} if not line_search_strict_actual
                else {"strict_actual_update": True}),
-            **({} if not args.line_search_reject_current_probe_increase
+            **({} if not line_search_reject_probe_increase
                else {"reject_current_probe_increase": True}),
-            **({} if not args.line_search_skip_on_probe_exhaustion
+            **({} if not line_search_skip_on_exhaustion
                else {"skip_on_probe_exhaustion": True}),
         ),
         optimizer=str(args.optimizer),
         lbfgs_history=int(args.lbfgs_history),
         terminal_init_noise=bool(args.terminal_init_noise),
         terminal_init_noise_ramp_steps=int(args.terminal_init_noise_ramp_steps),
+        mpc_init_noise=bool(args.mpc_init_noise),
+        mpc_noise=mpc_noise,
+        timing_mpc_state_noise=state_noise,
+        terminal_init_all_rows=bool(args.terminal_init_all_rows),
+        init_noise=noise,
         short_wp=int(args.short_wp), short_boost=float(args.short_boost),
         rhythm_idle_frac=float(args.rhythm_idle_frac),
         post_hit_frac=float(args.post_hit_frac),
         far_fetched_frac=float(args.far_fetched_frac),
+        pair_frac=float(args.pair_frac),
         eval_like_mix_frac=float(args.eval_like_frac),
         cmd_lead_s=resolve_lead(args.cmd_lead),
         probe_every=int(args.probe_every),
@@ -2314,6 +2740,26 @@ def main(argv=None) -> int:
         cfg.suffix_warmup = int(args.suffix_warmup)
     if args.dls_terminal_frac is not None:
         cfg.dls_terminal_frac = float(args.dls_terminal_frac)
+    if args.dls_terminal_start_pairs is not None:
+        kit = A.DrumKit.from_layout()
+        pairs = []
+        for value in args.dls_terminal_start_pairs:
+            hand, drum = value.split(':', 1)
+            pairs.append((('left', 'right').index(hand), list(kit.names).index(drum)))
+        cfg.dls_terminal_start_pairs = tuple(pairs)
+    if args.dls_terminal_region_target is not None:
+        cfg.dls_terminal_region_target = args.dls_terminal_region_target
+    if args.dls_terminal_reject_worse is not None:
+        cfg.dls_terminal_reject_worse = args.dls_terminal_reject_worse
+    if args.dls_terminal_goal_pairs is not None:
+        names = A.DrumKit.from_layout().names
+        pairs = []
+        for value in args.dls_terminal_goal_pairs:
+            hand, drum = value.split(":", 1)
+            if hand not in ("left", "right") or drum not in names:
+                raise ValueError(f"invalid DLS goal pair: {value}")
+            pairs.append((("left", "right").index(hand), names.index(drum)))
+        cfg.dls_terminal_goal_pairs = tuple(pairs)
     if args.w_dls_terminal_cost is not None:
         cfg.w_dls_terminal_cost = float(args.w_dls_terminal_cost)
     if args.w_dls_terminal_tie is not None:
@@ -2639,7 +3085,7 @@ def main(argv=None) -> int:
               f"{[c.name for c in probe_clips]} "
               f"(lead {args.probe_lead*1000:.0f} ms, freeze {args.probe_freeze} wp, "
               f"bounce {'off' if args.no_probe_bounce else 'on'}, "
-              f"tight on_head)",
+              f"tight on_head; init={'fresh_line_every_tick' if args.terminal_init_all_rows else 'shifted_mpc'})",
               flush=True)
 
         def probe_fn(m, _clips=probe_clips, _sc=probe_scorer):  # noqa: F811
@@ -2656,10 +3102,12 @@ def main(argv=None) -> int:
                 saturate_effort=bool(args.plant_saturate_effort),
                 bounce=not bool(args.no_probe_bounce),
                 record_drift=False,
+                fresh_line_init=bool(args.terminal_init_all_rows),
                 waist_pr_ema=bool(args.waist_pr_ema),
                 waist_pr_ema_alpha=float(args.waist_pr_ema_alpha),
                 waist_pr_ema_leak=float(args.waist_pr_ema_leak),
             )
+            r["initialization"] = ("fresh_line_every_tick" if args.terminal_init_all_rows else "shifted_mpc")
             r.pop("_hits", None)
             return r
 
@@ -2764,6 +3212,7 @@ def main(argv=None) -> int:
         voxel_train_state=voxel_train_state,
         timing_critic_state=timing_critic_state,
         suffix_replay_state=suffix_replay_state,
+        terminal_role_state=(ck.get("extra") or {}).get("terminal_role") if args.resume else None,
     )
     summary["args"] = vars(args)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))

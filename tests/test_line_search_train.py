@@ -485,7 +485,7 @@ def test_on_selection_failure_then_should_not_advance():
 
 
 def test_train_phase2_gates_cosine_under_line_search():
-    """§11.10: selector owns LR; cosine ``lr_at`` only on the non-LS branch."""
+    """§11.10: active selector owns LR; delayed cosine has an explicit gate."""
     src = (
         Path(__file__).resolve().parents[1]
         / "amortized_opt"

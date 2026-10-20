@@ -65,6 +65,30 @@ def test_sample_and_forward_q_in_urdf_box():
     assert (q <= hi_t + 1e-4).all()
 
 
+def test_v4_terminal_pose_contact_geometry_backpropagates():
+    batch=TP.sample_terminal_batch(4,rng=np.random.default_rng(907),
+                                   device='cpu',dtype=torch.float32)
+    cost=TP.TerminalPoseCost(TP.TerminalPoseConfig(contact_scoring_mode='isaac_v4'),
+                             device='cpu')
+    q=batch.q_start.detach().clone().requires_grad_(True)
+    result=cost(q,batch)
+    assert torch.isfinite(result.total).all()
+    result.total.sum().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+
+
+def test_v5_terminal_pose_capsule_contact_geometry_backpropagates():
+    batch=TP.sample_terminal_batch(4,rng=np.random.default_rng(908),
+                                   device='cpu',dtype=torch.float32)
+    cost=TP.TerminalPoseCost(TP.TerminalPoseConfig(contact_scoring_mode='isaac_v5'),
+                             device='cpu')
+    q=batch.q_start.detach().clone().requires_grad_(True)
+    result=cost(q,batch)
+    assert torch.isfinite(result.total).all()
+    result.total.sum().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+
+
 def test_features_include_start_state_and_time_to_hit():
     rng = np.random.default_rng(1)
     batch = TP.sample_terminal_batch(3, rng=rng, device="cpu", dtype=torch.float32)
@@ -264,14 +288,14 @@ def test_al_hit_grows_collision_does_not():
     assert al.lam["collision"] <= lam0_col + 1e-12
 
 
-def test_no_right_hihat_or_left_floor_tom():
+def test_right_hihat_is_sampled_and_left_floor_tom_is_excluded():
     rng = np.random.default_rng(11)
     batch = TP.sample_terminal_batch(400, rng=rng, device="cpu", dtype=torch.float32, idle_frac=0.0)
     names = list(batch.drum_names)
     floor = names.index("floor_tom")
     hihat = names.index("hihat")
     assert not bool((batch.drum_index[:, 0] == floor).any())
-    assert not bool((batch.drum_index[:, 1] == hihat).any())
+    assert bool((batch.drum_index[:, 1] == hihat).any())
     assert bool(batch.active.all())
 
 

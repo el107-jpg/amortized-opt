@@ -53,6 +53,8 @@ def parse_args(argv=None):
     p.add_argument("--val-scenarios", type=int, default=40_000)
     p.add_argument("--workers", type=int, default=64)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument('--all-hand-drum-goals',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--synthetic-goal-frac',type=float,default=.5)
     p.add_argument("--horizon", type=int, default=100)
     p.add_argument("--buckets", type=int, nargs="+", default=[25, 50, 100])
     p.add_argument("--aux-weight", type=float, default=0.1)
@@ -143,6 +145,8 @@ def main(argv=None) -> int:
     scen = ScenarioConfig(
         horizon=int(args.horizon),
         buckets=tuple(args.buckets),
+        all_hand_drum_goals=bool(args.all_hand_drum_goals),
+        synthetic_goal_frac=float(args.synthetic_goal_frac),
         randomize_kit=not args.no_kit_randomization,
         idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
         idle_settle_wp=int(args.idle_settle_wp),
@@ -186,6 +190,10 @@ def main(argv=None) -> int:
             flush=True,
         )
     print(f"[data] {t_data:.1f} s", flush=True)
+    from amortized_opt.warmstart_data import phase1_goal_coverage
+    coverage = {name: phase1_goal_coverage(pool, scen) for name, pool in
+                (("train", train_pool), ("validation", val_pool))}
+    (run_dir / "data_coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
 
     # The IDLE context token is only worth its parameters when the pool carries
     # a payload for it: with no home table ``build_context_inputs`` leaves the

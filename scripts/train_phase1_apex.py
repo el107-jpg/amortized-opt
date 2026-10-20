@@ -59,9 +59,14 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=64)
     p.add_argument("--threads-per-worker", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument('--all-hand-drum-goals',action=argparse.BooleanOptionalAction,default=True,
+                   help='include every eligible hand/drum target using synthetic single-hand goal clips')
+    p.add_argument('--synthetic-goal-frac',type=float,default=.5)
     p.add_argument("--horizon", type=int, default=100)
     p.add_argument("--buckets", type=int, nargs="+", default=[25, 50, 100])
     p.add_argument("--aux-weight", type=float, default=0.1)
+    p.add_argument("--output-mode", choices=("direct", "residual"), default="direct",
+                   help="predict the full trajectory or a correction to the initializer")
     p.add_argument("--d-model", type=int, default=None, help="decoder width (default 384)")
     p.add_argument("--dec-layers", type=int, default=None, help="decoder depth (default 3)")
     p.add_argument("--d-ctx", type=int, default=None, help="context encoder width (default 256)")
@@ -167,8 +172,8 @@ def parse_args(argv=None):
     p.add_argument("--terminal-mode", default="nearest_apex",
                    choices=["nearest_apex", "nearest_yaw"])
     # init channel (Eric, 2026-08-10 update 1)
-    p.add_argument("--init-mode", default="straight",
-                   choices=["mix", "straight", "apex"],
+    p.add_argument("--init-mode", default="straight_clean",
+                   choices=["mix", "straight", "straight_clean", "apex"],
                    help="decoder input channel (default: terminal-head direct path; "
                         "mix/apex remain available as diagnostics)")
     p.add_argument("--init-mix", type=float, default=0.5,
@@ -226,12 +231,15 @@ def main(argv=None) -> int:
     root = Path(__file__).resolve().parent.parent
     run_dir = Path(args.out) if args.out else root / "runs" / "phase1_apex"
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2) + "\n")
     print(f"[run] {run_dir}", flush=True)
 
     scen = ScenarioConfig(
         waist_cfg=A.WaistAimConfig(future_tau=float(args.waist_aim_future_tau)),
         horizon=int(args.horizon),
         buckets=tuple(args.buckets),
+        all_hand_drum_goals=bool(args.all_hand_drum_goals),
+        synthetic_goal_frac=float(args.synthetic_goal_frac),
         randomize_kit=not args.no_kit_randomization,
         idle_home_path=None if args.no_idle_home else (args.idle_home or "default"),
         idle_settle_wp=int(args.idle_settle_wp),
@@ -257,6 +265,7 @@ def main(argv=None) -> int:
         max_horizon=int(args.horizon), num_drums=scen.num_drums,
         num_future=scen.num_future,
         terminal_head=True,
+        output_mode=args.output_mode,
         idle_home_token=(scen.idle_home_path is not None) and not args.no_idle_token,
         waist_sp_head=bool(args.waist_sp_head),
         waist_pr_sp_head=bool(args.waist_pr_sp_head),
@@ -283,6 +292,7 @@ def main(argv=None) -> int:
     model.load_terminal_head(terminal_ckpt, map_location=dev)
     print(f"[terminal] frozen head <- {terminal_ckpt}", flush=True)
     print(f"[model] {A.param_counts(model)}", flush=True)
+    print(f"[model] output_mode={model_cfg.output_mode}", flush=True)
     pool_initializer = model.terminal_initializer
     if torch.device(pool_dev) != dev:
         pool_initializer = copy.deepcopy(pool_initializer).to(pool_dev)
@@ -318,6 +328,12 @@ def main(argv=None) -> int:
     for name, pool in (("train", train_pool), ("val", val_pool)):
         print(_fmt_stats(name, pool), flush=True)
     print(f"[data] {t_data:.1f} s", flush=True)
+    from amortized_opt.warmstart_data import phase1_goal_coverage
+    coverage = {name: phase1_goal_coverage(pool, scen) for name, pool in
+                (("train", train_pool), ("validation", val_pool))}
+    (run_dir / "data_coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
+    print(f"[data] coverage audited: {coverage['train']['expected_targets']} eligible targets "
+          "in train and validation; see data_coverage.json", flush=True)
 
     cfg = TrainConfig(
         max_steps=int(args.steps),
@@ -373,9 +389,9 @@ def main(argv=None) -> int:
     if best.exists():
         A.load_checkpoint(best, model=model, map_location=dev)
     amp = None if args.no_amp else torch.bfloat16
-    # "straight_init" is the trained regime (matches deployment); the other two
-    # are robustness probes.
+    # Report the trained clean-line regime alongside robustness probes.
     for tag, kw in (
+        ("straight_clean_init", {"init_mode": "straight_clean"}),
         ("mix_init", {"init_mode": "mix"}),
         ("straight_init", {"init_mode": "straight"}),
         ("apex_init", {"init_mode": "apex"}),

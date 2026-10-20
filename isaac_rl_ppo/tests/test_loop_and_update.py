@@ -176,6 +176,75 @@ def test_lead_is_not_applied_twice(driver):
     assert torch.equal(cmd_deployed, cmd_ppo)
 
 
+def test_mean_correction_changes_collected_command_and_replays(
+        driver, run_cfg, kit_and_clips):
+    """The corrected waypoint drives execution and remains replay-exact."""
+    drv, q, qd, cost = driver
+    actor, mpc, sched = drv.actor, drv.mpc, drv.sched
+    assert actor.mean_correction is not None
+    kit, clips = kit_and_clips
+    env_ids = torch.arange(q.shape[0])
+    selected_clips = [clips[i % len(clips)] for i in range(q.shape[0])]
+
+    # Pair the rollouts with the same initial state, schedule, and sample noise.
+    # The small sample keeps the command away from bounds for some joints.
+    sched.reset(env_ids, selected_clips, [kit] * q.shape[0],
+                rng=np.random.default_rng(0))
+    mpc.reset(env_ids, q)
+    with torch.no_grad():
+        actor.std.fill_(2.0e-2)
+        actor.mean_correction.weight.zero_()
+        actor.mean_correction.bias.zero_()
+    base_storage = PpoStorage(device="cpu", horizon=actor.H, n_dof=17)
+    actor._ar1_eps = None
+    torch.manual_seed(73)
+    drv.tick(q.clone(), qd.clone(), base_storage)
+    base_cmd = mpc.prev_cmd.clone()
+
+    sched.reset(env_ids, selected_clips, [kit] * q.shape[0],
+                rng=np.random.default_rng(0))
+    mpc.reset(env_ids, q)
+    prev_cmd = mpc.prev_cmd.clone()
+    with torch.no_grad():
+        actor.mean_correction.bias.fill_(0.2)
+    corrected_storage = PpoStorage(device="cpu", horizon=actor.H, n_dof=17)
+    actor._ar1_eps = None
+    torch.manual_seed(73)
+    drv.tick(q.clone(), qd.clone(), corrected_storage)
+    corrected_cmd = mpc.prev_cmd.clone()
+    correction = run_cfg.actor.mean_correction_scale * 0.2
+    base_residual = base_storage.actions[0] - base_storage.mu[0]
+    corrected_residual = corrected_storage.actions[0] - corrected_storage.mu[0]
+    assert torch.allclose(corrected_residual, base_residual, atol=1.0e-7, rtol=0.0)
+    assert torch.allclose(
+        corrected_storage.mu[0] - base_storage.mu[0],
+        torch.full_like(base_storage.mu[0], correction), atol=1.0e-6, rtol=0.0)
+    command_delta = corrected_cmd - base_cmd
+    assert bool(torch.isclose(
+        command_delta, torch.full_like(command_delta, correction),
+        atol=1.0e-4, rtol=1.0e-3).any()), \
+        "no unclipped joint received the expected mean correction"
+    assert torch.all(corrected_cmd >= mpc.q_lo - 1.0e-6)
+    assert torch.all(corrected_cmd <= mpc.q_hi + 1.0e-6)
+    if mpc.step_max is not None:
+        assert torch.all((corrected_cmd - prev_cmd).abs()
+                         <= mpc.step_max + 1.0e-5)
+
+    # A fresh replay must reproduce the collected corrected mean and action
+    # density, so the first minibatch sees only the KL stabilizer's small floor.
+    corrected_storage.returns = torch.zeros(1, q.shape[0])
+    corrected_storage.advantages = torch.zeros(1, q.shape[0])
+    corrected_storage.finalize()
+    updater = PpoUpdater(actor, run_cfg, device="cpu", cost=cost)
+    updater._begin_balanced_head_grads()
+    flat = corrected_storage.flat
+    stats = updater._chunk_loss(
+        flat, torch.arange(flat["actions"].shape[0]), flat["advantages"])
+    updater._finish_balanced_head_grads()
+    assert float(stats["kl"]) < 3.0e-4
+    assert float(stats["ratio_dev"]) < 1.0e-5
+
+
 # ==================================================== storage / GAE / update ==
 def test_stack_and_index_dataclass_roundtrip(scheduled):
     sched, _kit, B = scheduled

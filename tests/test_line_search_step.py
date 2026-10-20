@@ -24,7 +24,7 @@ from amortized_opt.objective_replay import (
     snapshot_torch_generator,
     restore_mutable_batch_fields,
 )
-from amortized_opt.train_cost import Phase2Config
+from amortized_opt.train_cost import Phase2Config, _line_search_scheduled_rate
 
 
 class _Tiny(nn.Module):
@@ -180,6 +180,81 @@ def test_delayed_activation_follows_cosine_floor_then_searches():
     assert "never_searched" in reasons
 
 
+def test_delayed_cosine_matches_native_adamw_and_hands_rate_to_search():
+    model = _ScalarObjective()
+    native = copy.deepcopy(model)
+    cfg = Phase2Config(line_search=True, line_search_cosine_before_activation=True,
+                       lr=1e-4, lr_horizon=10000, warmup_steps=300)
+    cfg.line_search_cfg = LineSearchConfig(
+        activate_after_updates=10000, epsilon_min=1e-10,
+        strict_actual_update=True, warmup_updates=0,
+        search_on_early_triggers=False,
+    )
+    opt = build_adamw_like_train_cost(model.named_parameters(), lr=cfg.lr)
+    native_opt = build_adamw_like_train_cost(native.named_parameters(), lr=cfg.lr)
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
+    rates = []
+    for step in (0, 299, 5000, 9999):
+        rt.ctrl.successful_update_count = step
+        known, reasons, update = resolve_known_search(rt)
+        rate = _line_search_scheduled_rate(cfg, step, rt, update)
+        assert not known
+        rates.append(rate)
+        opt.zero_grad(set_to_none=True)
+        loss = model.objective()
+        loss.backward()
+        result = run_search_or_ordinary(
+            rt, j=update, run_search=known, search_reasons=reasons,
+            F0=float(loss.detach()), g_preclip=None,
+            probe_F=lambda: (_ for _ in ()).throw(AssertionError("probe before activation")),
+            pre_activation_epsilon=rate,
+        )
+        native_opt.zero_grad(set_to_none=True)
+        native.objective().backward()
+        for group in native_opt.param_groups:
+            group["lr"] = rate
+        native_opt.step()
+        assert result.executed and result.epsilon == rate
+        torch.testing.assert_close(model.w, native.w, rtol=0, atol=0)
+    assert rates[0] == pytest.approx(1e-4 / 300)
+    assert rates[1] == 1e-4
+    assert rates[3] == pytest.approx(5e-6, abs=1e-10)
+    known, reasons, update = resolve_known_search(rt)
+    assert known and update == 10001
+    # Changing the absolute cosine clock cannot overwrite the inherited rate
+    # once the selector becomes active.
+    cfg.lr_at = lambda step: (_ for _ in ()).throw(AssertionError("cosine after handoff"))
+    assert _line_search_scheduled_rate(cfg, 999999, rt, update) == rates[-1]
+    opt.zero_grad(set_to_none=True)
+    loss = model.objective()
+    loss.backward()
+    result = run_search_or_ordinary(
+        rt, j=update, run_search=known, search_reasons=reasons,
+        F0=float(loss.detach()), g_preclip=snapshot_g_preclip(list(model.parameters())),
+        probe_F=lambda: float(model.objective().detach()),
+        pre_activation_epsilon=0.5,  # ignored after activation
+    )
+    assert result.executed and result.searched
+    assert result.log["ls_epsilon_seed"] == rates[-1]
+    assert result.epsilon < 0.5
+
+
+def test_resume_uses_absolute_cosine_step_until_remaining_activation_delay():
+    model = _ScalarObjective()
+    cfg = Phase2Config(line_search=True, line_search_cosine_before_activation=True,
+                       lr=1e-4, lr_horizon=10000, warmup_steps=300)
+    cfg.line_search_cfg = LineSearchConfig(activate_after_updates=8800)
+    opt = build_adamw_like_train_cost(model.named_parameters(), lr=cfg.lr)
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
+    _, _, update = resolve_known_search(rt)
+    assert _line_search_scheduled_rate(cfg, 1200, rt, update) == cfg.lr_at(1200)
+    assert _line_search_scheduled_rate(cfg, 1200, rt, update) != cfg.lr_at(0)
+    rt.ctrl.successful_update_count = 8800
+    rt.ctrl.last_selected_epsilon = 5e-6
+    _, _, update = resolve_known_search(rt)
+    assert _line_search_scheduled_rate(cfg, 10000, rt, update) == 5e-6
+
+
 def test_fast_ordinary_update_is_bit_exact_native_adamw():
     torch.manual_seed(91)
     fast = _Tiny()
@@ -261,6 +336,19 @@ def test_phase2_cli_exposes_line_search_safety_policies():
     assert args.log_every == 3
 
 
+def test_phase2_cli_can_explicitly_disable_fresh_resume_safety_defaults():
+    from scripts.train_phase2 import parse_args
+
+    args = parse_args([
+        "--no-line-search-strict-actual-update",
+        "--no-line-search-reject-current-probe-increase",
+        "--no-line-search-skip-on-probe-exhaustion",
+    ])
+    assert args.line_search_strict_actual_update is False
+    assert args.line_search_reject_current_probe_increase is False
+    assert args.line_search_skip_on_probe_exhaustion is False
+
+
 def test_ordinary_then_search_commit_once():
     torch.manual_seed(0)
     m = _Tiny()
@@ -333,6 +421,26 @@ def test_selection_failure_skips_side_effects_flag():
     assert not res.executed
     assert not res.commit_side_effects
     assert rt.ctrl.pending_search
+
+
+def test_stochastic_failure_can_retry_retained_rate():
+    model = _ScalarObjective()
+    cfg = Phase2Config(line_search=True, lr=0.01, grad_balance="")
+    cfg.line_search_cfg = LineSearchConfig(
+        epsilon_seed=0.01, epsilon_min=1e-10,
+        retry_retained_rate=True,
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=0.01)
+    rt = init_line_search_runtime(phase2_cfg=cfg, optimizer=opt)
+    opt.zero_grad(set_to_none=True)
+    model.w.grad = torch.zeros_like(model.w)
+    result = run_search_or_ordinary(
+        rt, j=1, run_search=True, search_reasons=["never_searched"],
+        F0=0.5, g_preclip=snapshot_g_preclip(rt.adapter._params),
+        probe_F=lambda: 0.5,
+    )
+    assert not result.executed
+    assert rt.ctrl.retry_seed == pytest.approx(0.01)
 
 
 def test_actual_diagnostic_replays_exec_before_commit_without_rng_leak():
@@ -520,3 +628,19 @@ def test_strike_snapshot_roundtrip():
     restore_mutable_batch_fields(batch, snap)
     assert not torch.equal(batch["init"], torch.zeros_like(batch["init"]))
     assert torch.allclose(batch["strike"].a, snap["strike"].a)
+
+
+def test_explicit_minimum_probe_rate_is_honored_on_selector_resume():
+    from amortized_opt.line_search_step import runtime_state_dict
+
+    m = _Tiny()
+    cfg = Phase2Config(line_search=True, lr=1e-4, grad_balance="")
+    cfg.line_search_cfg = LineSearchConfig(epsilon_seed=1e-4)
+    opt = build_adamw_like_train_cost(m.named_parameters(), lr=cfg.lr)
+    saved = runtime_state_dict(init_line_search_runtime(phase2_cfg=cfg, optimizer=opt))
+    cfg.line_search_cfg = LineSearchConfig(epsilon_seed=1e-4, epsilon_min=1e-7)
+    restored = init_line_search_runtime(
+        phase2_cfg=cfg, optimizer=opt, line_search_state=saved, opt_restored=True,
+    )
+    assert restored.epsilon_min == pytest.approx(1e-7)
+    assert restored.cfg.epsilon_min == pytest.approx(1e-7)

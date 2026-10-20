@@ -12,7 +12,9 @@ update the hit/collision dual.
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -21,7 +23,8 @@ import numpy as np
 import torch
 from torch.optim import AdamW
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT=Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from amortized_opt.line_search import (  # noqa: E402
     LineSearchConfig,
@@ -81,6 +84,8 @@ class TrainConfig:
     w_start: float = 10.0
     w_motion: float = 0.02
     collision_topk: int = 1
+    contact_scoring_mode: str = 'auto'
+    physics_loss_version: str = 'auto'
     start_bank_size: int = 4096
     optnet: bool = False
     n_constraints: int = 4
@@ -91,6 +96,7 @@ class TrainConfig:
     line_search_interval: int | None = None
     resume: str | None = None
     out: str = "runs/terminal_pose/last.pt"
+    tensorboard: bool = True
 
 
 def parse_args(argv=None) -> TrainConfig:
@@ -122,6 +128,9 @@ def parse_args(argv=None) -> TrainConfig:
     p.add_argument("--w-start", type=float, default=10.0)
     p.add_argument("--w-motion", type=float, default=0.02)
     p.add_argument("--collision-topk", type=int, default=1)
+    p.add_argument('--physics-loss-version', choices=('auto','legacy','geometry_v2'), default='auto')
+    p.add_argument('--contact-scoring-mode',choices=('auto','legacy','isaac_v4','isaac_v5'),default='auto',
+                   help='fresh terminal-pose training uses v4 geometry; auto preserves archived resumes')
     p.add_argument(
         "--start-bank-size", type=int, default=4096,
         help="precomputed StartSampler states; 0 uses the cheap fallback sampler",
@@ -173,6 +182,7 @@ def parse_args(argv=None) -> TrainConfig:
         help="checkpoint to load (weights and augmented-Lagrangian state)",
     )
     p.add_argument("--out", default="runs/terminal_pose/last.pt")
+    p.add_argument('--tensorboard',action=argparse.BooleanOptionalAction,default=True)
     ns = p.parse_args(argv)
     return TrainConfig(
         steps=int(ns.steps),
@@ -189,6 +199,8 @@ def parse_args(argv=None) -> TrainConfig:
         w_start=float(ns.w_start),
         w_motion=float(ns.w_motion),
         collision_topk=int(ns.collision_topk),
+        contact_scoring_mode=ns.contact_scoring_mode,
+        physics_loss_version=ns.physics_loss_version,
         start_bank_size=int(ns.start_bank_size),
         optnet=bool(ns.optnet or ns.centered_qp or ns.mix_width is not None or ns.qp_out),
         n_constraints=int(ns.n_constraints),
@@ -201,6 +213,7 @@ def parse_args(argv=None) -> TrainConfig:
         ),
         resume=None if ns.resume is None else str(ns.resume),
         out=str(ns.out),
+        tensorboard=bool(ns.tensorboard),
     )
 
 
@@ -409,17 +422,43 @@ def cosine_lr(step: int, steps: int, lr_start: float, lr_end: float) -> float:
     )
 
 
+def resolve_terminal_contact_mode(requested: str, resume_checkpoint: dict | None) -> str:
+    if requested!='auto':return requested
+    if resume_checkpoint is None:return 'isaac_v5'
+    return (resume_checkpoint.get('config') or {}).get('contact_scoring_mode','legacy')
+
+
 def train_terminal_pose(cfg: TrainConfig) -> dict:
     """Run the differentiable terminal-pose loop; return the saved checkpoint dict."""
     device = torch.device(cfg.device)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
+    resume_ckpt=(torch.load(cfg.resume,map_location=device,weights_only=False)
+                 if cfg.resume else None)
+    previous_mode=((resume_ckpt.get('config') or {}).get('contact_scoring_mode','legacy')
+                   if resume_ckpt is not None else None)
+    cfg.contact_scoring_mode=resolve_terminal_contact_mode(cfg.contact_scoring_mode,
+                                                             resume_ckpt)
+    changed_contact_mode=(previous_mode is not None
+                          and previous_mode!=cfg.contact_scoring_mode)
+    if changed_contact_mode:
+        raise ValueError('Changing terminal-pose contact geometry requires a fresh '
+                         'training run; --resume preserves its optimizer/AL objective')
+
+    previous_physics=((resume_ckpt.get('config') or {}).get('physics_loss_version','legacy')
+                      if resume_ckpt is not None else None)
+    if cfg.physics_loss_version == 'auto':
+        cfg.physics_loss_version=previous_physics if resume_ckpt is not None else 'geometry_v2'
+    if resume_ckpt is not None and cfg.physics_loss_version != previous_physics:
+        raise ValueError('Changing terminal-pose physics loss requires a fresh run')
 
     pose_cfg = TerminalPoseConfig(
         w_start=float(cfg.w_start),
         w_motion=float(cfg.w_motion),
         collision_topk=int(cfg.collision_topk),
+        contact_scoring_mode=cfg.contact_scoring_mode,
+        physics_loss_version=cfg.physics_loss_version,
     )
     # Net takes in_dim / width, not TerminalPoseConfig (cost weights live on the latter).
     net = TerminalPoseNet(
@@ -433,13 +472,19 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
     ).to(device)
     cost = TerminalPoseCost(pose_cfg, device=device, dtype=torch.float32)
     start_bank = _build_start_bank(cfg, device)
+    from amortized_opt.tensorboard_log import MetricsTensorboard
+    run_dir=Path(cfg.out).resolve().parent;run_dir.mkdir(parents=True,exist_ok=True)
+    tb=MetricsTensorboard(run_dir/'tb',enabled=cfg.tensorboard)
+    if cfg.tensorboard and os.environ.get("TB_AUTO_REGISTER", "1") != "0":
+        registry=ROOT/'runs/tensorboard_active';registry.mkdir(parents=True,exist_ok=True)
+        alias=registry/('terminal_pose_'+run_dir.name)
+        if not alias.exists() and not alias.is_symlink():alias.symlink_to((run_dir/'tb').resolve())
+    goal_counts=np.zeros((2,7),dtype=int)
     al = TerminalPoseAL()
     start_step = 0
-    resume_ckpt = None
     if cfg.resume:
-        resume_ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
         net.load_state_dict(resume_ckpt["model"])
-        if "al" in resume_ckpt:
+        if "al" in resume_ckpt and not changed_contact_mode:
             al.load_state_dict(resume_ckpt["al"])
         if "rng_state" in resume_ckpt:
             rng.bit_generator.state = resume_ckpt["rng_state"]
@@ -453,7 +498,8 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
         f"params={net.n_parameters()} "
         f"pen_hit={al.pen['hit']:.4g} pen_collision={al.pen['collision']:.4g} "
         f"pen_max_hit={al.pen_max['hit']:.4g} pen_max_collision={al.pen_max['collision']:.4g} "
-        f"resume_step={start_step}",
+        f"resume_step={start_step} contact_scoring_mode={cfg.contact_scoring_mode} "
+        f"contact_al_reset={changed_contact_mode}",
         flush=True,
     )
     ls_rt = None
@@ -508,6 +554,8 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
             for group in opt.param_groups:
                 group["lr"] = lr
         batch = _sample_batch(int(cfg.batch), rng, device, start_bank)
+        drum=batch.drum_index.detach().cpu().numpy();active=batch.active.detach().cpu().numpy().astype(bool)
+        for h in (0,1):np.add.at(goal_counts[h],drum[:,h][active[:,h]],1)
         q = net(batch.features)
         out = cost(q, batch, al.cost_weights())
         loss = out.total.mean()
@@ -528,6 +576,17 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
         if step % max(int(cfg.log_every), 1) == 0 or step == 1 or step == cfg.steps:
             v_hit = float(out.violations["hit"].detach().mean().item())
             v_col = float(out.violations["collision"].detach().mean().item())
+            tb.log_record(dict(event='train',step=global_step,loss=last_loss,
+                terminal_violation=v_hit,collision_violation=v_col))
+            from amortized_opt.rhythm import DrumKit
+            kit = DrumKit.from_layout()
+            coverage = dict(step=global_step, active_goal_counts={
+                hand: dict(zip(kit.names, goal_counts[h].tolist()))
+                for h, hand in enumerate(("left", "right"))})
+            coverage["missing_targets"] = [f"{hand}:{kit.names[d]}"
+                for h, hand in enumerate(("left", "right"))
+                for d in kit.eligible(hand) if goal_counts[h, d] == 0]
+            (run_dir / "data_coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
             parts = [
                 f"step={global_step}",
                 f"loss={last_loss:.4g}",
@@ -553,6 +612,7 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
             ev = heldout_metrics(net, cost, device, start_bank=start_bank)
             ev["step"] = global_step
             eval_history.append(dict(ev))
+            tb.log_record(dict(event='eval',**ev))
             print("[eval] " + " ".join(f"{k}={v:.4g}" for k, v in ev.items()), flush=True)
 
     shares = grad_shares(net, cost, al, device, start_bank=start_bank)
@@ -582,6 +642,8 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
         "loss_spec": LOSS_SPEC,
         "grad_shares": shares,
         "eval_history": eval_history,
+        "hand_drum_training_counts":goal_counts.tolist(),
+        "all_hand_drum_goals":bool((goal_counts[0,:6]>0).all() and (goal_counts[1]>0).all()),
         "optimizer": opt.state_dict(),
         "rng_state": rng.bit_generator.state,
         "train_config": _config_dict(cfg),
@@ -589,6 +651,7 @@ def train_terminal_pose(cfg: TrainConfig) -> dict:
         **_al_checkpoint(al),
     }
     torch.save(ckpt, out_path)
+    tb.close()
     print(f"[ckpt] {out_path}  params={net.n_parameters()}  loss={last_loss:.4g}", flush=True)
     return ckpt
 

@@ -197,7 +197,8 @@ def mpc_model_planner(model, *, num_drums, num_future, device, amp_dtype=None,
                       full_cost_steps: int = 0,
                       full_cost_lr: float = 1.0e-3,
                       full_cost_grad_clip: float = 1.0e4,
-                      full_cost_from_init: bool = False):
+                      full_cost_from_init: bool = False,
+                      fresh_line_init: bool = False):
     """The decoder wired into ``MPCGenerator``'s planner protocol.
 
     Returns ``(plan_fn, state)``; ``state["drift"]`` accumulates the
@@ -297,12 +298,16 @@ def mpc_model_planner(model, *, num_drums, num_future, device, amp_dtype=None,
             pending = last is None or any(
                 h >= 1 and (last[i] < 1 or h > last[i]) for i, h in enumerate(hits)
             )
-            if pending:
+            if pending and not fresh_line_init:
                 init = correct_quintic_init_arms(
                     _fk(init.device, init.dtype), init, st[:, :n], hit, aims,
                     steps=1, joint_names=G1_UPPER_BODY_JOINTS,
                     qd0=st[:, n:], dt=float(req.dt),
                 )
+            if fresh_line_init:
+                if getattr(core, "terminal_initializer", None) is None:
+                    raise ValueError("fresh-line probes require a terminal pose head")
+                init = core.initial_trajectory(ctx, st, masks).to(init.dtype)
             if clamp_init_to_box:
                 init = init.clamp(q_lo_t.to(device=init.device, dtype=init.dtype),
                                   q_hi_t.to(device=init.device, dtype=init.dtype))
@@ -760,6 +765,8 @@ def closed_loop_probe(
     full_cost_lr: float = 1.0e-3,
     full_cost_grad_clip: float = 1.0e4,
     full_cost_from_init: bool = False,
+    fresh_line_init: bool = False,
+    record_rollout: bool = False,
 ) -> dict:
     """Run ``len(clips)`` closed-loop episodes and score every executed strike.
 
@@ -772,6 +779,10 @@ def closed_loop_probe(
     contact impulse (:func:`~amortized_opt.train_cost.apply_bounce`) before the
     next-hit quintic is seeded, matching the training roller's post-hit carry.
     Pass ``False`` to restore the historical through-the-head plant.
+
+    ``record_rollout`` adds ``_rollouts`` with full plant histories, network
+    plans, and plans after controller freeze/lead processing for visualization.
+    It is opt-in because these arrays are unsuitable for training metric logs.
     """
     was_training = getattr(model, "training", False)
     core = model.module if hasattr(model, "module") else model
@@ -795,6 +806,7 @@ def closed_loop_probe(
     lead_ticks = int(round(float(lead_s) / CONTROL_DT))
 
     all_hits, all_lat, episodes, waist_traces = [], [], [], []
+    rollouts = []
     t_all = time.perf_counter()
     for ep, clip in enumerate(clips):
         gen = MPCGenerator(
@@ -818,7 +830,8 @@ def closed_loop_probe(
                 perfect_tracking=bool(perfect_tracking),
             ),
         )
-        record: list = [] if record_drift else None
+        record: list = [] if record_drift or record_rollout else None
+        committed_plans = [] if record_rollout else None
         plan, st = mpc_model_planner(
             model, num_drums=num_drums, num_future=num_future, device=device,
             amp_dtype=amp_dtype, iterations=iterations, record=record,
@@ -833,12 +846,17 @@ def closed_loop_probe(
             full_cost_lr=float(full_cost_lr),
             full_cost_grad_clip=float(full_cost_grad_clip),
             full_cost_from_init=bool(full_cost_from_init),
+            fresh_line_init=bool(fresh_line_init),
         )
         t0 = time.perf_counter()
         res = gen.run_episode(
             clip, starts.q[ep].cpu().numpy(), starts.qd[ep].cpu().numpy(),
             seed=1000 + ep, planner=plan, max_steps=int(steps),
+            **({"plan_trace": committed_plans} if record_rollout else {}),
         )
+        if record_rollout:
+            rollouts.append({"result": res, "plans": record,
+                             "committed_plans": committed_plans})
         wall = time.perf_counter() - t0
         hits = score_hits(
             scorer, kit, res, record, lead_ticks=lead_ticks,
@@ -964,4 +982,6 @@ def closed_loop_probe(
     if record_waist_trace:
         out["waist_trace"] = waist_traces
     out["_hits"] = all_hits
+    if record_rollout:
+        out["_rollouts"] = rollouts
     return out

@@ -676,6 +676,7 @@ class MPCGenerator:
         planner: PlannerFn | None = None,
         max_steps: int | None = None,
         t_start: float = 0.0,
+        plan_trace: list | None = None,
     ) -> EpisodeResult:
         """One simulated-MPC rollout over ``clip`` starting from ``(q0, qd0)``."""
         if rng is None:
@@ -918,6 +919,19 @@ class MPCGenerator:
             if cmd is not traj[0]:
                 traj = traj.copy()
                 traj[0] = cmd
+            if plan_trace is not None:
+                # Opt-in diagnostics: the plan after freeze/lead processing,
+                # before advancing the plant. Keep its true measured boundary.
+                plan_trace.append({
+                    "step": int(step), "time_s": float(t_now),
+                    "q0": q.copy(), "v0": qd.copy(), "traj": traj.copy(),
+                    "elem_mask": masks.elem_mask[0].cpu().numpy().copy(),
+                    "hit": dict(hit_index),
+                    "target_drum": {
+                        h: int(snap.goal[h].drum) if snap.goal[h].active else -1
+                        for h in HANDS
+                    },
+                })
             gs = None
             if imp is not None:
                 # Pre-decrement ``hit_index``: an active hand has kh >= 1 and

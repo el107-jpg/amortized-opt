@@ -103,6 +103,22 @@ def test_dls_lookahead_has_a_finite_straight_through_actor_gradient():
     assert float(traj.grad.abs().sum()) > 0.0
 
 
+def test_targeted_dls_lookahead_skips_other_goals_and_keeps_selected_gradients():
+    cost, traj0, strike = _fixture()
+    strike.target_drum[1, 0] = 1
+    traj = traj0.clone().requires_grad_(True)
+    cfg = Phase2Config(compile_model=False, compile_cost=False,
+        dls_terminal_frac=1., dls_terminal_goal_pairs=((0, 1),),
+        dls_terminal_steps=2, dls_terminal_window=5)
+    corrected_cost, tie, _, stats = dls_terminal_lookahead_loss(
+        traj, traj0[:, 0], torch.zeros_like(traj0[:, 0]), strike,
+        group_lengths(strike.hit_index), {}, cost, cfg)
+    (corrected_cost+10*tie).backward()
+    assert stats['dls_terminal_rows'].item() == 1
+    assert torch.equal(traj.grad[0], torch.zeros_like(traj.grad[0]))
+    assert torch.isfinite(traj.grad[1]).all() and traj.grad[1].abs().sum() > 0
+
+
 def test_analytic_spline_smoothness_hessian_matches_autograd():
     cost, traj, strike = _fixture()
     q0 = traj[:, 0]
@@ -132,6 +148,38 @@ def test_analytic_spline_smoothness_hessian_matches_autograd():
         expected = h[horizon] @ direction[row, :, 3] / counts[row]
         torch.testing.assert_close(g1[row, :, 3] - g0[row, :, 3], expected,
                                    rtol=3e-3, atol=2e-3)
+
+
+def test_region_teacher_keeps_an_already_legal_contact_in_place():
+    cost, traj, strike = _fixture()
+    strike.target_top_entry_depth_m = .07
+    local = _dls_contact_local(cost, strike, 0)
+    point = _dls_contact_position(cost.fk, traj[:, -1], 'left', local)
+    strike.p_star[:, 0] = point + torch.tensor([.02, 0., .03])
+    teacher, _, stats = dls_terminal_teacher(traj, strike, cost, steps=4,
+                                            region_target=True)
+    torch.testing.assert_close(teacher, traj, atol=1e-6, rtol=0)
+    assert stats['dls_terminal_delta_abs_rad'] < 1e-6
+
+
+def test_full_cost_gate_rejects_bad_teacher_and_departure_filter_selects_rows(monkeypatch):
+    import amortized_opt.train_cost as module
+    cost, traj0, strike = _fixture()
+    strike.start_drum[:] = -1
+    strike.start_drum[1, 0] = 1
+    def bad_teacher(traj, *_args, **_kwargs):
+        return traj.detach()+3., torch.ones_like(traj), {}
+    monkeypatch.setattr(module, 'dls_terminal_teacher', bad_teacher)
+    traj=traj0.clone().requires_grad_(True)
+    cfg=Phase2Config(compile_model=False, compile_cost=False, dls_terminal_frac=1.,
+        dls_terminal_start_pairs=((0,1),), dls_terminal_reject_worse=True)
+    look, tie, _, stats=dls_terminal_lookahead_loss(traj, traj0[:,0],
+        torch.zeros_like(traj0[:,0]), strike, group_lengths(strike.hit_index), {}, cost, cfg)
+    assert stats['dls_terminal_teacher_accept_frac'] == 0
+    assert tie == 0
+    look.backward()
+    assert not traj.grad[0].any()
+    assert torch.isfinite(traj.grad[1]).all() and traj.grad[1].abs().sum()>0
 
 
 def test_curvature_teacher_never_admits_a_higher_full_cost_and_backprops():

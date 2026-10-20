@@ -74,6 +74,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
+from .gaussian_bridge import GaussianBridgeNoise, sample_bridge
 from functools import lru_cache
 from pathlib import Path
 
@@ -159,26 +160,45 @@ from .rhythm_chain_data import (  # noqa: E402
 def pair_combinations(kit) -> tuple[list[tuple[int, int]], list[int]]:
     """``(distinct_pairs, same_drum)`` the PAIR family enumerates, as indices.
 
-    ``distinct_pairs`` is ``(left_drum, right_drum)`` already ORDERED by lateral
-    position -- left hand takes the greater ``+y`` -- so the no-crossover rule
-    is satisfied by construction rather than by filtering.  ``same_drum`` lists
-    the drums BOTH hands can reach.
-
-    Both lists are checked against :meth:`DrumKit.eligible`, so a layout whose
-    geometry disagrees with the eligibility rule yields fewer combinations
-    rather than rows that get silently rejected downstream.
+    Include crossed assignments such as left/snare + right/hi-hat. Eligibility,
+    rather than lateral drum order, determines which hand/drum pairs are legal.
     """
-    y = [float(p[1]) for p in kit.positions]
     left_ok, right_ok = set(kit.eligible("left")), set(kit.eligible("right"))
     distinct: list[tuple[int, int]] = []
     for a in range(kit.num_drums):
         for b in range(kit.num_drums):
-            if a == b or y[a] <= y[b]:
-                continue                      # a is the LEFT (greater +y) one
-            if a in left_ok and b in right_ok:
+            if a != b and a in left_ok and b in right_ok:
                 distinct.append((a, b))
     same = [d for d in range(kit.num_drums) if d in left_ok and d in right_ok]
     return distinct, same
+
+
+def add_empty_schedule_provenance(
+    buckets: dict[int, dict[str, np.ndarray]], *, schedule_slots: int = 2,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Give synthetic one-goal rows the rhythm pool's schedule schema.
+
+    Their current goals live in ``goal_*``; they have no later clip hits to
+    promote, so every schedule slot is invalid and clip provenance is -1.
+    This keeps all columns aligned when the rows are merged with RCC rows.
+    """
+    for fields in buckets.values():
+        if "sched_valid" in fields:
+            continue
+        n = len(fields["q0"])
+        if np.asarray(fields["future_valid"]).any():
+            raise ValueError("empty-schedule provenance requires no future goals")
+        fields.update(
+            sched_drum=np.full((n, 2, schedule_slots), -1, dtype=np.int64),
+            sched_pos=np.zeros((n, 2, schedule_slots, 3), dtype=np.float32),
+            sched_vel=np.zeros((n, 2, schedule_slots, 3), dtype=np.float32),
+            sched_dt=np.zeros((n, 2, schedule_slots), dtype=np.float32),
+            sched_valid=np.zeros((n, 2, schedule_slots), dtype=np.bool_),
+            clip_i=np.full(n, -1, dtype=np.int64),
+            hand_hit_time=np.where(fields["goal_valid"], fields["goal_tth"],
+                                   0).astype(np.float32),
+        )
+    return buckets
 
 _LONG_FIELDS = frozenset({"goal_drum", "future_drum"})
 _BOOL_FIELDS = frozenset(
@@ -233,6 +253,11 @@ class Phase2ScenarioConfig:
     lead_s: float = 1.0
     tip_speed_max: float = 4.0
     synth_transition_frac: float = 0.25
+    #: Cover every eligible hand/drum target in far rows and single-hand clips.
+    all_hand_drum_goals: bool = True
+    #: Optional focused far-family coverage as (hand, drum-name) pairs.
+    #: Explicit pairs override the default all-hand coverage policy.
+    far_goal_pairs: tuple[tuple[str, str], ...] | None = None
     schedule_slots: int = 2
     idle_arm_noise: float = 0.05
     idle_qd_scale: float = 0.02
@@ -269,28 +294,23 @@ class Phase2ScenarioConfig:
     #:
     #: Why it exists.  The clips are real grooves, so the plan-native family
     #: inherits real drumming's distribution, and that is savagely skewed:
-    #: measured on the 2026-08-14 pool, two-handed rows covered 5 of the 31
-    #: reachable (left, right) pairs, with hihat+snare alone at 83.6 % and
+    #: measured on the 2026-08-14 pool, two-handed rows covered only 5
+    #: (left, right) pairs, with hihat+snare alone at 83.6 % and
     #: ``floor_tom`` and ``cymbal_left`` appearing in ZERO two-handed rows out
     #: of 110 k.  Quantity was never the problem -- 71 % of all strike
     #: supervision is two-handed -- but the model only ever saw one
     #: configuration of it.
     #:
-    #: Hand assignment is by LATERAL POSITION, never crossed: of the two drums
-    #: the left hand takes the one with the greater ``+y`` and the right hand
-    #: the lesser.  That makes every one of the 21 distinct-drum pairs legal for
-    #: free -- ``hihat`` is max-y so it can only ever be the left one and
-    #: ``floor_tom`` is min-y so it can only ever be the right one, which is
-    #: exactly what the no-crossover eligibility (and the goal-pose library)
-    #: already forbids the other way round.
+    #: Enumerate every eligible ordered (left, right) drum combination,
+    #: including crossed assignments.  With left/floor_tom excluded this is
+    #: 36 distinct-drum pairs plus six same-drum pairs.
     pair_frac: float = 0.0
     #: Share of PAIR draws that put BOTH hands on the SAME drum.  Legal for the
-    #: five drums both hands can reach (everything but ``hihat``, which the
-    #: right hand cannot play, and ``floor_tom``, which the left cannot), so the
-    #: family enumerates 21 + 5 = 26 combinations.  The two contact points are
+    #: six drums both hands can reach (all except ``floor_tom``), so the
+    #: family enumerates 36 + 6 = 42 combinations.  The two contact points are
     #: resampled until they are ``pair_same_min_sep`` apart, so the sticks are
     #: not asked to occupy one point.
-    pair_same_frac: float = 5.0 / 26.0
+    pair_same_frac: float = 6.0 / 42.0
     #: Reads :data:`~amortized_opt.constants.STICK_MIN_SEP` (0.06 m, the value
     #: this field has always had).  The MPC roller's re-goal separation guard
     #: enforces the SAME number when it promotes a goal onto the drum the other
@@ -437,6 +457,30 @@ class Phase2Noise:
     sigma_white: float = 0.01
     tau_steps: float = 5.0
     clip_to_box: bool = True
+    # Legacy defaults preserve reconstruction of older runs. The trainer's
+    # current defaults select half-normal magnitudes and a longer OU timescale.
+    magnitude_distribution: str = "log_uniform"
+    sigma_scale: float = 0.30
+    process: str = "ou"
+    bridge: GaussianBridgeNoise | None = None
+
+    def __post_init__(self):
+        if isinstance(self.bridge, dict):
+            self.bridge = GaussianBridgeNoise(**self.bridge)
+        if self.process not in {"ou", "gaussian_bridge"}:
+            raise ValueError("unknown initialization noise process")
+        if self.process == "gaussian_bridge" and self.bridge is None:
+            raise ValueError("Gaussian bridge requires its calibrated configuration")
+        if self.magnitude_distribution not in {"log_uniform", "half_normal"}:
+            raise ValueError("unknown initialization noise magnitude distribution")
+        if not math.isfinite(self.tau_steps) or self.tau_steps <= 0:
+            raise ValueError("noise tau_steps must be finite and positive")
+        if not math.isfinite(self.sigma_white) or self.sigma_white < 0:
+            raise ValueError("noise sigma_white must be finite and nonnegative")
+        if not math.isfinite(self.sigma_scale) or self.sigma_scale < 0:
+            raise ValueError("noise sigma_scale must be finite and nonnegative")
+        if not (0 < self.sigma_corr_min <= self.sigma_corr_max < math.inf):
+            raise ValueError("noise correlated sigma bounds must be finite and positive")
 
 
 # ====================================================== strike geometry ======
@@ -702,6 +746,7 @@ def strike_context_from_arrays(
         elev_required=pick("elev"),
         drum_head_centers=drum_head_centers,
         drum_radii=drum_radii,
+        drum_axes=pick('drum_axis') if 'drum_axis' in d else None,
     )
 
 
@@ -1048,7 +1093,7 @@ def generate_cost_scenarios(
             src = np.full(2, -1, dtype=np.int64)
             kind = KIND_EVAL_LIKE
         elif pair:
-            # BOTH hands, drum combination uniform over the 26 legal ones.
+            # BOTH hands, drum combination uniform over the 42 legal ones.
             n_d, n_s = len(pair_distinct), len(pair_same)
             same = n_s > 0 and (n_d == 0 or rng.uniform() < cfg.pair_same_frac)
             if same:
@@ -1286,6 +1331,10 @@ def _merge(parts: list[dict]) -> dict:
         for k, v in p["stats"].items():
             if isinstance(v, np.ndarray):
                 stats.setdefault(k, []).append(v)
+            elif isinstance(v, dict):
+                target = stats.setdefault(k, {})
+                for label, count in v.items():
+                    target[label] = target.get(label, 0) + count
             else:
                 stats[k] = stats.get(k, 0) + v
     out_b = {b: {k: np.concatenate(v) for k, v in a.items()} for b, a in buckets.items()}
@@ -1324,9 +1373,16 @@ class Phase2Pool:
 
         self.data: dict[int, dict[str, torch.Tensor]] = {}
         self._ou: dict[int, torch.Tensor] = {}
+        self._ou_overrides: dict[tuple[int, float], torch.Tensor] = {}
         for H, arrays in sorted(buckets.items()):
             if not len(arrays["q0"]):
                 continue
+            n = len(arrays["q0"])
+            wrong = {key: len(value) for key, value in arrays.items()
+                     if len(value) != n}
+            if wrong:
+                raise ValueError(f"bucket {H} has {n} q0 rows but mismatched "
+                                 f"columns: {wrong}")
             d: dict[str, torch.Tensor] = {}
             for k, v in arrays.items():
                 if v.dtype == np.bool_:
@@ -1544,15 +1600,33 @@ class Phase2Pool:
         return d["init"][:, :, yaw_i]
 
     def noised_init(
-        self, init: torch.Tensor, bucket: int, *, generator: torch.Generator | None = None
+        self, init: torch.Tensor, bucket: int, *, generator: torch.Generator | None = None,
+        noise: Phase2Noise | None = None,
+        elem_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        nc = self.noise
+        nc = self.noise if noise is None else noise
         B, H, D = init.shape
-        L = self._ou[int(bucket)]
+        if nc.process == "gaussian_bridge":
+            if elem_mask is None:
+                raise ValueError("Gaussian bridge requires per-joint strike masks")
+            out = init + sample_bridge(elem_mask, float(self.cfg.dt), nc.bridge, generator=generator)
+            return out.clamp(self.q_lo,self.q_hi) if nc.clip_to_box else out
+        if nc.tau_steps == self.noise.tau_steps:
+            L = self._ou[int(bucket)]
+        else:
+            key = (int(bucket), float(nc.tau_steps))
+            if key not in self._ou_overrides:
+                self._ou_overrides[key] = ou_kernel(H, nc.tau_steps, self.device, self.dtype)
+            L = self._ou_overrides[key]
         eps = torch.randn(B, H, D, device=init.device, dtype=init.dtype, generator=generator)
-        u = torch.rand(B, 1, 1, device=init.device, dtype=init.dtype, generator=generator)
-        lo, hi = math.log(nc.sigma_corr_min), math.log(nc.sigma_corr_max)
-        sigma = torch.exp(lo + (hi - lo) * u)
+        if nc.magnitude_distribution == "half_normal":
+            sigma = nc.sigma_scale * torch.randn(
+                B, 1, 1, device=init.device, dtype=init.dtype, generator=generator,
+            ).abs()
+        else:
+            u = torch.rand(B, 1, 1, device=init.device, dtype=init.dtype, generator=generator)
+            lo, hi = math.log(nc.sigma_corr_min), math.log(nc.sigma_corr_max)
+            sigma = torch.exp(lo + (hi - lo) * u)
         out = init + sigma * torch.einsum("ij,bjd->bid", L, eps)
         if nc.sigma_white > 0.0:
             out = out + nc.sigma_white * torch.randn(

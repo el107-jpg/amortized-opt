@@ -150,6 +150,7 @@ from .rnea import BatchedRNEA
 from .sdf import SdfPenalty, q0_collision_clear
 from .strike import STICK_TIP_SIGMA
 from .tensorboard_log import MetricsTensorboard
+from .gaussian_bridge import GaussianBridgeNoise, sample_state_drift
 from .tokenizer import ContextInputs, FK_POINT_NAMES, build_waypoint_masks
 from .train_warmstart import LossScales, _masked_huber
 # The encoder's own set-point clamp, so the search cannot propose a target the
@@ -187,6 +188,7 @@ from .line_search_step import (
     snapshot_g_preclip,
 )
 from .objective_replay import (
+    BpttReplayPayload,
     FrozenControls,
     GlobalTorchRngState,
     ObjectiveReplayContext,
@@ -579,6 +581,17 @@ def phase2_cost_config(**kw) -> CostConfig:
     on that same measurement.  Everything else is ``CostConfig``'s default.
     """
     base = dict(
+        physics_loss_version="geometry_v2",
+        n_sub=5,  # 4 ms geometry grid, matching 250 Hz Isaac physics
+        geometry_motion_mode="foh",
+        collision_temporal_bound=True,
+        impact_velocity_mode="fd_fine",
+        w_stick_stick=1.0e5,
+        # New phase-2 fits use the continuous distal-20-cm capsule scorer.
+        # Archived saved objectives retain their own mode on resume.
+        contact_scoring_mode="isaac_v5",
+        terminal_a_incidence=0.25,
+        terminal_a_speed_quality=0.5,
         # collision: undo the per-pair mean (see above)
         w_collision_drum=1.0e5, w_collision_under=1.0e5, w_collision_self=1.0e5,
         # Limit families, unit-normalized so a characteristic *element-mean*
@@ -882,6 +895,17 @@ class Phase2Config:
     #: surgery off before ``make_cost_step`` and follow commit-gate /
     #: ``viol_acc`` policy in plan §14 — do not clear balance only in-loop.
     line_search: bool = False
+    #: Run the normal warmup/cosine schedule during delayed activation, then
+    #: hand its final rate to the selector. Off preserves the legacy floor law.
+    line_search_cosine_before_activation: bool = False
+    terminal_role_checkpoint: str | None = None
+    terminal_role_w_com: float | None = None
+    terminal_role_dynamic_al: bool = False
+    terminal_role_al_lam_max: float | None = None
+    w_terminal_role: float = 1.0
+    terminal_role_batch: int = 64
+    terminal_head_grad_fraction_cap: float = 0.3
+    terminal_head_grad_cap_mode: str = "combined_l2"
     line_search_cfg: LineSearchConfig = field(default_factory=LineSearchConfig)
     #: Perturb the frozen terminal-head initialization seen by fresh rows.
     #: Noise uses the pool's phase-1-matched OU + white law, then a cubic
@@ -928,6 +952,11 @@ class Phase2Config:
     #: explicitly masked out.  Default off for backward-compatible experiments;
     #: the rhythm Bellman launcher enables it at the same scale as ``w_tc``.
     w_mpc_init_tie: float = 0.0
+    #: Retain the starting actor on contexts outside newly added right hi-hat
+    #: coverage. The frozen reference is training-only and excluded from export.
+    w_actor_retention: float = 0.0
+    actor_retention_checkpoint: str | None = None
+    actor_retention_hihat_departures: bool = False
     #: MPC replay consistency for waist yaw only.  Unlike the all-joint tie,
     #: this is not diluted over 17 output columns: current waypoint ``j`` is
     #: compared with the stored parent at the same absolute time.  It therefore
@@ -1001,6 +1030,12 @@ class Phase2Config:
     #: rather than randomly drawn so a line-search probe replays precisely the
     #: same scalar objective without another RNG payload.
     dls_terminal_frac: float = 0.0
+    #: Optional (hand index, drum index) filter for targeted coverage repair.
+    #: The teacher still evaluates the complete physical path on selected rows.
+    dls_terminal_goal_pairs: tuple[tuple[int, int], ...] | None = None
+    dls_terminal_start_pairs: tuple[tuple[int, int], ...] | None = None
+    dls_terminal_region_target: bool = False
+    dls_terminal_reject_worse: bool = False
     w_dls_terminal_cost: float = 0.0
     w_dls_terminal_tie: float = 0.0
     dls_terminal_steps: int = 1
@@ -1308,6 +1343,7 @@ class Phase2Config:
     rhythm_idle_frac: float = 0.30
     post_hit_frac: float = 0.60
     far_fetched_frac: float = 0.10
+    pair_frac: float = 0.0
     #: Recency-biased ring of on-policy post-hit inits harvested from the
     #: roller after a successful re-goal or chain-carry.  Smaller than the
     #: full replay: these rows are only the ~10 % fresh mix's Phase-B slice.
@@ -1429,8 +1465,23 @@ class Phase2Config:
     #: Appended to preserve positional compatibility of older Phase2Config
     #: construction.  0 preserves the legacy sampler.
     replay_viol_uniform_mix: float = 0.0
+    # Saved separately from pool geometry: cached scenarios receive freshly
+    # sampled input noise using these settings on each training batch.
+    init_noise: Phase2Noise = field(default_factory=Phase2Noise)
+    mpc_init_noise: bool = False
+    mpc_noise: Phase2Noise | None = None
+    terminal_init_all_rows: bool = False
+    timing_mpc_state_noise: GaussianBridgeNoise | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.timing_mpc_state_noise, dict):
+            self.timing_mpc_state_noise = GaussianBridgeNoise(**self.timing_mpc_state_noise)
+        if isinstance(self.init_noise, dict):
+            self.init_noise = Phase2Noise(**self.init_noise)
+        if isinstance(self.mpc_noise, dict):
+            self.mpc_noise = Phase2Noise(**self.mpc_noise)
+        if self.terminal_init_all_rows and (self.terminal_init_noise or self.mpc_init_noise):
+            raise ValueError("rebuilding all initializations requires both input noise flags off")
         if float(self.w_waist_yaw_mpc_tie) < 0.0:
             raise ValueError("w_waist_yaw_mpc_tie must be nonnegative")
         if int(self.bptt_batch) < 1:
@@ -1496,6 +1547,14 @@ class Phase2Config:
             raise ValueError("phase_timing_every must be nonnegative")
         if not 0.0 <= float(self.dls_terminal_frac) <= 1.0:
             raise ValueError("dls_terminal_frac must be in [0, 1]")
+        if self.dls_terminal_goal_pairs is not None:
+            for hand, drum in self.dls_terminal_goal_pairs:
+                if hand not in (0, 1) or not 0 <= drum < len(DrumKit.from_layout().names):
+                    raise ValueError("DLS goal pairs require a valid hand and drum index")
+        if self.dls_terminal_start_pairs is not None:
+            for hand, drum in self.dls_terminal_start_pairs:
+                if hand not in (0, 1) or not 0 <= drum < len(DrumKit.from_layout().names):
+                    raise ValueError("DLS start pairs require a valid hand and drum index")
         if float(self.w_dls_terminal_cost) < 0.0:
             raise ValueError("w_dls_terminal_cost must be nonnegative")
         if float(self.w_dls_terminal_tie) < 0.0:
@@ -1671,13 +1730,14 @@ class Phase2Config:
             KIND_POST_HIT,
             KIND_RHYTHM_IDLE,
         )
-        from .phase2_data import KIND_EVAL_LIKE
+        from .phase2_data import KIND_EVAL_LIKE, KIND_PAIR
 
         return {
             KIND_RHYTHM_IDLE: float(self.rhythm_idle_frac),
             KIND_POST_HIT: float(self.post_hit_frac),
             KIND_FAR_FETCHED: float(self.far_fetched_frac),
             KIND_EVAL_LIKE: float(self.eval_like_mix_frac),
+            KIND_PAIR: float(self.pair_frac),
         }
 
     def effective_kind_fracs(
@@ -1699,6 +1759,7 @@ class Phase2Config:
             KIND_RHYTHM_IDLE,
             effective_kind_fracs as _eff,
         )
+        from .phase2_data import KIND_PAIR
 
         counts = dict(pool.kind_counts())
         if extra_counts:
@@ -1706,7 +1767,7 @@ class Phase2Config:
                 n = int(n)
                 if n > 0:
                     counts[int(k)] = counts.get(int(k), 0) + n
-        rhythm = (KIND_RHYTHM_IDLE, KIND_POST_HIT, KIND_FAR_FETCHED)
+        rhythm = (KIND_RHYTHM_IDLE, KIND_POST_HIT, KIND_FAR_FETCHED, KIND_PAIR)
         if not any(int(counts.get(k, 0)) > 0 for k in rhythm):
             return None
         if not hasattr(self, "_kind_mix_log"):
@@ -1829,6 +1890,27 @@ def mpc_init_tie_loss(
         traj[:, :-1], shifted_parent[:, :-1].detach(), mask, beta,
     )
     return loss, n
+
+
+def actor_retention_loss(model, traj, batch):
+    core = model.module if hasattr(model, 'module') else model
+    teacher = getattr(core, '_actor_retention_teacher', None)
+    if teacher is None:
+        return traj.new_zeros(())
+    ctx = batch['context']
+    hat = teacher.terminal_initializer.hihat_index
+    retain = ~(ctx.goal_valid[:, 1].bool() & (ctx.goal_drum[:, 1] == hat))
+    if getattr(core, '_actor_retention_hihat_departures', False):
+        strike = batch['strike']
+        changing = (strike.active > .5) & (
+            (strike.start_drum == hat) | (strike.target_drum == hat))
+        retain = ~changing.any(dim=1)
+    with torch.no_grad():
+        encoding = teacher.encode_context(ctx)
+        target = teacher.refine(batch['init'], batch['state'], encoding,
+                                batch['masks'], iterations=1).traj.detach()
+    mask = batch['masks'].elem_mask.to(traj) * retain[:, None, None]
+    return _masked_huber(traj, target.to(traj), mask, .02)[0]
 
 
 def waist_yaw_mpc_init_tie_loss(
@@ -2724,8 +2806,8 @@ class MPCRoller:
 
         :meth:`GoalPoseLibrary.select` is a host-side dict lookup, so the whole
         (hand, drum, waist-yaw) surface is precomputed once and the re-goal path
-        gathers from it.  Pairs the library does not carry -- ``left/floor_tom``
-        and ``right/hihat``, the no-crossover rule -- are marked invalid, and a
+        gathers from it. Pairs the library does not carry, including the
+        excluded ``left/floor_tom`` pair, are marked invalid, and a
         promoted future landing on one counts as "no valid future" for that
         hand (it goes idle) exactly as ``generate_cost_scenarios`` rejects them.
         """
@@ -3755,6 +3837,7 @@ class MPCRoller:
             # ``_refresh_geometry`` re-prices the strike table off, so the
             # tokens, the strike row and the collision cylinders are one kit.
             drum_radii=st["drum_radius"],
+            drum_axes=st["drum_axis"],
             waist_yaw_ref=self._waist_aim_reference(),
         )
 
@@ -4077,6 +4160,7 @@ TERM_KEYS: tuple[str, ...] = (
     "waist_yaw_initial_accel_direction",
     "waist_pr_vel", "tip_crossover",
     "terminal_aim", "waist_pr_band", "waist_pr_terminal", "waist_upright",
+    "tip_up",
 )
 TORQUE_TERM_IDX: int = TERM_KEYS.index("torque")
 #: APPEND-ONLY (``train_phase2`` reads the block positionally out of the metrics
@@ -4141,6 +4225,10 @@ DIAG_KEYS: tuple[str, ...] = (
     "arm_com_height_max", "arm_com_radius_max",
     "arm_com_height_mean", "arm_com_radius_mean",
     "arm_com_height_excess_max", "arm_com_radius_excess_max",
+    # Mean relu(-stick_z) at the strike, averaged over active hands.  Snare and
+    # floor tom contribute nothing.  Logged at weight zero as a baseline.
+    "tip_up_down",
+    "collision_sampled_min_sdf", "collision_temporal_bound_gap",
 )
 #: Short log names for :data:`DIAG_KEYS`, positionally.  The term / violation
 #: names are derived from their key tuples so the two can never drift apart.
@@ -4158,6 +4246,8 @@ DIAG_NAMES: tuple[str, ...] = (
     "d_waist_pr_N",
     "d_arm_com_z", "d_arm_com_r", "d_arm_com_z_mean", "d_arm_com_r_mean",
     "d_arm_com_z_ex", "d_arm_com_r_ex",
+    "d_tip_up",
+    "d_sampled_sdf", "d_sweep_bound_gap",
 )
 assert len(DIAG_NAMES) == len(DIAG_KEYS)
 assert set(VIOL_KEYS) == set(CONSTRAINT_GROUPS), (VIOL_KEYS, CONSTRAINT_GROUPS)
@@ -4906,6 +4996,8 @@ def phase2_config_from_checkpoint(
 ) -> Phase2Config:
     """Rebuild :class:`Phase2Config` saved in a phase-2 checkpoint."""
     raw = dict(ck.get("train_cfg") or {})
+    if not isinstance(raw.get("cost"), (dict, CostConfig)):
+        raw["cost"] = CostConfig()  # never inject today's fresh objective into an archive
     if device is not None:
         raw["device"] = str(device)
     if compile_model is not None:
@@ -4919,6 +5011,9 @@ def phase2_config_from_checkpoint(
         ("bounce", BounceConfig),
         ("schedule", WeightSchedule),
         ("timing_critic", ViolationCriticConfig),
+        ("init_noise", Phase2Noise),
+        ("mpc_noise", Phase2Noise),
+        ("timing_mpc_state_noise", GaussianBridgeNoise),
     )
     for key, cls in nested:
         if isinstance(raw.get(key), dict):
@@ -5207,6 +5302,35 @@ def _restore_phase2_rng_state(state, streams: dict) -> str | None:
     return "partial"
 
 
+def _checkpoint_model_state(core) -> dict:
+    """State dict a plain ``AmortizedOptimizer`` can load.
+
+    Decoder LoRA is folded into the frozen linear weights.  A resume that
+    passes ``--lora-rank`` starts a new zero-delta adapter on that merged model.
+    """
+    from isaac_rl_ppo.actor import LoRALinear
+
+    wrapped = {
+        name: module for name, module in core.named_modules()
+        if isinstance(module, LoRALinear)
+    }
+    if not wrapped:
+        return core.state_dict()
+    state = {}
+    for name, module in wrapped.items():
+        state[name + ".weight"] = module.weight.detach().cpu().clone()
+        if module.bias is not None:
+            state[name + ".bias"] = module.bias.detach().cpu().clone()
+    skip = tuple(name + ".base." for name in wrapped) + tuple(
+        name + ".lora_" for name in wrapped
+    )
+    for key, value in core.state_dict().items():
+        if key.startswith(skip):
+            continue
+        state[key] = value.detach().cpu().clone() if torch.is_tensor(value) else value
+    return state
+
+
 def save_phase2_checkpoint(
     path, *, model, optimizer, al: AugmentedLagrangian, step: int,
     cfg: Phase2Config, model_cfg: ModelConfig, scenario_cfg=None, extra=None,
@@ -5217,7 +5341,7 @@ def save_phase2_checkpoint(
     core = model.module if hasattr(model, "module") else model
     payload = {
         "step": int(step),
-        "model": core.state_dict(),
+        "model": _checkpoint_model_state(core),
         "optimizer": optimizer.state_dict(),
         "al": al.state_dict(),
         "train_cfg": asdict(cfg),
@@ -5558,7 +5682,7 @@ def make_suffix_step(module, cost: FusedCost, cfg: Phase2Config,
     if compile_mode is not None and cfg.compile_model:
         _model = torch.compile(_model, mode=compile_mode, dynamic=False)
 
-    def fn(traj, q0, v0, enc, em_parent, masks_s, offs):
+    def fn(traj, q0, v0, enc, em_parent, masks_s, offs, *, child_context=None, noise_pool=None, noise_generator=None):
         B, H, D = traj.shape
         parent = traj.detach()
         shifted, valid = shift_plan(parent, offs)
@@ -5579,7 +5703,21 @@ def make_suffix_step(module, cost: FusedCost, cfg: Phase2Config,
             v0_s = torch.where(fresh, v0.float(), vk)
         em_s = masks_s.elem_mask.to(traj.dtype)
         child_init = shifted.detach() * em_s
-        out = _model(child_init, torch.cat([q0_s, v0_s], dim=-1), enc, masks_s)
+        state_s = torch.cat([q0_s, v0_s], dim=-1)
+        if cfg.terminal_init_all_rows:
+            if child_context is None:
+                raise ValueError("rebuilt Bellman child requires its retimed context")
+            core = module.module if hasattr(module, "module") else module
+            child_init = core.initial_trajectory(child_context, state_s, masks_s)
+        elif cfg.mpc_init_noise:
+            if noise_pool is None:
+                raise ValueError("noisy Bellman child requires a noise pool")
+            noisy_batch = {"init": child_init, "masks": masks_s,
+                           "mpc_init": torch.ones(B, device=traj.device, dtype=torch.bool)}
+            _apply_mpc_init_noise(noisy_batch, pool=noise_pool, generator=noise_generator,
+                enabled=True, noise_ramp_steps=cfg.terminal_init_noise_ramp_steps, noise=cfg.mpc_noise)
+            child_init = noisy_batch["init"]
+        out = _model(child_init, state_s, enc, masks_s)
         m = em_s * shift_plan(em_parent, offs)[0].to(traj.dtype) \
             * valid.unsqueeze(-1).to(traj.dtype)
         tie, _sq, n = _masked_huber(out.traj, shifted.detach(), m, 0.02)
@@ -5601,6 +5739,9 @@ def _run_suffix_step_chunked(
     offs: torch.Tensor,
     *,
     microbatch: int,
+    child_context=None,
+    noise_pool=None,
+    noise_generator=None,
 ):
     """Run a suffix solve in row chunks without changing its batch mean."""
     n = int(traj.shape[0])
@@ -5608,6 +5749,9 @@ def _run_suffix_step_chunked(
     if cap <= 0 or n <= cap:
         return fn(
             traj, q0, v0, enc, em_parent, masks_s, offs,
+            **({"child_context": child_context} if child_context is not None else {}),
+            **({"noise_pool": noise_pool, "noise_generator": noise_generator}
+               if noise_pool is not None else {}),
         )
     loss_tie = traj.sum() * 0.0
     tie_elems = traj.sum().detach() * 0.0
@@ -5630,6 +5774,10 @@ def _run_suffix_step_chunked(
             em_parent.index_select(0, idx),
             masks_part,
             offs.index_select(0, idx),
+            **({"child_context": slice_context(child_context, idx)}
+               if child_context is not None else {}),
+            **({"noise_pool": noise_pool, "noise_generator": noise_generator}
+               if noise_pool is not None else {}),
         )
         weight = float(idx.numel()) / float(n)
         loss_tie = loss_tie + weight * out[0]
@@ -5642,7 +5790,7 @@ def _run_suffix_step_chunked(
 def _strike_rows(s: StrikeContext, sl) -> StrikeContext:
     """Row-slice every populated field of a :class:`StrikeContext`."""
     return StrikeContext(
-        **{k: (None if v is None else v[sl]) for k, v in s.__dict__.items()}
+        **{k: (v[sl] if isinstance(v, torch.Tensor) else v) for k, v in s.__dict__.items()}
     )
 
 
@@ -6530,20 +6678,38 @@ def _waist_sp_search_term(*, model, cost, cfg, enc, batch, strike, lengths,
 
 
 def _bptt_term(pool, replay, bptt_fn, sim, cfg, bucket, device, dtype, gen, rng, w,
-               model=None):
+               model=None, replay_record=None, replay_only=False):
     """Draw a two-hit chain and return its second-solve cost.
 
     Hit 1 comes from wherever the training mix is drawing (replay if it has
     enough), hit 2 from a *fresh* scenario, so the second context is an honest
     "next drum" rather than a continuation of the same goal.
     """
-    n = min(int(cfg.bptt_batch), pool.size(bucket))
-    src = replay if (bucket in getattr(replay, "data", {}) and replay.size(bucket) >= n) else pool
-    i1 = (src.sample_idx(bucket, n, generator=gen) if src is replay
-          else torch.randint(0, pool.size(bucket), (n,), device=device, generator=gen))
-    b1 = src.batch(bucket, i1, generator=gen, noise=(src is pool))
-    i2 = torch.randint(0, pool.size(bucket), (n,), device=device, generator=gen)
-    b2 = pool.batch(bucket, i2, generator=gen, noise=False)
+    if replay_only:
+        payload = None if replay_record is None else replay_record.bptt
+        if payload is None or payload.batch1 is None or payload.batch2 is None:
+            raise ReplayIncompleteError("BPTT replay requires both frozen batches")
+        b1, b2 = payload.batch1, payload.batch2
+        samples = replay_record.samples
+        required = ("bptt_kp", "bptt_kd", "bptt_e_rest", "bptt_q_noise",
+                    "bptt_qd_noise", "bptt_tip_vel_noise")
+        if any(getattr(samples, key) is None for key in required):
+            raise ReplayIncompleteError("BPTT replay requires recorded gains and bounce noise")
+        n = int(b1["q0"].shape[0])
+        if int(b2["q0"].shape[0]) != n:
+            raise ReplayIncompleteError("BPTT replay batch sizes differ")
+    else:
+        n = min(int(cfg.bptt_batch), pool.size(bucket))
+        src = replay if (bucket in getattr(replay, "data", {}) and replay.size(bucket) >= n) else pool
+        i1 = (src.sample_idx(bucket, n, generator=gen) if src is replay
+              else torch.randint(0, pool.size(bucket), (n,), device=device, generator=gen))
+        b1 = src.batch(bucket, i1, generator=gen, noise=(src is pool))
+        i2 = torch.randint(0, pool.size(bucket), (n,), device=device, generator=gen)
+        b2 = pool.batch(bucket, i2, generator=gen, noise=False)
+        if replay_record is not None:
+            replay_record.bptt = BpttReplayPayload(
+                batch1=b1, batch2=b2, src_is_replay=(src is replay),
+            )
 
     he1 = effective_hits(b1["hit"], b1["active"], bucket)
     he2 = effective_hits(b2["hit"], b2["active"], bucket)
@@ -6565,20 +6731,36 @@ def _bptt_term(pool, replay, bptt_fn, sim, cfg, bucket, device, dtype, gen, rng,
 
     elen2 = per_element_lengths(he2, pool.cfg.joint_names)
     term2 = b2["seed"].gather(1, (elen2.clamp(1, bucket) - 1).unsqueeze(1)).squeeze(1)
-    kp, kd, _ki = sim.sample_gains(n, generator=gen)
     bc = cfg.bounce
-    e_rest = bc.restitution[0] + (bc.restitution[1] - bc.restitution[0]) * torch.rand(
-        n, device=device, dtype=dtype, generator=gen
-    )
-    randn = lambda *s: torch.randn(*s, device=device, dtype=dtype, generator=gen)
+    if replay_only:
+        kp, kd = samples.bptt_kp, samples.bptt_kd
+        e_rest = samples.bptt_e_rest
+        noise_q = samples.bptt_q_noise
+        noise_v = samples.bptt_qd_noise
+        noise_tip = samples.bptt_tip_vel_noise
+    else:
+        kp, kd, ki = sim.sample_gains(n, generator=gen)
+        e_rest = bc.restitution[0] + (bc.restitution[1] - bc.restitution[0]) * torch.rand(
+            n, device=device, dtype=dtype, generator=gen
+        )
+        noise_q = bc.q_noise * torch.randn(n, N_DOF, device=device, dtype=dtype, generator=gen)
+        noise_v = bc.qd_noise * torch.randn(n, N_DOF, device=device, dtype=dtype, generator=gen)
+        noise_tip = bc.tip_vel_noise * torch.randn(n, 3, device=device, dtype=dtype, generator=gen)
+        if replay_record is not None:
+            samples = replay_record.samples
+            samples.bptt_kp, samples.bptt_kd = kp.detach(), kd.detach()
+            samples.bptt_ki = None if ki is None else ki.detach()
+            samples.bptt_e_rest = e_rest.detach()
+            samples.bptt_q_noise = noise_q.detach()
+            samples.bptt_qd_noise = noise_v.detach()
+            samples.bptt_tip_vel_noise = noise_tip.detach()
     _c1, c2 = bptt_fn(
         b1["init"], b1["state"], b1["q0"], b1["v0"], encode(model, b1["context"]),
         b1["masks"], s1, group_lengths(he1), k_first,
         term2, encode(model, b2["context"]), b2["masks"], s2, group_lengths(he2),
         elen2, w, kp, kd,
         hand, normal, e_rest,
-        bc.q_noise * randn(n, N_DOF), bc.qd_noise * randn(n, N_DOF),
-        bc.tip_vel_noise * randn(n, 3),
+        noise_q, noise_v, noise_tip,
     )
     return c2
 
@@ -6978,6 +7160,8 @@ def _suffix_distill_loss(
     suffix_fn,
     pool: Phase2Pool,
     microbatch: int,
+    rebuild_initialization: bool = False,
+    generator: torch.Generator | None = None,
 ):
     """Build one shifted child batch and return its teacher-only tie loss."""
     active = replay_batch["active"]
@@ -6987,11 +7171,16 @@ def _suffix_distill_loss(
     )
     masks_child = pool.masks_for(hit_child.clamp_min(0), active, int(bucket))
     enc = encode_step(replay_batch["context"])
+    child_context = None
+    if rebuild_initialization:
+        child_context = replace(replay_batch["context"],
+            goal_tth=hit_child.clamp_min(0).float() * float(pool.cfg.dt))
     return _run_suffix_step_chunked(
         suffix_fn,
         replay_batch["parent_traj"], replay_batch["q0"], replay_batch["v0"],
         enc, replay_batch["masks"].elem_mask, masks_child, offs,
-        microbatch=int(microbatch),
+        microbatch=int(microbatch), child_context=child_context,
+        noise_pool=pool, noise_generator=generator,
     )
 
 
@@ -7156,6 +7345,7 @@ class _TrajectorySuffixMPCParentRing:
         costs: dict[int, FusedCost],
         q_noise: float = 0.01,
         qd_noise: float = 0.05,
+        state_noise: GaussianBridgeNoise | None = None,
         capacity: int = 2048,
         terminal_peak_frac: float = 0.55,
         terminal_long_frac: float = 0.42,
@@ -7170,6 +7360,7 @@ class _TrajectorySuffixMPCParentRing:
         self.costs = costs
         self.q_noise = float(q_noise)
         self.qd_noise = float(qd_noise)
+        self.state_noise = state_noise
         self.capacity = int(capacity)
         self.terminal_peak_frac = float(terminal_peak_frac)
         self.terminal_long_frac = float(terminal_long_frac)
@@ -7279,11 +7470,14 @@ class _TrajectorySuffixMPCParentRing:
             q0 = parent32.gather(1, km1)[:, 0]
             v0 = velocity.gather(1, km1)[:, 0]
 
-        if self.q_noise:
+        if self.state_noise is not None:
+            dq_noise, dv_noise = sample_state_drift(offs.float()*float(cost.dt),q0,self.state_noise,generator=generator)
+            q0, v0 = q0+dq_noise, v0+dv_noise
+        elif self.q_noise:
             q0 = q0 + self.q_noise * torch.randn(
                 q0.shape, device=q0.device, dtype=q0.dtype, generator=generator,
             )
-        if self.qd_noise:
+        if self.state_noise is None and self.qd_noise:
             v0 = v0 + self.qd_noise * torch.randn(
                 v0.shape, device=v0.device, dtype=v0.dtype, generator=generator,
             )
@@ -8902,6 +9096,7 @@ def dls_terminal_teacher(
     window: int = 16,
     damping: float = 0.05,
     max_step_rad: float = 0.35,
+    region_target: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Build a detached arm-only DLS terminal teacher and approach mask.
 
@@ -8933,6 +9128,44 @@ def dls_terminal_teacher(
         q_hit = teacher.index_select(0, active_rows).gather(1, gather).squeeze(1)
         aim = strike.p_star[:, hi].index_select(0, active_rows).detach().float()
         local = _dls_contact_local(cost, strike, hi).index_select(0, active_rows)
+        if region_target:
+            # Choose the nearest legal point of the playing shaft, rather than
+            # forcing a particular marker to the centre of the head.
+            from .sdf import segment_hit_region
+            from .strike import CYMBAL_CONTACT_SIGMA_FALLBACK
+            sub = _strike_rows(strike, active_rows)
+            sigma = sub.contact_sigma[:, hi].float()
+            tip = (torch.full_like(sigma, float(STICK_TIP_SIGMA))
+                   if sub.stick_tip_sigma is None else sub.stick_tip_sigma[:, hi].float())
+            shaft = (sub.shaft_allowed[:, hi] > .5) & (cost.cfg.contact_mode != 'spec')
+            low = torch.where(shaft, torch.full_like(sigma, CYMBAL_CONTACT_SIGMA_FALLBACK), sigma)
+            high = torch.where(shaft, tip, sigma)
+            low = torch.minimum(low, high)
+            axis = (cost.c_mount_axis[hand].float().expand(len(active_rows), -1)
+                    if sub.stick_axis_local is None else sub.stick_axis_local[:, hi].float())
+            mount = local - sigma[:, None] * axis
+            a = _dls_contact_position(cost.fk, q_hit, hand, mount + low[:, None]*axis)
+            b = _dls_contact_position(cost.fk, q_hit, hand, mount + high[:, None]*axis)
+            depth = getattr(strike, 'target_top_entry_depth_m', None)
+            if depth is None:
+                depth = cost.cfg.target_top_entry_depth_m
+            axial_hi = float(cost.cfg.terminal_axial_hi)
+            axial_lo = axial_hi-float(depth) if depth is not None else float(cost.cfg.terminal_axial_lo)
+            _, fraction, point = segment_hit_region(a, b, aim, sub.n_out[:, hi],
+                sub.hit_radius[:, hi], sub.disk_offset[:, hi], sub.half_plane_dir[:, hi],
+                sub.has_half_plane[:, hi], axial_lo, axial_hi)
+            local = mount + (low+fraction*(high-low))[:, None]*axis
+            normal = sub.n_out[:, hi].float()
+            delta = point-aim
+            axial = (delta*normal).sum(-1)
+            planar = delta-axial[:, None]*normal-sub.disk_offset[:, hi]
+            half = sub.half_plane_dir[:, hi].float()
+            component = (planar*half).sum(-1)
+            planar = planar - torch.where(sub.has_half_plane[:, hi] > .5,
+                component.clamp_max(0), torch.zeros_like(component))[:, None]*half
+            planar = planar * (sub.hit_radius[:, hi]/planar.norm(dim=-1).clamp_min(1e-9)).clamp_max(1)[:, None]
+            aim = (aim+sub.disk_offset[:, hi]+planar
+                   +axial.clamp(axial_lo, axial_hi)[:, None]*normal).detach()
         cols = torch.as_tensor(
             [i for i, name in enumerate(cost.joint_names) if name.startswith(f"{hand}_")],
             device=traj.device, dtype=torch.long,
@@ -8958,9 +9191,9 @@ def dls_terminal_teacher(
             q_arm = q_hit.index_select(1, cols) + dq
             q_arm = torch.maximum(
                 torch.minimum(
-                    q_arm, cost.q_hi_hard.index_select(0, cols).float(),
+                    q_arm, cost._joint_box_hard_limits()[2].reshape(-1).index_select(0, cols).float(),
                 ),
-                cost.q_lo_hard.index_select(0, cols).float(),
+                cost._joint_box_hard_limits()[1].reshape(-1).index_select(0, cols).float(),
             )
             q_hit = q_hit.index_copy(1, cols, q_arm)
         pos1 = _dls_contact_position(cost.fk, q_hit, hand, local)
@@ -9388,9 +9621,19 @@ def dls_terminal_lookahead_loss(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Full-cost DLS lookahead plus a detached-teacher imitation tie."""
     B = int(traj.shape[0])
+    eligible = (strike.active > 0.5).any(dim=1)
+    if cfg.dls_terminal_goal_pairs is not None:
+        eligible = torch.zeros(B, dtype=torch.bool, device=traj.device)
+        for hand, drum in cfg.dls_terminal_goal_pairs:
+            eligible |= (strike.active[:, hand] > .5) & (strike.target_drum[:, hand] == drum)
+    if cfg.dls_terminal_start_pairs is not None:
+        if cfg.dls_terminal_goal_pairs is None:
+            eligible = torch.zeros(B, dtype=torch.bool, device=traj.device)
+        for hand, drum in cfg.dls_terminal_start_pairs:
+            eligible |= (strike.active[:, hand] > .5) & (strike.start_drum[:, hand] == drum)
     rows = _dls_rows(
         B, cfg.dls_terminal_frac, traj.device,
-        eligible=(strike.active > 0.5).any(dim=1),
+        eligible=eligible,
     )
     if rows.numel() == 0:
         zero = traj.sum() * 0.0
@@ -9419,7 +9662,20 @@ def dls_terminal_lookahead_loss(
             window=cfg.dls_terminal_window,
             damping=cfg.dls_terminal_damping,
             max_step_rad=cfg.dls_terminal_max_step_rad,
+            region_target=cfg.dls_terminal_region_target,
         )
+        if cfg.dls_terminal_reject_worse:
+            with torch.no_grad():
+                args = (q0.index_select(0, rows), v0.index_select(0, rows),
+                        lengths.index_select(0, rows), _index_batch_weights(weights, rows, B))
+                baseline = cost.forward(args[0], traj_rows.detach(), args[1], strike_rows,
+                                        lengths=args[2], weights=args[3]).total
+                proposed = cost.forward(args[0], teacher, args[1], strike_rows,
+                                        lengths=args[2], weights=args[3]).total
+                accepted = torch.isfinite(proposed) & (proposed <= baseline)
+                teacher = torch.where(accepted[:, None, None], teacher, traj_rows.detach())
+                tie_mask = tie_mask*accepted[:, None, None]
+                stats['dls_terminal_teacher_accept_frac'] = accepted.float().mean()
     # Numerically this is the DLS-corrected trajectory; analytically it has an
     # identity Jacobian w.r.t. the actor trajectory (straight-through).
     corrected = traj_rows + (teacher - traj_rows.detach())
@@ -10488,6 +10744,38 @@ def _expand_timing_base_tasks(
 
 
 @torch.no_grad()
+def _apply_mpc_init_noise(
+    batch: dict, *, pool: Phase2Pool, generator: torch.Generator | None = None,
+    enabled: bool = False, noise_ramp_steps: int = 5,
+    noise: Phase2Noise | None = None,
+) -> None:
+    """Corrupt MPC decoder inputs, preserving clean seeds and measured state.
+
+    Called once after timing/initializer rewrites, on both the baseline and
+    replayed objective. Replay restores the unperturbed input and RNG stream.
+    """
+    mpc = batch.get("mpc_init")
+    if not enabled or mpc is None or not bool(mpc.any()):
+        return
+    init = batch["init"]
+    H = int(init.shape[1])
+    nc = pool.noise if noise is None else noise
+    kwargs = {"noise": noise} if noise is not None else {}
+    if nc.process == "gaussian_bridge":
+        kwargs["elem_mask"] = batch["masks"].elem_mask
+    noisy = pool.noised_init(init, H, generator=generator, **kwargs)
+    u = torch.arange(1, H+1, device=init.device, dtype=init.dtype)
+    u = (u / max(int(noise_ramp_steps), 1)).clamp_max(1)
+    envelope = (u.square() * (3-2*u)).view(1, H, 1)
+    # The bridge already preserves q0 and v0. A second ramp would change its
+    # calibrated covariance and terminal spline velocity on short horizons.
+    corrupted = noisy if nc.process == "gaussian_bridge" else init + envelope * (noisy-init)
+    if (pool.noise if noise is None else noise).clip_to_box:
+        corrupted = corrupted.clamp(pool.q_lo, pool.q_hi)
+    corrupted = corrupted * batch["masks"].elem_mask
+    batch["init"] = torch.where(mpc.bool()[:, None, None], corrupted, init)
+
+
 def _apply_terminal_initializer(
     core,
     batch: dict,
@@ -10496,16 +10784,21 @@ def _apply_terminal_initializer(
     generator: torch.Generator | None = None,
     start_anchored_noise: bool = False,
     noise_ramp_steps: int = 5,
+    all_rows: bool = False,
 ) -> bool:
-    """Replace fresh-scenario seeds with the frozen terminal-head seed."""
+    """Rebuild fresh seeds, or every row including MPC states, from the frozen head."""
     initializer = getattr(core, "terminal_initializer", None)
     if initializer is None:
+        if all_rows:
+            raise ValueError("rebuilding all initializations requires a terminal head")
         return False
     seed = core.initial_trajectory(batch["context"], batch["state"], batch["masks"])
     fresh = ~batch.get(
         "mpc_init",
         torch.zeros(seed.shape[0], device=seed.device, dtype=torch.bool),
     ).bool()
+    if all_rows:
+        fresh = torch.ones_like(fresh)
     if start_anchored_noise:
         if pool is None:
             raise ValueError("terminal init noise requires the Phase2Pool")
@@ -10588,6 +10881,7 @@ def _ls_probe_scalar_F(
             core, batch, pool=pool, generator=generator,
             start_anchored_noise=bool(cfg.terminal_init_noise),
             noise_ramp_steps=int(cfg.terminal_init_noise_ramp_steps),
+            all_rows=cfg.terminal_init_all_rows,
         )
         if cfg.waist_sp_from_head:
             sp = enc.waist_yaw_sp.float()
@@ -10616,6 +10910,10 @@ def _ls_probe_scalar_F(
                 joint_names=base.joint_names, qd0=batch["v0"],
                 dt=float(getattr(pool.cfg, "dt", 0.02)),
             )
+        _apply_mpc_init_noise(
+            batch, pool=pool, generator=generator, enabled=cfg.mpc_init_noise,
+            noise_ramp_steps=cfg.terminal_init_noise_ramp_steps, noise=cfg.mpc_noise,
+        )
         step_out = step_fns[bucket](
             batch["init"], batch["state"], batch["q0"], batch["v0"],
             enc, batch["masks"], strike, lengths, w,
@@ -10658,12 +10956,17 @@ def _ls_probe_scalar_F(
                 masks2, kp, kd,
             )
 
-        if include_bptt:
-            raise ReplayIncompleteError(
-                "BPTT included on baseline but probe BPTT payload replay is "
-                "not wired yet (MVP: set w_bptt=0 / bptt_max_frac=0 under LS)"
-            )
         loss_bptt = torch.zeros((), device=device)
+        if include_bptt:
+            bptt_fn = rec.samples.extras.get("bptt_fn")
+            bptt_bucket = rec.samples.extras.get("bptt_bucket")
+            if bptt_fn is None or bptt_bucket is None:
+                raise ReplayIncompleteError("BPTT replay function/bucket not recorded")
+            loss_bptt = _bptt_term(
+                pool, None, bptt_fn, sim, cfg, bptt_bucket, device, dtype,
+                generator, None, rec.controls.weights, model=model,
+                replay_record=rec, replay_only=True,
+            )
 
         loss_sfx_tie = torch.zeros((), device=device)
         loss_mpc_tie = torch.zeros((), device=device)
@@ -10692,6 +10995,7 @@ def _ls_probe_scalar_F(
                 bucket=bucket, encode_step=encode_step,
                 suffix_fn=sfx_fns[bucket], pool=pool,
                 microbatch=int(cfg.suffix_microbatch),
+                rebuild_initialization=cfg.terminal_init_all_rows, generator=generator,
             )
         extra = (
             cfg.w_tc * loss_tc + cfg.w_bptt * loss_bptt
@@ -10699,6 +11003,8 @@ def _ls_probe_scalar_F(
             + cfg.w_waist_yaw_mpc_tie * loss_waist_mpc_tie
             + sfx_ramp * cfg.w_suffix_tie * loss_sfx_tie
         )
+        if cfg.w_actor_retention > 0:
+            extra = extra + cfg.w_actor_retention * actor_retention_loss(model, _traj, batch)
         if (
             cfg.dls_terminal_frac > 0.0
             and (cfg.w_dls_terminal_cost > 0.0 or cfg.w_dls_terminal_tie > 0.0)
@@ -10774,6 +11080,15 @@ def _ls_probe_scalar_F(
                 rows=slice(0, n_ss),
             )
             extra = extra + cfg.w_waist_sp_search * loss_sp_search
+        role = getattr(core, "_terminal_role_loss", None)
+        if role is not None:
+            terminal_batch = samples.extras.get("terminal_role_batch")
+            if terminal_batch is None:
+                raise ReplayIncompleteError("Joint terminal role loss requires its recorded batch")
+            role_weights = samples.extras.get("terminal_role_weights")
+            if role.dynamic_al and role_weights is None:
+                raise ReplayIncompleteError("Dynamic terminal AL requires recorded objective prices")
+            extra = extra + cfg.w_terminal_role * role.evaluate(core, terminal_batch, weights=role_weights).total.mean()
         total = loss + extra
     if return_tensor:
         return total
@@ -10894,6 +11209,13 @@ class _CudaPhaseTimer:
         return out
 
 
+def _line_search_scheduled_rate(cfg, step: int, runtime, update: int) -> float:
+    """Use warmup/cosine only before activation; preserve selector LR afterward."""
+    if cfg.line_search_cosine_before_activation and not runtime.cfg.active_at(update):
+        return cfg.lr_at(step)
+    return float(runtime.ctrl.last_selected_epsilon or runtime.eta_ref)
+
+
 def train_phase2(
     *,
     model,
@@ -10913,6 +11235,7 @@ def train_phase2(
     voxel_train_state: dict | None = None,
     timing_critic_state: dict | None = None,
     suffix_replay_state: dict | None = None,
+    terminal_role_state: dict | None = None,
     probe_fn=None,
     stage_a_init: bool = False,
     max_hours: float | None = None,
@@ -10934,6 +11257,9 @@ def train_phase2(
     to ``best_probe.pt``.
     """
     run_dir = Path(run_dir)
+    # The supplied pool owns the actual batch-time sampling law. Preserve it
+    # in checkpoints even for callers that construct a pool outside the CLI.
+    cfg.init_noise = pool.noise
     run_dir.mkdir(parents=True, exist_ok=True)
     if cfg.curvature_direct_frac > 0.0:
         if cfg.dls_terminal_frac > 0.0:
@@ -10951,6 +11277,39 @@ def train_phase2(
     amp = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(cfg.amp_dtype)
 
     core = model.module if hasattr(model, "module") else model
+    terminal_role = None
+    terminal_validation = None
+    if bool(getattr(core.cfg, "terminal_head_trainable", False)):
+        from .terminal_finetune import TerminalRoleLoss
+        if not cfg.terminal_role_checkpoint or cfg.w_terminal_role <= 0:
+            raise ValueError("Trainable terminal head requires its original positive role loss")
+        if cfg.terminal_role_batch < 1 or not 0 < cfg.terminal_head_grad_fraction_cap < 1:
+            raise ValueError("Invalid terminal role batch or gradient-fraction cap")
+        terminal_role = TerminalRoleLoss(cfg.terminal_role_checkpoint, device, w_com=cfg.terminal_role_w_com,
+                                        dynamic_al=cfg.terminal_role_dynamic_al, lam_max=cfg.terminal_role_al_lam_max,
+                                        contact_scoring_mode=cfg.cost.contact_scoring_mode,
+                                        physics_loss_version=cfg.cost.physics_loss_version)
+        terminal_role.load_state_dict(terminal_role_state)
+        object.__setattr__(core, "_terminal_role_loss", terminal_role)
+        terminal_validation = terminal_role.draw(256, np.random.default_rng(12345))
+        (run_dir / "terminal_role.json").write_text(json.dumps(terminal_role.state_dict(), indent=2)+"\n")
+    if cfg.w_actor_retention > 0:
+        if cfg.actor_retention_checkpoint:
+            from .train_warmstart import build_model
+            from .model import model_config_from_checkpoint
+            reference = torch.load(cfg.actor_retention_checkpoint, map_location='cpu', weights_only=False)
+            teacher = build_model(model_config_from_checkpoint(reference), device)
+            teacher.load_state_dict(reference['model'], strict=True)
+            teacher.eval().requires_grad_(False)
+        else:
+            import copy
+            teacher = copy.deepcopy(core).eval().requires_grad_(False)
+        # Avoid registering a duplicate network in the actor/optimizer/export.
+        object.__setattr__(core, '_actor_retention_teacher', teacher)
+        object.__setattr__(core, '_actor_retention_hihat_departures', cfg.actor_retention_hihat_departures)
+        if log:
+            print(f'[retention] frozen starting actor; weight={cfg.w_actor_retention:g}, '
+                  f'hi-hat departure learning={cfg.actor_retention_hihat_departures}', flush=True)
     if cfg.timing_critic.mode in {"assist", "control"}:
         if cfg.voxel_pool:
             raise ValueError(
@@ -11269,6 +11628,9 @@ def train_phase2(
         "jit_gen": jit_gen,
         "rng": rng,
     }
+    terminal_rng = np.random.default_rng(int(cfg.seed)+17027)
+    if terminal_role is not None:
+        phase2_rng_streams["terminal_rng"] = terminal_rng
 
     timing_critic = None
     timing_mpc_ring = None
@@ -11317,6 +11679,7 @@ def train_phase2(
                 costs=costs,
                 q_noise=cfg.timing_mpc_q_noise,
                 qd_noise=cfg.timing_mpc_qd_noise,
+                state_noise=cfg.timing_mpc_state_noise,
                 capacity=cfg.timing_mpc_parent_capacity,
                 terminal_peak_frac=cfg.terminal_suffix_peak_frac,
                 terminal_long_frac=cfg.terminal_suffix_long_frac,
@@ -11324,7 +11687,8 @@ def train_phase2(
                 terminal_peak_wp=cfg.terminal_suffix_peak_wp,
                 terminal_tail_tau=cfg.terminal_suffix_tail_tau,
             )
-            if timing_critic_state and timing_critic_state.get("primary_mpc_ring"):
+            if (cfg.timing_critic.primary_mpc_enabled and timing_critic_state
+                    and timing_critic_state.get("primary_mpc_ring")):
                 timing_mpc_ring.load_state_dict(
                     timing_critic_state["primary_mpc_ring"]
                 )
@@ -11433,6 +11797,8 @@ def train_phase2(
 
     def _train_checkpoint_extra(extra: dict | None = None) -> dict:
         out = dict(extra or {})
+        if terminal_role is not None:
+            out["terminal_role"] = terminal_role.state_dict()
         if sfx_fns:
             out["suffix_replay"] = suffix_ring.state_dict()
         if timing_critic is not None:
@@ -11516,7 +11882,18 @@ def train_phase2(
         enabled=bool(cfg.tensorboard) and rank == 0,
     )
     if rank == 0 and cfg.tensorboard and log:
-        print(f"[tensorboard] logdir={run_dir / 'tb'}", flush=True)
+        tb_dir = (run_dir / "tb").resolve()
+        print(f"[tensorboard] logdir={tb_dir}", flush=True)
+        registry = run_dir.parent / "tensorboard_active"
+        registry.mkdir(parents=True, exist_ok=True)
+        link = registry / run_dir.name
+        if link.is_symlink() and link.resolve() == tb_dir:
+            pass
+        elif not link.exists():
+            link.symlink_to(tb_dir)
+            print(f"[tensorboard] registered {link}", flush=True)
+        else:
+            print(f"[tensorboard] registry entry already exists: {link}", flush=True)
 
     def emit(rec: dict) -> None:
         if fh is None:
@@ -11685,13 +12062,13 @@ def train_phase2(
         updates_attempted += 1
         last_step = step + 1
         update_executed = False
-        # Selector owns LR under line search (plan §7): no cosine write.
+        # Selector owns LR under line search after activation (plan §7).
         if ls_rt is not None:
             known_search, search_reasons, ls_j = resolve_known_search(ls_rt)
             ls_direction_due = needs_line_search_direction(
                 ls_rt, known_search=known_search, j=ls_j,
             )
-            eps_reuse = float(ls_rt.ctrl.last_selected_epsilon or ls_rt.eta_ref)
+            eps_reuse = _line_search_scheduled_rate(cfg, step, ls_rt, ls_j)
             ls_rt.adapter.set_group_lrs(eps_reuse)
             lr = eps_reuse
         else:
@@ -11979,7 +12356,8 @@ def train_phase2(
                     timing_part = _cat_phase2_batches([expanded_part, anchor_part])
 
             parts = [timing_part]
-            if mpc_n > 0 and timing_mpc_ring.size(bucket) > 0:
+            if (mpc_n > 0 and cfg.timing_critic.primary_mpc_enabled
+                    and timing_mpc_ring.size(bucket) > 0):
                 idx = timing_mpc_ring.sample_idx(
                     bucket, mpc_n, generator=gen,
                 )
@@ -12028,8 +12406,11 @@ def train_phase2(
                     (mpc_n,), -1, device=device, dtype=torch.long,
                 )
                 parts.append(fallback)
-                roll_acc["timing_primary_mpc_fallback"] = (
-                    roll_acc.get("timing_primary_mpc_fallback", 0.0)
+                fill_metric = ("timing_primary_mpc_fallback"
+                               if cfg.timing_critic.primary_mpc_enabled
+                               else "timing_primary_fresh_fill")
+                roll_acc[fill_metric] = (
+                    roll_acc.get(fill_metric, 0.0)
                     + float(mpc_n)
                 )
             batch = _cat_phase2_batches(parts)
@@ -12271,6 +12652,9 @@ def train_phase2(
                     tail_tau=cfg.terminal_suffix_tail_tau,
                 )
 
+        terminal_role_batch = (terminal_role.draw(int(cfg.terminal_role_batch), terminal_rng)
+                               if terminal_role is not None else None)
+        terminal_role_weights = None if terminal_role is None else dict(terminal_role.weights)
         if (
             ls_rt is not None
             and replay_mgr is not None
@@ -12295,6 +12679,9 @@ def train_phase2(
             if suffix_replay_batch is not None:
                 ls_rec.samples.suffix_offs = suffix_replay_offs.detach()
                 ls_rec.samples.extras["suffix_replay_batch"] = suffix_replay_batch
+            if terminal_role_batch is not None:
+                ls_rec.samples.extras["terminal_role_batch"] = terminal_role_batch
+                ls_rec.samples.extras["terminal_role_weights"] = terminal_role_weights
 
         if cfg.yaw_now_jitter > 0.0 and batch["context"].yaw_now is not None:
             # Perturb only the CONDITIONING token; q0, the cost and the stored
@@ -12419,6 +12806,7 @@ def train_phase2(
                 core, batch, pool=pool, generator=gen,
                 start_anchored_noise=bool(cfg.terminal_init_noise),
                 noise_ramp_steps=int(cfg.terminal_init_noise_ramp_steps),
+                all_rows=cfg.terminal_init_all_rows,
             )
             if terminal_reseeded and enc.waist_pr_sp is not None:
                 batch["init"] = seed_waist_pr_to_sp(
@@ -12449,6 +12837,10 @@ def train_phase2(
                 # Candidate optimizer steps replay those finalized rows and
                 # never rerun the critic or resample its timing rays.
                 _refresh_timing_line_search_replay(ls_rec, batch)
+            _apply_mpc_init_noise(
+                batch, pool=pool, generator=gen, enabled=cfg.mpc_init_noise,
+                noise_ramp_steps=cfg.terminal_init_noise_ramp_steps, noise=cfg.mpc_noise,
+            )
             grad_term_probe = None
             if (
                 cfg.grad_term_every > 0
@@ -12704,8 +13096,11 @@ def train_phase2(
                         else replay
                     ),
                     bptt_fn, sim, cfg, bptt_bucket, device, dtype,
-                    gen, rng, w_confirmed, model=model,
+                    gen, rng, w_confirmed, model=model, replay_record=ls_rec,
                 )
+                if ls_rec is not None:
+                    ls_rec.samples.extras["bptt_fn"] = bptt_fn
+                    ls_rec.samples.extras["bptt_bucket"] = bptt_bucket
             loss_sfx_cost = torch.zeros((), device=device)
             loss_sfx_tie = torch.zeros((), device=device)
             loss_mpc_tie = torch.zeros((), device=device)
@@ -12739,6 +13134,7 @@ def train_phase2(
                         bucket=bucket, encode_step=encode_step,
                         suffix_fn=sfx_fns[bucket], pool=pool,
                         microbatch=int(cfg.suffix_microbatch),
+                        rebuild_initialization=cfg.terminal_init_all_rows, generator=gen,
                     )
                 )
                 roll_acc["suffix_replay_rows"] = (
@@ -12755,6 +13151,10 @@ def train_phase2(
                 + cfg.w_waist_yaw_mpc_tie * loss_waist_mpc_tie
                 + sfx_ramp * cfg.w_suffix_tie * loss_sfx_tie
             )
+            if cfg.w_actor_retention > 0:
+                retention = actor_retention_loss(model, _traj, batch)
+                extra = extra + cfg.w_actor_retention * retention
+                roll_acc['actor_retention_loss'] = roll_acc.get('actor_retention_loss', 0.) + float(retention.detach())
             dls_stats: dict[str, torch.Tensor] = {}
             if (
                 cfg.dls_terminal_frac > 0.0
@@ -12884,6 +13284,21 @@ def train_phase2(
                 for i_, v_ in enumerate(ss_diag):
                     ss_acc[i_] += v_
                 ss_n += 1
+        if terminal_role is not None:
+            role_result = terminal_role.evaluate(core, terminal_role_batch, weights=terminal_role_weights)
+            roll_acc["terminal_role_batches"] = roll_acc.get("terminal_role_batches", 0.) + 1
+            extra = extra + cfg.w_terminal_role * role_result.total.mean()
+            roll_acc["terminal_role_loss"] = roll_acc.get("terminal_role_loss", 0.) + float(role_result.total.mean().detach())
+            for label, term in role_result.terms.items():
+                key = "terminal_role_"+label
+                roll_acc[key] = roll_acc.get(key, 0.) + float(term.mean().detach())
+            if (step+1) % cfg.log_every == 0 or step == start_step:
+                head_params = list(core.terminal_initializer.head.parameters())
+                for label, objective in (("decoder", loss),
+                                         ("role", cfg.w_terminal_role*role_result.total.mean())):
+                    gradients = torch.autograd.grad(objective, head_params, retain_graph=True, allow_unused=True)
+                    norm_sq = sum(float(g.detach().float().square().sum()) for g in gradients if g is not None)
+                    roll_acc["terminal_head_"+label+"_grad_norm_probe"] = norm_sq**.5
         total = loss + extra
         phase_timer.mark("backward")
         if enc.waist_yaw_res is not None:
@@ -13165,6 +13580,12 @@ def train_phase2(
                     + float(torque_grad_cached_scale)
                 )
 
+        if terminal_role is not None:
+            from .terminal_finetune import cap_terminal_gradient
+            roll_acc["terminal_gradient_cap_visits"] = roll_acc.get("terminal_gradient_cap_visits", 0.) + 1
+            for key, value in cap_terminal_gradient(core, cfg.terminal_head_grad_fraction_cap,
+                                                   mode=cfg.terminal_head_grad_cap_mode).items():
+                roll_acc[key] = roll_acc.get(key, 0.) + value
         g_preclip = None
         g_for_lbfgs = None
         if ls_rt is not None and ls_direction_due:
@@ -13226,11 +13647,12 @@ def train_phase2(
                     and bool(late_reasons)
                 )
             all_reasons = list(search_reasons) + list(late_reasons)
-            if run_search and include_bptt_step:
+            if run_search and include_bptt_step and (
+                ls_rec is None or ls_rec.bptt is None
+                or ls_rec.bptt.batch1 is None or ls_rec.bptt.batch2 is None
+            ):
                 raise ReplayIncompleteError(
-                    f"step {step}: line-search requires BPTT replay payload when "
-                    "include_bptt; MVP disables this path — set w_bptt=0 or "
-                    "bptt_max_frac=0 under LS, or wait for BPTT payload wiring"
+                    f"step {step}: line-search BPTT replay payload missing"
                 )
             if run_search and tc_fns and (
                 ls_rec is None
@@ -13293,17 +13715,32 @@ def train_phase2(
                         torque_grad_scale=torque_step_scale,
                     )
 
+            if run_search and os.environ.get("P2_LS_REPLAY_DIAGNOSTIC") == "1":
+                # Same-parameter replay is a necessary condition for a valid
+                # stochastic line search.  Opt-in diagnostic for handoffs.
+                with replay_mgr.run_isolated(ls_rec):
+                    replay_F0 = _probe_F()
+                print(f"[line_search] replay invariance step {step + 1}: "
+                      f"F0={F0:.7g} replay={replay_F0:.7g} "
+                      f"delta={replay_F0 - F0:.7g}", flush=True)
+                if abs(replay_F0 - F0) > max(0.01, 1e-4 * abs(F0)):
+                    raise ReplayIncompleteError(
+                        f"step {step}: baseline/probe objective mismatch "
+                        f"{replay_F0 - F0:+.6g}"
+                    )
+
             ls_result = run_search_or_ordinary(
                 ls_rt,
                 j=ls_j,
                 run_search=run_search,
                 search_reasons=all_reasons,
                 F0=F0,
-                    g_preclip=g_preclip,
+                g_preclip=g_preclip,
                 probe_F=_probe_F,
                 g_objective=g_objective,
                 replay_ctx=replay_mgr,
                 replay_rec=ls_rec,
+                pre_activation_epsilon=(lr if cfg.line_search_cosine_before_activation else None),
             )
             ls_log = dict(ls_result.log)
             commit_side_effects = bool(ls_result.commit_side_effects)
@@ -13383,6 +13820,8 @@ def train_phase2(
 
         if update_executed:
             updates_executed += 1
+        if terminal_role is not None:
+            terminal_role.commit(role_result.violations, executed=update_executed)
 
         phase_timer.mark("critic")
 
@@ -13496,18 +13935,19 @@ def train_phase2(
             # training on noisy suffix states is the recovery signal; only the
             # structural pre-hit-waypoint check inside ``refresh`` can reject a
             # row here.
-            timing_parent_ok = _timing_mpc_parent_ingress_ok(gate.detach())
-            refreshed = timing_mpc_ring.refresh(
-                bucket, timing_parent_batch, _traj, hard_ok=timing_parent_ok,
-                generator=gen,
-            )
-            roll_acc["timing_mpc_refresh"] = (
-                roll_acc.get("timing_mpc_refresh", 0.0) + float(refreshed)
-            )
-            roll_acc["timing_mpc_parent_pool_size"] = (
-                roll_acc.get("timing_mpc_parent_pool_size", 0.0)
-                + float(timing_mpc_ring.size(bucket))
-            )
+            if cfg.timing_critic.primary_mpc_enabled:
+                timing_parent_ok = _timing_mpc_parent_ingress_ok(gate.detach())
+                refreshed = timing_mpc_ring.refresh(
+                    bucket, timing_parent_batch, _traj, hard_ok=timing_parent_ok,
+                    generator=gen,
+                )
+                roll_acc["timing_mpc_refresh"] = (
+                    roll_acc.get("timing_mpc_refresh", 0.0) + float(refreshed)
+                )
+                roll_acc["timing_mpc_parent_pool_size"] = (
+                    roll_acc.get("timing_mpc_parent_pool_size", 0.0)
+                    + float(timing_mpc_ring.size(bucket))
+                )
 
         if frontier_cloud is not None and commit_side_effects:
             _frontier_ema_from_traj(
@@ -13691,6 +14131,19 @@ def train_phase2(
                     rec["ls_u_mom_over_fresh_mean"] = (
                         roll_acc["ls_u_mom_over_fresh"] / ls_n
                     )
+            if terminal_role is not None:
+                rec.update({key: value / max(roll_acc.get("terminal_role_batches" if key.startswith("terminal_role_")
+                                                                      else "terminal_gradient_cap_visits", 0.), 1)
+                            for key, value in roll_acc.items()
+                            if key.startswith(("terminal_role_", "terminal_head_grad_", "terminal_rest_grad_"))
+                            or key in ("terminal_head_parameter_count", "terminal_rest_parameter_count")})
+                rec.update({key: value for key, value in roll_acc.items()
+                            if key.startswith("terminal_head_") and key.endswith("_grad_norm_probe")})
+                rec.update({"terminal_role_al_updates": terminal_role.committed_al_updates,
+                            "terminal_role_al_steps": terminal_role.al.steps})
+                rec.update({"terminal_role_al_"+k: v for k,v in terminal_role.weights.items()})
+                if (step+1) % cfg.eval_every == 0 or step+1 == cfg.log_every:
+                    rec.update(terminal_role.metrics(core, terminal_validation))
             if grad_term_probe is not None:
                 rec.update(grad_term_probe)
             if gb_stats:

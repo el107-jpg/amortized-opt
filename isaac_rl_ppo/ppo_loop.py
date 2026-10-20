@@ -1343,7 +1343,10 @@ class RolloutDriver:
         else:
             action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
-        delta = action - mean
+        # ``action`` is in raw, un-led waypoint coordinates. Use that same
+        # origin here: subtracting ``mean`` would cancel the trainable mean
+        # correction, leaving only exploration to affect the plant command.
+        delta = action - mpc.last_ref0
 
         cmd = executed_command(
             res.cmd, delta, prev_cmd=mpc.prev_cmd, step_max=mpc.step_max,

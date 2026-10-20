@@ -6,6 +6,14 @@ same states for the torque term; the spline coefficients give the velocity
 maxima and the smoothness integrals in closed form.  Everything is batched,
 differentiable, mask-aware and free of device->host syncs.
 
+Fresh ``physics_loss_version="geometry_v2"`` uses convex capsule/cylinder
+signed distance, shared arm capsules, held shorter-horizon limbs, and a 4 ms
+FOH command grid. Collision prices conservative between-sample clearance
+bounds; diagnostics separately report sampled clearance. Optional ``pd``
+geometry evaluates the saturated nominal PD surrogate. Terminal feasibility
+uses a hard candidate minimum with geometry and speed quality from ONE contact.
+Archived configs missing the version field retain the original loss.
+
 Term inventory
 --------------
 
@@ -124,6 +132,7 @@ from .constants import (
     HEAD_SPHERE,
     PD_SUBSTEPS,
     PELVIS_IN_ENV,
+    SHAFT_HIT_SPAN,
     SHAFT_TIP_CLEAR,
     STICK_LENGTH,
     STICK_MOUNT_POS_LEFT,
@@ -132,6 +141,8 @@ from .constants import (
     TIP_RADIUS,
     TORSO_CAPSULE,
     WRIST_RADIUS,
+    UPPER_ARM_RADIUS,
+    FOREARM_RADIUS,
     ready_joint_pos,
     static_torque_tighten_divisors,
     torque_limit_eta_scale,
@@ -186,7 +197,13 @@ from .strike import (
     strike_axial_limits,
     strike_elevation_required,
 )
-from .tspline import TrajectorySpline, TrajectorySplineBuilder
+from .tspline import TrajectorySpline, TrajectorySplineBuilder, SplineSamples
+from .target_contact import (target_top_entry_mask,target_upper_side_entry,
+                             target_v4_top_entry_mask,
+                             v4_contact_probe_distance,v4_impact_quality,v4_contact_selection)
+from .capsule_contact import capsule_sweep_distance,target_capsule_entry_mask
+from .convex_distance import capsule_cylinder_signed_distance
+from .collision_geometry import arm_capsules, temporal_clearance_bound
 
 __all__ = [
     "CostConfig",
@@ -232,6 +249,11 @@ class CostConfig:
     and the softplus warning sits at a fixed ``w_*`` (never × λ), so the
     weights below are the *relative* warning prices and are O(1)-ish.
     """
+
+    # Missing fields on archived checkpoints must retain their old objective.
+    physics_loss_version: str = "legacy"  # legacy | geometry_v2
+    geometry_motion_mode: str = "spline"  # spline | foh | pd
+    collision_temporal_bound: bool = False
 
     # ---------------------------------------------------------- sampling --
     #: Sub-samples per spline segment for the FK / SDF / RNEA pass.  1 = the
@@ -307,6 +329,10 @@ class CostConfig:
     #: ratio (7 / 50 = 0.14) instead: the harness scores speed MAGNITUDE and
     #: direction cosine, both of which a zero tangential weight leaves unpriced.
     terminal_a_tangential: float = 0.14
+    #: Additional v4 side-contact incidence and impact-quality residuals.
+    #: Zero under legacy costs, so archived checkpoints retain their objective.
+    terminal_a_incidence: float = 0.0
+    terminal_a_speed_quality: float = 0.0
     w_terminal_elev: float = 5.0
     #: Aim-frame axial band of the legal hit cylinder (outward normal).  Defaults
     #: to the interior 1 cm slab from the aim to the head surface; see
@@ -326,9 +352,19 @@ class CostConfig:
     #: ``"fd_coarse"`` = ``(p(q_k) - p(q_{k-1})) / dt`` -- the harness /
     #: FOH-plant convention.  ``"fd_fine"`` uses the spline sub-sample spacing.
     impact_velocity_mode: str = "fd_coarse"
+    #: ``isaac_v4`` qualifies target cymbal/hi-hat collisions by a prior
+    #: top-face entry or the upper 5 mm of the side, plus downward incidence.
+    #: Legacy checkpoints have no field and therefore retain timed exemptions.
+    contact_scoring_mode: str = "legacy"
+    v4_incidence_ratio: float = 1.5
+    v4_top_entry_depth_m: float = 0.10
+    v4_contact_proxy_margin_m: float = 0.003
+    v4_contact_softmin_temp: float = 0.002  # m; four discrete physical probes
 
     # ------------------------------------------------------- collision ----
     w_collision_drum: float = 100.0
+    #: Optional sampled top-entry contract; None retains the usual strike window.
+    target_top_entry_depth_m: float | None = None
     w_collision_under: float = 100.0
     w_collision_self: float = 100.0
     #: Price on the CROSS-HAND (stick vs stick) collision mean.  The three
@@ -710,6 +746,12 @@ class CostConfig:
     #: the hinge bites.  0.05 m fires on 4.9 % (left) / 2.1 % (right) of the
     #: recorded trajopt baseline poses.
     elbow_down_margin: float = 0.05
+    #: ReLU on a downward stick at the strike: ``relu(-u_z)`` of the
+    #: handle-to-tip axis in the pelvis frame.  Zero when the tip is level or
+    #: above the hand.  Snare and floor tom are exempt; those heads sit low
+    #: enough that a downward tip is the normal stroke.
+    w_tip_up: float = 0.0
+    tip_up_exempt_drums: tuple[str, ...] = ("snare", "floor_tom")
     beta_elbow: float = 0.02
     #: Port of trajopt's ``w_axial_twist``: a rank-1 quadratic on the net roll of
     #: each limb about its own long axis, measured from the ready pose.  Zero by
@@ -723,12 +765,25 @@ class CostConfig:
     reduction: str = "mean"
 
     def validate(self) -> "CostConfig":
+        if self.physics_loss_version not in ("legacy", "geometry_v2"):
+            raise ValueError(f"physics_loss_version={self.physics_loss_version!r}")
+        if self.geometry_motion_mode not in ("spline", "foh", "pd"):
+            raise ValueError(f"geometry_motion_mode={self.geometry_motion_mode!r}")
+        if self.n_sub < 1:
+            raise ValueError("n_sub must be positive")
         if self.physics_mode not in ("knot_fd", "spline"):
             raise ValueError(f"physics_mode={self.physics_mode!r}")
         if self.velocity_max_mode not in ("analytic", "subsample"):
             raise ValueError(f"velocity_max_mode={self.velocity_max_mode!r}")
         if self.contact_mode not in ("softmin", "spec"):
             raise ValueError(f"contact_mode={self.contact_mode!r}")
+        if self.contact_scoring_mode not in ("legacy", "isaac_v4", "isaac_v5"):
+            raise ValueError(f"contact_scoring_mode={self.contact_scoring_mode!r}")
+        if (self.v4_incidence_ratio <= 0 or self.v4_top_entry_depth_m <= 0
+                or self.v4_contact_softmin_temp <= 0
+                or self.v4_contact_proxy_margin_m < 0
+                or self.terminal_a_incidence < 0 or self.terminal_a_speed_quality < 0):
+            raise ValueError('Invalid differentiable v4 contact/scoring coefficients')
         if self.impact_velocity_mode not in ("fd_coarse", "fd_fine"):
             raise ValueError(f"impact_velocity_mode={self.impact_velocity_mode!r}")
         if self.box_source not in ("posture", "hard"):
@@ -849,8 +904,13 @@ class CostConfig:
             raise ValueError("arm_compact_height_scale must be >= 0")
         if self.arm_compact_radius_scale < 0.0:
             raise ValueError("arm_compact_radius_scale must be >= 0")
+        if self.w_tip_up < 0.0:
+            raise ValueError("w_tip_up must be >= 0")
         if self.terminal_axial_lo > self.terminal_axial_hi:
             raise ValueError("terminal_axial_lo must be <= terminal_axial_hi")
+        if self.target_top_entry_depth_m is not None and (
+            not math.isfinite(self.target_top_entry_depth_m) or self.target_top_entry_depth_m <= 0):
+            raise ValueError('target_top_entry_depth_m must be finite and positive')
         return self
 
 
@@ -896,6 +956,8 @@ class StrikeContext:
     #: frame-independent, so this is ``ContextInputs.drum_radius`` verbatim --
     #: one array, and the two cannot drift.
     drum_radii: torch.Tensor | None = None
+    #: Per-sample physical drum normals, matching randomized drum-axis tokens.
+    drum_axes: torch.Tensor | None = None
     #: ``(B, 2, P, 3)`` per-sample stick contact points in the WRIST frame, hand
     #: major (0 = left), ``P = 1 tip + n_shaft + 1 wrist`` in ``c_points`` order.
     #: Set this whenever the STICK is domain-randomized, for exactly the reason
@@ -933,6 +995,11 @@ class StrikeContext:
     #: P/R command harvested by the roller.  Sample 0 is then masked out of
     #: the reduction, matching ``waist_aim``.
     waist_pr_ref: torch.Tensor | None = None
+    #: Optional calibration-only target-head entry law. Replace the timed
+    #: target capsule exemption with physical-top entry up to this depth (m).
+    #: Source departure exemptions stay active. Side/underside entry before
+    #: top contact and wrists stay checked. None preserves the checkpoint law.
+    target_top_entry_depth_m: float | None = None
 
     @property
     def batch(self) -> int:
@@ -943,6 +1010,8 @@ class StrikeContext:
         for k, v in self.__dict__.items():
             if v is None:
                 out[k] = None
+            elif not isinstance(v, torch.Tensor):
+                out[k] = v
             elif v.dtype == torch.long:
                 out[k] = v.to(device)
             else:
@@ -1310,6 +1379,9 @@ class FusedCost:
         joint_names: tuple[str, ...] = G1_UPPER_BODY_JOINTS,
     ):
         self.cfg = (cfg or CostConfig()).validate()
+        self._capsule_distance = (capsule_cylinder_signed_distance
+                                 if self.cfg.physics_loss_version == "geometry_v2"
+                                 else segment_cylinder_sdf)
         self.device = torch.device(device)
         self.dtype = dtype
         self.dt = float(dt)
@@ -1330,6 +1402,14 @@ class FusedCost:
             under_depth=under_depth, under_clearance=under_clearance,
         )
         self.drum_index = {n: i for i, n in enumerate(self.scene.names)}
+        exempt = torch.zeros(len(self.scene.names), dtype=torch.bool, device=self.device)
+        for name, index in self.drum_index.items():
+            if name in self.cfg.tip_up_exempt_drums:
+                exempt[index] = True
+        self.c_tip_up_exempt = exempt
+        self.c_edge_hit = torch.as_tensor(
+            [shaft_hit_allowed(name) for name in self.scene.names],
+            dtype=torch.bool, device=self.device)
         self.spline = TrajectorySplineBuilder(
             max_segments=self.max_horizon, dt=self.dt,
             bc_start=bc_start, bc_end=bc_end, joint_names=self.joint_names,
@@ -1396,6 +1476,8 @@ class FusedCost:
         self.c_lower_a = t([x[1] for x in FIXED_LOWER_BODY_CAPSULES])
         self.c_lower_b = t([x[2] for x in FIXED_LOWER_BODY_CAPSULES])
         self.c_lower_r = t([x[3] for x in FIXED_LOWER_BODY_CAPSULES])
+        self._body_motion_offset = max(float(np.linalg.norm(TORSO_CAPSULE[0])),
+            float(np.linalg.norm(TORSO_CAPSULE[1])), float(np.linalg.norm(HEAD_SPHERE[0])))
 
         # Stick mount, per hand: contact(sigma) = p + R @ (mount_p + sigma*axis)
         self.c_mount_p, self.c_mount_axis = {}, {}
@@ -1449,6 +1531,8 @@ class FusedCost:
             if nm in self.joint_names:
                 row[self.joint_names.index(nm)] = 1.0
         self.c_waist_pr, self.c_waist_yaw = t(pr), t(yaw)
+        self.c_waist_pr_idx = torch.tensor(np.flatnonzero(pr).tolist(), device=dev, dtype=torch.long)
+        self._waist_yaw_index = int(np.flatnonzero(yaw)[0])
 
         # Actuator-class column indices for the split limit duals.  Built as
         # long tensors so ``index_select`` in the compiled cost is a gather.
@@ -1469,6 +1553,23 @@ class FusedCost:
 
         M0 = mass_matrix(self.rnea, self.q_ready.view(1, -1))
         self._m_diag_ready = torch.diagonal(M0, dim1=-2, dim2=-1).detach().squeeze(0)
+        self.c_motion_levers = {}
+        self.c_motion_axes = {}
+        for name, chain in self.fk._chains.items():
+            lever = np.zeros(self.n_dof)
+            axis_mask = np.zeros(self.n_dof)
+            links = np.linalg.norm(chain["p_np"], axis=-1)
+            for j, column in enumerate(chain["qidx_np"]):
+                lever[column] = links[j+1:].sum()+np.linalg.norm(chain["p_tail_np"])
+                axis_mask[column] = 1.0
+            self.c_motion_levers[name] = t(lever)
+            self.c_motion_axes[name] = t(axis_mask)
+        from .pd_sim import BatchedPDSim, PDSimConfig
+        self._geometry_pd = BatchedPDSim(PDSimConfig(dt=self.dt, substeps=cfg.n_sub,
+            kp_sigma=0, kd_sigma=0, saturate_effort=True,
+            saturate_derate=cfg.torque_derate, saturate_scale=cfg.torque_saturation_scale,
+            joint_names=self.joint_names),
+            device=self.device, dtype=self.dtype, rnea=self.rnea)
 
         # Group column indices (waist / left / right), for per-hand masks.
         # Warm BOTH spline caches here: they are built from Python lists, so a
@@ -1574,6 +1675,14 @@ class FusedCost:
         out = object.__new__(FusedCost)
         out.__dict__.update(self.__dict__)
         out.cfg = replace(self.cfg, **kw).validate()
+        from copy import copy
+        out._geometry_pd = copy(self._geometry_pd)
+        out._geometry_pd.cfg = replace(self._geometry_pd.cfg,
+            substeps=out.cfg.n_sub, saturate_derate=out.cfg.torque_derate,
+            saturate_scale=out.cfg.torque_saturation_scale)
+        out._capsule_distance = (capsule_cylinder_signed_distance
+                                 if out.cfg.physics_loss_version == "geometry_v2"
+                                 else segment_cylinder_sdf)
         # ``tau_hard`` is baked at construction; refresh when the soft-wrist
         # scoring scale changes so ``with_config`` stays honest.
         if "soft_wrist_effort_scale" in kw:
@@ -1637,6 +1746,55 @@ class FusedCost:
             if write_raw:
                 raw[key] = (h * m).sum(dim=(1, 2)) / denom
 
+    def _geometry_samples(self, sp, v0):
+        cfg = self.cfg
+        if cfg.geometry_motion_mode == "spline":
+            return sp.subsample(cfg.n_sub, include_end=True)
+        command = sp.subsample_foh(cfg.n_sub)
+        if cfg.geometry_motion_mode == "foh":
+            return command
+        # Frozen per-knot coupled inertia, nominal runtime gains, hard effort
+        # saturation. This plant is a surrogate and has no contact impulses.
+        sim = self._geometry_pd
+        with torch.no_grad():
+            from .pd_sim import mass_matrix
+            q_mass = sp.x_held[:, :-1]
+            if q_mass.dtype not in (torch.float32, torch.float64):
+                q_mass = q_mass.float()
+            shape = q_mass.shape
+            matrix = mass_matrix(sim.rnea, q_mass.reshape(-1, self.n_dof))
+            # Physical effective inertia is positive definite. inv_ex avoids
+            # a CUDA->host error-check synchronization in this hot path.
+            mobility = torch.linalg.inv_ex(matrix, check_errors=False).inverse.reshape(
+                shape[0], shape[1], self.n_dof, self.n_dof).to(sp.x.dtype)
+        _, _, _, q, qd = sim.rollout(sp.x_held, qa0=sp.x[:, 0], va0=v0,
+            Minv=mobility, substeps=cfg.n_sub, return_substeps=True)
+        zero = torch.zeros_like(q)
+        return SplineSamples(q, qd, zero, zero, command.mask, command.t, cfg.n_sub)
+
+    def _geometry_speed_bounds(self, sp, samples, ctx):
+        h = self.dt/self.cfg.n_sub
+        if self.cfg.geometry_motion_mode == "spline":
+            # Exact joint-rate bound over the whole cubic segment.
+            rate = sp.segment_velocity_max_analytic().repeat_interleave(self.cfg.n_sub, 1)
+            rate = torch.cat((torch.zeros_like(rate[:, :1]), rate), dim=1)
+        else:
+            # FOH commands / piecewise-linear PD state interpolation.
+            rate = (samples.q[:, 1:]-samples.q[:, :-1]).abs()/h
+            rate = torch.cat((torch.zeros_like(rate[:, :1]), rate), dim=1)
+        speeds = {}
+        for name in self.c_motion_levers:
+            speeds[name] = (rate*self.c_motion_levers[name]).sum(-1)
+        for hi, hand in enumerate(_HANDS):
+            local = self.c_points[hand] if ctx.stick_points_local is None else ctx.stick_points_local[:, hi]
+            offset = torch.linalg.vector_norm(local, dim=-1).amax(-1)
+            if offset.ndim:
+                offset = offset[:, None]
+            speeds[f"{hand}_stick"] = speeds[f"{hand}_wrist"] + (
+                rate*self.c_motion_axes[f"{hand}_wrist"]).sum(-1)*offset
+        speeds["body"] = speeds["torso"] + self._body_motion_offset*(rate*self.c_motion_axes["torso"]).sum(-1)
+        return speeds
+
     # ------------------------------------------------------------ forward --
     def forward(
         self,
@@ -1650,6 +1808,8 @@ class FusedCost:
         weights: dict[str, torch.Tensor | float] | None = None,
         aux_mode: str | None = None,
         aux_tau_kernel: torch.Tensor | None = None,
+        constraint_capture: dict[str, torch.Tensor] | None = None,
+        constraint_profile_capture: dict[str, torch.Tensor] | None = None,
     ) -> CostTerms:
         cfg = self.cfg
         if lengths is None:
@@ -1658,8 +1818,16 @@ class FusedCost:
             else:
                 lengths = self._lengths_from_context(ctx)
         sp = self.spline.build(q0, waypoints, v0, lengths)
-        ss = sp.subsample(cfg.n_sub, include_end=True)
+        ss = self._geometry_samples(sp, v0)
         B, S, D = ss.q.shape
+        constraint_mask = None
+        active_hand_constraints_only = getattr(self, 'calibration_active_hand_only', False)
+        if active_hand_constraints_only:
+            constraint_mask = q0.new_ones(B, 1, D)
+            for hi, hand in enumerate(_HANDS):
+                constraint_mask[:, :, self._gcols[hand]] = ctx.active[:, hi, None, None]
+            ss.mask = ss.mask * constraint_mask
+            sp.seg_mask = sp.seg_mask * constraint_mask
 
         # Per-hand sample validity: a sample counts for a hand if that hand's
         # joints are inside its horizon at that sample.
@@ -1735,7 +1903,18 @@ class FusedCost:
                 lim_a, device=ss.q.device, dtype=ss.q.dtype
             ).view(1, 1, D)
 
-        self._collision(frames, B, S, ctx, m_hand, raw, viol, live, diag, counts, sp)
+        collision_masks = m_hand
+        if cfg.physics_loss_version == "geometry_v2" and not active_hand_constraints_only:
+            # A shorter-horizon arm remains physically present, held at its
+            # terminal command (or continuing under PD) while the other moves.
+            collision_masks = {h: m_any for h in _HANDS}
+        speeds = (self._geometry_speed_bounds(sp, ss, ctx)
+                  if cfg.collision_temporal_bound else None)
+        self._collision(frames, B, S, ctx, collision_masks, raw, viol, live, diag, counts, sp,
+                        constraint_capture=constraint_capture,
+                        profile_capture=constraint_profile_capture,
+                        active_hand_constraints_only=active_hand_constraints_only,
+                        speed_bounds=speeds)
         tau = None
         if cfg.torque_static_only:
             self._torque_off(
@@ -1753,14 +1932,19 @@ class FusedCost:
                 else:
                     torque_full_blend = 0.0
             tau = self._torque(
-                sp, ss, v0, B, S, D, ctx, raw, viol, live, diag, counts, lim_a,
+                sp, (sp.subsample(cfg.n_sub) if cfg.physics_mode == "spline" else ss),
+                v0, B, S, D, ctx, raw, viol, live, diag, counts, lim_a,
                 torque_full_blend=torque_full_blend,
+                constraint_capture=constraint_capture,
+                constraint_mask=constraint_mask,
+                profile_capture=constraint_profile_capture,
             )
         if cfg.w_torque_static > 0.0 or (
             cfg.torque_static_only and cfg.torque_static_al
         ):
             self._torque_static(
                 sp, ss, v0, B, S, D, raw, viol, live, diag, counts, lim_a,
+                constraint_mask=constraint_mask,
             )
         # TRACKING TORQUE.  Entirely behind a trace-time python branch: with
         # both weights at 0 (the default) not one tensor of it is created, and
@@ -1770,21 +1954,46 @@ class FusedCost:
         if self.track_torque_on:
             tau_track = self._track_torque(
                 sp, v0, B, D, raw, viol, live, diag, counts, lim_a,
+                constraint_mask=constraint_mask,
             )
         else:
             z = ss.q.new_zeros(B)
             diag["track_torque_excess_mean"] = z
             diag["track_torque_excess_max"] = z
             diag["track_torque_max"] = z
-        self._velocity(sp, raw, viol, live, diag, counts, lim_a)
+        self._velocity(sp, raw, viol, live, diag, counts, lim_a,
+                       geometry_samples=ss if cfg.physics_loss_version == "geometry_v2" else None,
+                       constraint_capture=constraint_capture)
         wp_mask = elem_mask if elem_mask is not None else sp.seg_mask
+        if elem_mask is not None and constraint_mask is not None:
+            wp_mask = wp_mask * constraint_mask
+        continuous_bounds = None
+        if cfg.physics_loss_version == "geometry_v2":
+            if cfg.geometry_motion_mode == "spline":
+                continuous_bounds = sp.segment_position_bounds()
+            elif cfg.geometry_motion_mode == "pd":
+                dense = ss.q[:, 1:].reshape(B, sp.max_segments, cfg.n_sub, D)
+                continuous_bounds = (dense.amin(2), dense.amax(2))
+                if not active_hand_constraints_only:
+                    wp_mask = wp_mask.amax(-1, keepdim=True).expand_as(wp_mask)
         self._joint_box(
             waypoints, wp_mask, raw, viol, live, diag, counts, w["waist_box"], lim_a,
+            continuous_bounds=continuous_bounds,
         )
+        if constraint_capture is not None:
+            _, lo, hi = self._joint_box_hard_limits(w["waist_box"])
+            lower = waypoints if continuous_bounds is None else torch.minimum(waypoints, continuous_bounds[0])
+            upper = waypoints if continuous_bounds is None else torch.maximum(waypoints, continuous_bounds[1])
+            constraint_capture["joint_lo"] = torch.where(
+                wp_mask > .5, lo-lower, -1e3).amax(1)
+            constraint_capture["joint_hi"] = torch.where(
+                wp_mask > .5, upper-hi, -1e3).amax(1)
         self._smoothness(sp, raw, diag, counts)
         self._posture(sp, frames, ss, B, S, ctx, raw, diag, counts)
         self._waist_pr_band(waypoints, wp_mask, B, ctx, raw, viol, live)
-        self._terminal(sp, ctx, raw, viol, live, diag, counts)
+        self._terminal(sp, ctx, raw, viol, live, diag, counts,
+                       geometry_samples=ss if cfg.physics_loss_version == "geometry_v2" else None,
+                       constraint_capture=constraint_capture)
 
         # Warning (no λ): softplus / curriculum at ``cfg.w_*``.  Hard wall
         # ``λ [g]₊`` is added below over ``TERM_FOR_GROUP``.  Default λ=1 when
@@ -1800,6 +2009,8 @@ class FusedCost:
             + (cfg.w_terminal_elev * w["terminal_elev"]) * raw["terminal_elev"]
         )
         terms["terminal_aim"] = cfg.w_terminal_aim * raw["terminal_aim"]
+        # Downward-tip ReLU at the strike.  Exactly zero at ``w_tip_up = 0``.
+        terms["tip_up"] = cfg.w_tip_up * raw["tip_up"]
         # Mean collision is a margin-softplus warning at ``cfg.w_collision_*``;
         # ``w["collision"]`` (λ) does not scale it.  The peak is already a
         # ReLU reduction, priced as ``λ_peak * w_collision_peak * raw_peak``
@@ -1991,7 +2202,9 @@ class FusedCost:
             local = per.repeat_interleave(reps, dim=0) if reps > 1 else per
         return ChainFK.points_world(R, p, local.to(p.dtype))
 
-    def _collision(self, frames, B, S, ctx, m_hand, raw, viol, live, diag, counts, sp) -> None:
+    def _collision(self, frames, B, S, ctx, m_hand, raw, viol, live, diag, counts, sp,
+                   *, constraint_capture=None, active_hand_constraints_only=False, profile_capture=None,
+                   speed_bounds=None) -> None:
         cfg = self.cfg
         dtype = self.c_heads.dtype
         D = self.n_drums
@@ -2004,7 +2217,10 @@ class FusedCost:
         pen_s = 0.0
         v_max = None
         min_sdf = None
+        sampled_min_sdf = None
         n_seen = 0.0
+        arm_pen = 0.0
+        arm_seen = 0.0
         # The smooth-max half is built from the SAME hinges the means reduce,
         # collected flat and concatenated so ONE :func:`smooth_max` sees every
         # (knot, capsule/wrist, drum) pair of both hands and all three collision
@@ -2017,10 +2233,18 @@ class FusedCost:
         #: Each hand's world sample points, kept for the CROSS-HAND block after
         #: the loop -- the per-hand pass already pays for the transform.
         pts_by_hand: dict[str, torch.Tensor] = {}
+        arms_by_hand = {}
+        def swept(sdf, mask, speed):
+            return (temporal_clearance_bound(sdf, mask, speed, self.dt/n_sub)
+                    if speed_bounds is not None else sdf)
+        def record_sampled(sdf, mask):
+            nonlocal sampled_min_sdf
+            value = torch.where(mask > .5, sdf, 1e3).reshape(B, -1).amin(-1)
+            sampled_min_sdf = value if sampled_min_sdf is None else torch.minimum(sampled_min_sdf, value)
         # Domain randomization moves the drums; when the caller supplies the
         # per-sample head centres (fix B) the collision scene is rebuilt from
         # them, so it agrees with the terminal cost and the goal tokens.
-        if ctx.drum_head_centers is None:
+        if ctx.drum_head_centers is None and ctx.drum_axes is None:
             body_c = self.c_body_c.view(1, 1, D, 3)
             under_c = self.c_under_c.view(1, 1, D, 3)
         else:
@@ -2028,8 +2252,10 @@ class FusedCost:
             # has however many the layout defines. Row i is drum id i in both
             # (both are sorted by the layout's ``id``), so a prefix slice lines
             # them up.
-            heads_b = ctx.drum_head_centers[:, :D].to(dtype)   # (B, D, 3)
-            axb = self.c_axes.view(1, D, 3)
+            heads_b = (self.c_heads[None].expand(B, -1, -1) if ctx.drum_head_centers is None
+                       else ctx.drum_head_centers[:, :D].to(dtype))
+            axb = (self.c_axes.view(1, D, 3) if ctx.drum_axes is None
+                   else F.normalize(ctx.drum_axes[:, :D].to(dtype), dim=-1))
             body_c = (heads_b - self.c_half_h.view(1, D, 1) * axb).view(B, 1, D, 3)
             under_top_b = heads_b - self.c_heights_uc.view(1, D, 1) * axb
             under_c = (under_top_b - self.c_under_off * axb).view(B, 1, D, 3)
@@ -2041,12 +2267,15 @@ class FusedCost:
             rad = self.c_radii.view(1, 1, D)
         else:
             rad = ctx.drum_radii[:, :D].to(dtype).view(B, 1, D)
-        ax = self.c_axes.view(1, 1, D, 3)
+        ax = (self.c_axes.view(1, 1, D, 3) if ctx.drum_axes is None else
+              F.normalize(ctx.drum_axes[:, :D].to(dtype), dim=-1).view(B, 1, D, 3))
         half_h = self.c_half_h.view(1, 1, D)
         under_half = self.c_under_half.view(1, 1, D)
 
         for hi, hand in enumerate(_HANDS):
             pts = self._points_world(frames, hand, ctx).reshape(B, S, P, 3)
+            hand_arm_min = pts.new_full((B,), 1e3)
+            hand_arm_max = pts.new_zeros(B)
             pts_by_hand[hand] = pts
             tip_w, butt_w, wrist_w = pts[:, :, 0], pts[:, :, 1], pts[:, :, -1]
 
@@ -2056,6 +2285,10 @@ class FusedCost:
             win_strike = (s_idx >= first_exempt.view(-1, 1)).to(dtype)  # (B,S)
             last_start = cfg.start_exempt_waypoints * n_sub
             win_start = (s_idx <= last_start).to(dtype).expand(B, S)
+            start_age = getattr(ctx, 'start_contact_age_s', None)
+            if start_age is not None:
+                win_start = ((s_idx.to(dtype)*self.spline.dt/n_sub+
+                    start_age[:, hi, None]) <= cfg.start_exempt_waypoints*self.spline.dt+1e-7).to(dtype)
             if cfg.start_exempt_waypoints <= 0:
                 win_start = torch.zeros_like(win_start)
 
@@ -2076,24 +2309,134 @@ class FusedCost:
             w_cap = (1.0 - ex_cap) * smask.unsqueeze(-1)  # (B,S,D)
             w_wr = smask.unsqueeze(-1).expand(B, S, D)
 
-            cap_b = segment_cylinder_sdf(
+            cap_b = self._capsule_distance(
                 butt_w.unsqueeze(2), tip_w.unsqueeze(2),
                 body_c, ax, rad, half_h, ra=self.c_stick_r,
             )
-            cap_u = segment_cylinder_sdf(
+            cap_u = self._capsule_distance(
                 butt_w.unsqueeze(2), tip_w.unsqueeze(2),
                 under_c, ax, rad, under_half, ra=self.c_stick_r,
             )
+            w_cap_under = w_cap
+            top_entry_depth = getattr(ctx, 'target_top_entry_depth_m', None)
+            if top_entry_depth is None:
+                top_entry_depth = cfg.target_top_entry_depth_m
+            entry_distance = None
+            if top_entry_depth is not None or cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                batch = torch.arange(B, device=self.device)
+                target = tgt.clamp_min(0)
+                heads = self.c_heads[None].expand(B, -1, -1) if ctx.drum_head_centers is None else ctx.drum_head_centers[:, :D]
+                radii = self.c_radii[None].expand(B, -1) if ctx.drum_radii is None else ctx.drum_radii[:, :D]
+                target_axis = ax.expand(B, -1, -1, -1)[batch, 0, target]
+                edge = self.c_edge_hit[target] & (tgt >= 0)
+                side_allowed = torch.zeros(B, S, device=self.device, dtype=torch.bool)
+                side_repair = torch.zeros(B, S, device=self.device, dtype=dtype)
+                target_body_sdf = torch.minimum(cap_b[batch, :, target], cap_u[batch, :, target])
+                if cfg.contact_scoring_mode == 'isaac_v5':
+                    axis_stick=F.normalize(tip_w-butt_w,dim=-1)
+                    playing_start=tip_w-SHAFT_HIT_SPAN*axis_stick
+                    physical_height=torch.minimum(2*self.c_half_h[target],
+                        torch.full_like(self.c_half_h[target],cfg.v4_top_entry_depth_m))
+                    allowed_top,entries,top_repair,side_allowed=target_capsule_entry_mask(
+                        playing_start,tip_w,heads[batch,target],target_axis,radii[batch,target],
+                        physical_height,cap_b[batch,:,target],dt=self.spline.dt/n_sub,
+                        already_contacting_source=(src==tgt)&(tgt>=0),
+                        incidence_ratio=cfg.v4_incidence_ratio,
+                        contact_margin=cfg.v4_contact_proxy_margin_m)
+                    side_repair=top_repair
+                    side_allowed &= edge[:,None]
+                elif cfg.contact_scoring_mode == 'isaac_v4':
+                    _side_geometry, _probe_incidence, side_allowed, side_repair = target_upper_side_entry(
+                        pts[:, :, :-1], heads[batch, target], target_axis, radii[batch, target],
+                        self.c_pt_radii[:-1].to(dtype), cap_b[batch, :, target],
+                        dt=self.spline.dt/n_sub, incidence_ratio=cfg.v4_incidence_ratio,
+                        contact_margin=cfg.v4_contact_proxy_margin_m)
+                    side_allowed &= edge[:, None]
+                    physical_height=torch.minimum(2*self.c_half_h[target],
+                        torch.full_like(self.c_half_h[target],cfg.v4_top_entry_depth_m))
+                    if top_entry_depth is not None:
+                        physical_height=torch.minimum(physical_height,
+                            torch.full_like(physical_height,float(top_entry_depth)))
+                    allowed_top, entries, top_repair = target_v4_top_entry_mask(
+                        pts[:, :, :-1],heads[batch,target],target_axis,radii[batch,target],
+                        physical_height,self.c_pt_radii[:-1].to(dtype),cap_b[batch,:,target],
+                        dt=self.spline.dt/n_sub,
+                        already_contacting_source=(src==tgt)&(tgt>=0),
+                        incidence_ratio=cfg.v4_incidence_ratio,
+                        contact_margin=cfg.v4_contact_proxy_margin_m)
+                else:
+                    tip_sigma = (torch.full_like(ctx.contact_sigma[:, hi], STICK_TIP_SIGMA)
+                                 if ctx.stick_tip_sigma is None else ctx.stick_tip_sigma[:, hi])
+                    axis_stick = F.normalize(tip_w-butt_w, dim=-1)
+                    low = high = ctx.contact_sigma[:, hi]
+                    if cfg.contact_mode != 'spec':
+                        shaft = ctx.shaft_allowed[:, hi] > .5
+                        low = torch.where(shaft, torch.full_like(low, CYMBAL_CONTACT_SIGMA_FALLBACK), low)
+                        high = torch.where(shaft, tip_sigma, high)
+                    contact_a = tip_w+(low-tip_sigma)[:, None, None]*axis_stick
+                    contact_b = tip_w+(high-tip_sigma)[:, None, None]*axis_stick
+                    allowed_top, entries, top_repair = target_top_entry_mask(
+                        butt_w,tip_w,contact_a,contact_b,heads[batch,target],target_axis,
+                        radii[batch,target],target_body_sdf,
+                        stick_radius=self.c_stick_r,depth=top_entry_depth,
+                        already_contacting_source=(src==tgt)&(tgt>=0),
+                        return_repair_distance=True)
+                if cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                    allowed = torch.where(edge[:, None],
+                                          (allowed_top | side_allowed) & (win_strike > .5),
+                                          win_strike > .5)
+                    penetrating = target_body_sdf < -1e-6
+                    previous_penetrating = torch.cat((torch.zeros(B, 1, device=self.device,
+                        dtype=torch.bool), penetrating[:, :-1]), dim=1)
+                    episode_start = penetrating & ~previous_penetrating
+                    top_direction = torch.where(top_repair > 1e-7, top_repair,
+                        torch.full_like(top_repair, 1e3))
+                    entry_distance = torch.where(edge[:, None] & episode_start & ~allowed,
+                        torch.minimum(top_direction, side_repair), torch.zeros_like(side_repair))
+                    diag[f'v4_upper_side_exempt_samples_{hand}'] = (
+                        (side_allowed & allowed)*smask).sum(1).detach()
+                    diag[f'v4_top_exempt_samples_{hand}'] = (
+                        (allowed_top & allowed & edge[:, None])*smask).sum(1).detach()
+                else:
+                    allowed, entry_distance = allowed_top, top_repair
+                if constraint_capture is not None:
+                    repair = entry_distance * smask * (ctx.active[:, hi] > .5)[:, None]
+                    constraint_capture[f'head_entry_{hand}'] = repair.amax(1, keepdim=True)
+                allowed &= (ctx.active[:, hi] > .5)[:, None]
+                source_exempt = win_start.unsqueeze(-1)*oh_s.unsqueeze(1)
+                target_exempt = allowed.to(dtype).unsqueeze(-1)*oh_t.unsqueeze(1)
+                w_cap = (1-(source_exempt+target_exempt).clamp_max(1))*smask.unsqueeze(-1)
+                w_cap_under = w_cap
+                diag[f'target_top_entry_exempt_samples_{hand}'] = (
+                    (allowed_top & allowed)*smask).sum(1).detach()
+                diag[f'target_top_entry_first_time_s_{hand}'] = torch.where(
+                    entries & (smask > .5) & (ctx.active[:, hi] > .5)[:, None],
+                    s_idx.expand(B, -1).to(dtype)*self.spline.dt/n_sub,
+                    torch.full((B, S), float('inf'), device=self.device, dtype=dtype)).amin(1).detach()
             wr_x = wrist_w.unsqueeze(2)  # (B,S,1,3) broadcasts vs (.,1,D,3)
             sdf_wb = point_cylinder_sdf(wr_x, body_c, ax, rad, half_h) - self.c_wrist_r
             sdf_wu = point_cylinder_sdf(wr_x, under_c, ax, rad, under_half) - self.c_wrist_r
+            for distance, mask in ((cap_b, w_cap), (cap_u, w_cap_under),
+                                    (sdf_wb, w_wr), (sdf_wu, w_wr)):
+                record_sampled(distance, mask)
+            if speed_bounds is not None:
+                # Entry certification above uses sampled physical geometry;
+                # only collision pricing receives conservative interval bounds.
+                cap_b = swept(cap_b, w_cap, speed_bounds[f"{hand}_stick"])
+                cap_u = swept(cap_u, w_cap_under, speed_bounds[f"{hand}_stick"])
+                sdf_wb = swept(sdf_wb, w_wr, speed_bounds[f"{hand}_wrist"])
+                sdf_wu = swept(sdf_wu, w_wr, speed_bounds[f"{hand}_wrist"])
             hdc = _softplus_hinge(cfg.collision_margin - cap_b, cfg.beta_collision)
+            if entry_distance is not None:
+                # A differentiable approach penalty accompanies the unchanged
+                # physical entry gate, including when no SQP capture is requested.
+                hdc = hdc + entry_distance.unsqueeze(-1) * oh_t.unsqueeze(1)
             huc = _softplus_hinge(cfg.collision_margin - cap_u, cfg.beta_collision)
             hdw = _softplus_hinge(cfg.collision_margin - sdf_wb, cfg.beta_collision)
             huw = _softplus_hinge(cfg.collision_margin - sdf_wu, cfg.beta_collision)
 
             # --- time-bucketed drum collision (diagnostic only) ---------
-            hsum = ((hdc + huc) * w_cap + (hdw + huw) * w_wr).sum(dim=2)
+            hsum = (hdc*w_cap + huc*w_cap_under + (hdw + huw)*w_wr).sum(dim=2)
             hcnt = (w_cap + w_wr).sum(dim=2).clamp_min(1.0)
             hps = hsum / hcnt                               # (B, S)
             k_wp = k.float().view(B, 1)
@@ -2113,7 +2456,7 @@ class FusedCost:
                 ).detach()
 
             hand_pen_d = (hdc * w_cap + hdw * w_wr).sum(dim=(1, 2))
-            hand_pen_u = (huc * w_cap + huw * w_wr).sum(dim=(1, 2))
+            hand_pen_u = (huc * w_cap_under + huw * w_wr).sum(dim=(1, 2))
             hand_n = (w_cap + w_wr).sum(dim=(1, 2))
             pen_d = pen_d + hand_pen_d
             pen_u = pen_u + hand_pen_u
@@ -2143,13 +2486,91 @@ class FusedCost:
             )
             sdf_self_st = torch.minimum(torch.minimum(s_t, s_h), s_lower_st)
             sdf_self_wr = torch.minimum(torch.minimum(s_wt, s_wh), s_lower_wr)
+            record_sampled(sdf_self_st, smask)
+            record_sampled(sdf_self_wr, smask)
+            if speed_bounds is not None:
+                sdf_self_st = swept(sdf_self_st, smask, speed_bounds[f"{hand}_stick"]+speed_bounds["body"])
+                sdf_self_wr = swept(sdf_self_wr, smask, speed_bounds[f"{hand}_wrist"]+speed_bounds["body"])
+
+            # Both arm capsules are physical obstacles even for target drums.
+            # Shoulder/torso connected overlap is excluded, as in pose cost.
+            if cfg.physics_loss_version == "geometry_v2":
+                arms = arm_capsules(frames, B, S, hand)
+                arms_by_hand[hand] = arms
+                for label, p0, p1, radius in arms:
+                    speed = None
+                    if speed_bounds is not None:
+                        first = "shoulder" if label == "upper" else "elbow"
+                        second = "elbow" if label == "upper" else "wrist"
+                        speed = torch.maximum(speed_bounds[f"{hand}_{first}"],
+                                              speed_bounds[f"{hand}_{second}"])
+                    arm_body = self._capsule_distance(p0[:, :, None], p1[:, :, None],
+                        body_c, ax, rad, half_h, ra=radius)
+                    arm_under = self._capsule_distance(p0[:, :, None], p1[:, :, None],
+                        under_c, ax, rad, under_half, ra=radius)
+                    arm_head = segment_segment_sdf(p0, p1, hc, hc, radius, self.c_head_r)
+                    arm_lower, _ = fixed_capsule_self_sdf(p0, p1, wrist_w,
+                        self.c_lower_a, self.c_lower_b, self.c_lower_r,
+                        stick_radius=radius, wrist_radius=self.c_wrist_r)
+                    arm_self = torch.minimum(arm_head, arm_lower)
+                    if label == "forearm":
+                        arm_self = torch.minimum(arm_self,
+                            segment_segment_sdf(p0, p1, a, b, radius, self.c_torso_r))
+                    else:
+                        # Upper arm and the same hand's stick/wrist are
+                        # nonadjacent; the forearm/wrist junction is connected.
+                        arm_self = torch.minimum(arm_self, torch.minimum(
+                            segment_segment_sdf(p0, p1, butt_w, tip_w, radius, self.c_stick_r),
+                            segment_segment_sdf(p0, p1, wrist_w, wrist_w, radius, self.c_wrist_r)))
+                    record_sampled(arm_body, w_wr)
+                    record_sampled(arm_under, w_wr)
+                    record_sampled(arm_self, smask)
+                    if speed is not None:
+                        arm_body = swept(arm_body, w_wr, speed)
+                        arm_under = swept(arm_under, w_wr, speed)
+                        other_speed = speed_bounds["body"]
+                        if label == "upper":
+                            other_speed = torch.maximum(other_speed, speed_bounds[f"{hand}_stick"])
+                        arm_self = swept(arm_self, smask, speed+other_speed)
+                    for kind, distance, mask in (("body", arm_body, w_wr),
+                        ("under", arm_under, w_wr), ("self", arm_self, smask)):
+                        hinge = _softplus_hinge(cfg.collision_margin-distance, cfg.beta_collision)
+                        arm_pen = arm_pen+(hinge*mask).reshape(B, -1).sum(-1)
+                        arm_seen = arm_seen+mask.reshape(B, -1).sum(-1)
+                        penetration = (-distance).clamp_min(0)*mask
+                        arm_max = penetration.reshape(B, -1).amax(-1)
+                        hand_arm_max = torch.maximum(hand_arm_max, arm_max)
+                        v_max = arm_max if v_max is None else torch.maximum(v_max, arm_max)
+                        arm_min = torch.where(mask > .5, distance, 1e3).reshape(B, -1).amin(-1)
+                        hand_arm_min = torch.minimum(hand_arm_min, arm_min)
+                        min_sdf = arm_min if min_sdf is None else torch.minimum(min_sdf, arm_min)
+                        if want_peak:
+                            peak_h.append(penetration.reshape(B, -1))
+                            peak_m.append(mask.reshape(B, -1))
+                        if constraint_capture is not None:
+                            constraint_capture[f"collision_{hand}_{label}_{kind}"] = torch.where(
+                                mask > .5, -distance, -1e3).amax(1).reshape(B, -1)
+                        if profile_capture is not None:
+                            profile_capture[f"collision_{hand}_{label}_{kind}"] = torch.where(
+                                mask > .5, -distance, -1e3).reshape(B, S, -1)
+            if constraint_capture is not None or profile_capture is not None:
+                for label, sdf, mask in (
+                    ("body", cap_b, w_cap), ("under", cap_u, w_cap_under),
+                    ("wrist_body", sdf_wb, w_wr), ("wrist_under", sdf_wu, w_wr),
+                    ("self_stick", sdf_self_st, smask), ("self_wrist", sdf_self_wr, smask),
+                ):
+                    signed = torch.where(mask > .5, -sdf, -1e3)
+                    if constraint_capture is not None:
+                        constraint_capture[f"collision_{hand}_{label}"] = signed.amax(1).reshape(B, -1)
+                    if profile_capture is not None:
+                        profile_capture[f"collision_{hand}_{label}"] = signed.reshape(B, S, -1)
             hs_st = _softplus_hinge(cfg.collision_margin - sdf_self_st, cfg.beta_collision)
             hs_wr = _softplus_hinge(cfg.collision_margin - sdf_self_wr, cfg.beta_collision)
             pen_s = pen_s + (hs_st * smask + hs_wr * smask).sum(dim=1)
 
             # --- raw violation (penetration depth), for the multipliers -------
             vdc = torch.where(w_cap > 0.5, (-cap_b).clamp_min(0.0), torch.zeros_like(cap_b))
-            vuc = torch.where(w_cap > 0.5, (-cap_u).clamp_min(0.0), torch.zeros_like(cap_u))
+            vuc = torch.where(w_cap_under > 0.5, (-cap_u).clamp_min(0.0), torch.zeros_like(cap_u))
             vdw = torch.where(w_wr > 0.5, (-sdf_wb).clamp_min(0.0), torch.zeros_like(sdf_wb))
             vuw = torch.where(w_wr > 0.5, (-sdf_wu).clamp_min(0.0), torch.zeros_like(sdf_wu))
             vs_st = (-sdf_self_st).clamp_min(0.0) * smask
@@ -2170,7 +2591,7 @@ class FusedCost:
                 peak_h += [vdc.reshape(B, -1), vuc.reshape(B, -1),
                            vdw.reshape(B, -1), vuw.reshape(B, -1),
                            vs_st, vs_wr]
-                peak_m += [w_cap.reshape(B, -1), w_cap.reshape(B, -1),
+                peak_m += [w_cap.reshape(B, -1), w_cap_under.reshape(B, -1),
                            w_wr.reshape(B, -1), w_wr.reshape(B, -1),
                            smask, smask]
             hand_max = torch.maximum(
@@ -2180,12 +2601,13 @@ class FusedCost:
                     torch.maximum(vs_st.amax(dim=1), vs_wr.amax(dim=1)),
                 ),
             )
+            hand_max = torch.maximum(hand_max, hand_arm_max)
             v_max = hand_max if v_max is None else torch.maximum(v_max, hand_max)
             big = 1.0e3
             msd = torch.minimum(
                 torch.minimum(
                     torch.where(w_cap > 0.5, cap_b, big).amin(dim=(1, 2)),
-                    torch.where(w_cap > 0.5, cap_u, big).amin(dim=(1, 2)),
+                    torch.where(w_cap_under > 0.5, cap_u, big).amin(dim=(1, 2)),
                 ),
                 torch.minimum(
                     torch.where(w_wr > 0.5, sdf_wb, big).amin(dim=(1, 2)),
@@ -2199,6 +2621,7 @@ class FusedCost:
                     torch.where(smask > 0.5, sdf_self_wr, big).amin(dim=1),
                 ),
             )
+            msd = torch.minimum(msd, hand_arm_min)
             min_sdf = msd if min_sdf is None else torch.minimum(min_sdf, msd)
 
             # Per-hand breakdown.  The recorded trajopt baseline freezes its idle
@@ -2242,10 +2665,32 @@ class FusedCost:
                 cross_hand_sdf(l_wr, l_wr, r_wr, r_wr, rw, rw),
             ),
         )                                                       # (B, S)
+        if cfg.physics_loss_version == "geometry_v2":
+            pieces = {}
+            for hand, points in (("left", pl), ("right", pr)):
+                pieces[hand] = [(points[:, :, 1], points[:, :, 0], rs),
+                                (points[:, :, -1], points[:, :, -1], rw)]
+                pieces[hand] += [(a, b, radius) for _, a, b, radius in arms_by_hand[hand]]
+            for li, (a0, a1, radius_l) in enumerate(pieces["left"]):
+                for ri, (b0, b1, radius_r) in enumerate(pieces["right"]):
+                    if li < 2 and ri < 2:
+                        continue  # already included above
+                    sdf_x = torch.minimum(sdf_x,
+                        cross_hand_sdf(a0, a1, b0, b1, radius_l, radius_r))
         # A sample counts only where BOTH hands are inside their horizon: past
         # it the frames are the held tail and the two sticks are not
         # simultaneously real.
         wx = m_hand["left"] * m_hand["right"]                    # (B, S)
+        if cfg.w_stick_stick > 0:
+            record_sampled(sdf_x, wx)
+        if speed_bounds is not None:
+            # Stick speed bounds dominate the corresponding wrist/arm origins.
+            sdf_x = swept(sdf_x, wx, speed_bounds["left_stick"]+speed_bounds["right_stick"])
+        if constraint_capture is not None:
+            constraint_capture["collision_cross"] = torch.where(
+                wx > .5, -sdf_x, -1e3).amax(1, keepdim=True)
+        if profile_capture is not None:
+            profile_capture['collision_cross'] = torch.where(wx > .5, -sdf_x, -1e3).reshape(B, S, -1)
         hx = _softplus_hinge(cfg.collision_margin - sdf_x, cfg.beta_collision)
         n_x = wx.sum(dim=1)
         pen_x = (hx * wx).sum(dim=1)
@@ -2279,6 +2724,10 @@ class FusedCost:
         diag["collision_stick_min_sdf"] = torch.where(
             n_x > 0.5, msd_x, sdf_x.amin(dim=1)
         ).detach()
+        if active_hand_constraints_only:
+            # A masked cross-hand pair must not fail the calibration gate via
+            # the diagnostic fallback that normally reports raw clearance.
+            diag["collision_stick_min_sdf"] = msd_x.detach()
         counts["collision_stick"] = n_x.detach()
 
         # --- tip lateral ordering (plain objective; not AL) -----------------
@@ -2331,6 +2780,8 @@ class FusedCost:
         raw["collision_drum"] = pen_d / denom
         raw["collision_under"] = pen_u / denom
         raw["collision_self"] = pen_s / denom
+        if cfg.physics_loss_version == "geometry_v2":
+            raw["collision_self"] = raw["collision_self"] + arm_pen/arm_seen.clamp_min(1)
         if want_peak:
             hcat = torch.cat(peak_h, dim=1)
             mcat = torch.cat(peak_m, dim=1)
@@ -2351,6 +2802,8 @@ class FusedCost:
         live["collision"] = coll_live
         live["collision_peak"] = coll_live
         diag["collision_min_sdf"] = min_sdf.detach()
+        diag["collision_sampled_min_sdf"] = sampled_min_sdf.detach()
+        diag["collision_temporal_bound_gap"] = (sampled_min_sdf-min_sdf).clamp_min(0).detach()
         diag["collision_pen_max"] = coll_live.detach()
         # Per-type breakdown (the three sub-costs before weighting)
         diag["collision_drum"] = raw["collision_drum"].detach()
@@ -2439,6 +2892,7 @@ class FusedCost:
 
     def _torque_static(
         self, sp, ss, v0, B, S, D, raw, viol, live, diag, counts, lim_alpha=None,
+        *, constraint_mask=None,
     ) -> None:
         """Gravity-only static torque: τ_g = RNEA(q, 0, 0).
 
@@ -2455,6 +2909,8 @@ class FusedCost:
             mask = (idx <= sp.lengths.unsqueeze(1)).to(q.dtype)
         else:
             q, mask = ss.q, ss.mask
+        if constraint_mask is not None:
+            mask = mask * constraint_mask
         n = q.shape[1]
         q_flat = q.reshape(B * n, D)
         zd = torch.zeros_like(q_flat)
@@ -2525,7 +2981,8 @@ class FusedCost:
         return tau_g + m_diag * qdd_flat
 
     def _torque(self, sp, ss, v0, B, S, D, ctx, raw, viol, live, diag, counts,
-                lim_alpha=None, *, torque_full_blend: float = 1.0) -> torch.Tensor:
+                lim_alpha=None, *, torque_full_blend: float = 1.0,
+                constraint_capture=None, constraint_mask=None, profile_capture=None) -> torch.Tensor:
         """RNEA torque against ``eta_torque`` x the effort limits.
 
         Two reductions, both returned:
@@ -2575,6 +3032,8 @@ class FusedCost:
             mask = (idx <= sp.lengths.unsqueeze(1)).to(q.dtype)
         else:
             q, qd, qdd, mask = ss.q, ss.qd, ss.qdd, ss.mask
+        if constraint_mask is not None:
+            mask = mask * constraint_mask
         n = q.shape[1]
         q_flat = q.reshape(B * n, D)
         qd_flat = qd.reshape(B * n, D)
@@ -2603,6 +3062,13 @@ class FusedCost:
             derate=cfg.torque_derate,
         )
         lim = self.c_torque_eta.view(1, 1, D) * lim_hard
+        if profile_capture is not None:
+            profile_capture['torque_tau'] = tau
+            profile_capture['torque_available'] = lim_hard.expand_as(tau)
+            profile_capture['torque_mask'] = mask
+        if constraint_capture is not None:
+            constraint_capture["torque"] = torch.where(
+                mask > .5, tau.abs()-lim_hard, -1e3).amax(1)
         excess = tau.abs() - lim
         h = _softplus_hinge(excess, cfg.beta_torque)
         ss = _Rates(q, qd, qdd, mask)  # local alias for the reductions below
@@ -2664,7 +3130,7 @@ class FusedCost:
 
     # ---------------------------------------------------- tracking torque --
     def _track_torque(self, sp, v0, B, D, raw, viol, live, diag, counts,
-                      lim_alpha=None) -> torch.Tensor:
+                      lim_alpha=None, *, constraint_mask=None) -> torch.Tensor:
         """The torque the PD servo DEMANDS while tracking this plan.
 
         ``tau_hat[t] = tau_rnea[t] + tau_fb[t]`` per (waypoint, joint), where
@@ -2711,6 +3177,8 @@ class FusedCost:
             sp.max_segments + 1, device=q.device, dtype=torch.long
         ).view(1, -1, 1)
         mask = (idx <= sp.lengths.unsqueeze(1)).to(q.dtype)
+        if constraint_mask is not None:
+            mask = mask * constraint_mask
         lim_hard = available_torque_torch(
             qd, self.tau_hard.view(1, 1, D), self.v_hard.view(1, 1, D),
             eta=1.0, saturation_scale=cfg.torque_saturation_scale,
@@ -2866,7 +3334,7 @@ class FusedCost:
 
     # ----------------------------------------------------------- velocity --
     def _velocity(self, sp: TrajectorySpline, raw, viol, live, diag, counts,
-                  lim_alpha=None) -> None:
+                  lim_alpha=None, *, constraint_capture=None, geometry_samples=None) -> None:
         cfg = self.cfg
         B = sp.x.shape[0]
         # Off path: no segment-max |qd|, no hinge, no peak.  A run that does
@@ -2891,34 +3359,43 @@ class FusedCost:
             diag["velocity_max"] = z.detach()
             counts["velocity"] = z.detach()
             return
-        vmax = (
-            sp.segment_velocity_max_analytic()
-            if cfg.velocity_max_mode == "analytic"
-            else sp.segment_velocity_max(cfg.n_vel_probe)
-        )  # (B, H, n)
+        velocity_mask = sp.seg_mask
+        if geometry_samples is not None and cfg.geometry_motion_mode == "foh":
+            vmax = (sp.x_held[:, 1:]-sp.x_held[:, :-1]).abs()/sp.dt
+        elif geometry_samples is not None and cfg.geometry_motion_mode == "pd":
+            vmax = geometry_samples.qd[:, 1:].reshape(
+                B, sp.max_segments, cfg.n_sub, self.n_dof).abs().amax(2)
+            velocity_mask = velocity_mask.amax(-1, keepdim=True).expand_as(velocity_mask)
+        else:
+            vmax = (sp.segment_velocity_max_analytic()
+                if cfg.velocity_max_mode == "analytic"
+                else sp.segment_velocity_max(cfg.n_vel_probe))
         lim_hard = self.v_hard.view(1, 1, -1)
+        if constraint_capture is not None:
+            constraint_capture["velocity"] = torch.where(
+                velocity_mask > .5, vmax-lim_hard, -1e3).amax(1)
         h = _softplus_hinge(vmax - cfg.eta_velocity * lim_hard, cfg.beta_velocity)
         # Per-joint price on the hinge, before the mean; ``over`` below is the
         # unscaled excess the augmented Lagrangian reads.  See ``forward``.
         val, cnt = self._reduce(
-            h if lim_alpha is None else h * lim_alpha, sp.seg_mask, (1, 2)
+            h if lim_alpha is None else h * lim_alpha, velocity_mask, (1, 2)
         )
         raw["velocity"] = val
         counts["velocity"] = cnt.detach()
-        over = (vmax - lim_hard).clamp_min(0.0) * sp.seg_mask
+        over = (vmax - lim_hard).clamp_min(0.0) * velocity_mask
         vel_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
         viol["velocity"] = vel_live.detach()
         live["velocity"] = vel_live
         h_priced = h if lim_alpha is None else h * lim_alpha
         self._emit_limit_segments(
-            "velocity", over, h_priced, sp.seg_mask, cnt, raw, viol, live,
+            "velocity", over, h_priced, velocity_mask, cnt, raw, viol, live,
         )
         peak_live = over.amax(dim=(1, 2))
         diag["velocity_excess_max"] = peak_live.detach()
         diag["velocity_max"] = vmax.amax(dim=(1, 2)).detach()
         if cfg.w_velocity_peak > 0.0:
             raw["velocity_peak"] = smooth_max(
-                over, sp.seg_mask, cfg.velocity_peak_mode, cfg.velocity_peak_p,
+                over, velocity_mask, cfg.velocity_peak_mode, cfg.velocity_peak_p,
                 cfg.velocity_peak_temp, dims=(1, 2),
             )
             viol["velocity_peak"] = peak_live.detach()
@@ -2953,7 +3430,7 @@ class FusedCost:
         return half, lo_hard, hi_hard
 
     def _joint_box(self, waypoints, wp_mask, raw, viol, live, diag, counts,
-                   w_waist_box=1.0, lim_alpha=None) -> None:
+                   w_waist_box=1.0, lim_alpha=None, *, continuous_bounds=None) -> None:
         """Decoder waypoints against the (optionally waist-narrowed) box.
 
         The warning is a mean softplus over valid ``(waypoint, joint)`` pairs.
@@ -2969,16 +3446,21 @@ class FusedCost:
         cfg = self.cfg
         half, lo_hard, hi_hard = self._joint_box_hard_limits(w_waist_box)
         dev = (waypoints - self.q_mid.view(1, 1, -1)).abs()
+        if continuous_bounds is not None:
+            low, high = continuous_bounds
+            dev = torch.maximum(dev, torch.maximum(
+                (low-self.q_mid.view(1, 1, -1)).abs(),
+                (high-self.q_mid.view(1, 1, -1)).abs()))
         h = _softplus_hinge(dev - half, cfg.beta_position)
         val, cnt = self._reduce(
             h if lim_alpha is None else h * lim_alpha, wp_mask, (1, 2)
         )
         raw["joint_box"] = val
         counts["joint_box"] = cnt.detach()
-        over = (
-            torch.maximum(lo_hard - waypoints, waypoints - hi_hard)
-            .clamp_min(0.0) * wp_mask
-        )
+        excess = torch.maximum(lo_hard-waypoints, waypoints-hi_hard)
+        if continuous_bounds is not None:
+            excess = torch.maximum(excess, torch.maximum(lo_hard-low, high-hi_hard))
+        over = excess.clamp_min(0)*wp_mask
         box_live = over.sum(dim=(1, 2)) / cnt.clamp_min(1.0)
         viol["joint_box"] = box_live.detach()
         live["joint_box"] = box_live
@@ -3145,7 +3627,7 @@ class FusedCost:
         # (w=100 vs tether 5), which is how dumps taught the head.
         m_pr = ss.mask * self.c_waist_pr.view(1, 1, -1)
         if ctx.waist_pr_ref is not None:
-            pr_idx = self.c_waist_pr.nonzero(as_tuple=True)[0]  # (2,) pitch, roll
+            pr_idx = self.c_waist_pr_idx
             pr_ref = ctx.waist_pr_ref  # (B, H, 2)
             H_ref = pr_ref.shape[1]
             n_sub = int(cfg.n_sub)
@@ -3299,8 +3781,8 @@ class FusedCost:
                 torch.zeros_like(yaw_ref_ss),
             ], dim=-1)  # (B, S, 3)
             # Waist column indices in joint order
-            yaw_i = int(self.c_waist_yaw.nonzero(as_tuple=True)[0][0])
-            pr_idx = self.c_waist_pr.nonzero(as_tuple=True)[0]  # (2,)
+            yaw_i = self._waist_yaw_index
+            pr_idx = self.c_waist_pr_idx
             # Reorder to [yaw, pitch, roll] matching waist_aim convention
             names = self.joint_names
             waist_order = []
@@ -3341,7 +3823,7 @@ class FusedCost:
         # makes every negative increment expensive, including the very first
         # command.  Deceleration is free as long as position keeps increasing.
         if ctx.waist_yaw_ref is not None:
-            yaw_i = int(self.c_waist_yaw.nonzero(as_tuple=True)[0][0])
+            yaw_i = self._waist_yaw_index
             q_yaw = ss.q[:, :, yaw_i]
             # One monotonic segment ends at the NEAREST active hit.  Samples
             # after that are deliberately unpriced: when the hit fires MPC
@@ -3362,10 +3844,11 @@ class FusedCost:
                 endpoint_delta.sign(),
                 torch.zeros_like(endpoint_delta),
             ).detach()
-            # Causal stop-gradient on the preceding sample: a wrong-way step
-            # is repaired by moving the CURRENT sample in the desired direction,
-            # never by dragging the already-earlier sample backward to meet it.
-            dq = q_yaw[:, 1:] - q_yaw[:, :-1].detach()
+            # The measured boundary q0 is fixed data in the solve, while every
+            # spline sample is a decision-dependent value.  Differentiate
+            # through both sides of each increment so the raw scalar's gradient
+            # matches finite differences of the value used by line search.
+            dq = q_yaw[:, 1:] - q_yaw[:, :-1]
             sample_i = torch.arange(
                 1, ss.q.shape[1], device=ss.q.device, dtype=torch.long,
             ).view(1, -1)
@@ -3432,7 +3915,7 @@ class FusedCost:
             viol["waist_pr_band"] = z
             live["waist_pr_band"] = z
             return
-        pr_idx = self.c_waist_pr.nonzero(as_tuple=True)[0]  # (2,) pitch, roll
+        pr_idx = self.c_waist_pr_idx
         # When no encoder SP head is active, treat the reference as upright
         # (zero pitch/roll) so the band becomes "stay within band_rad of vertical".
         if ctx.waist_pr_ref is None:
@@ -3462,7 +3945,8 @@ class FusedCost:
 
     # ---------------------------------------------------------- terminal ---
     def _terminal(self, sp: TrajectorySpline, ctx: StrikeContext,
-                  raw, viol, live, diag, counts) -> None:
+                  raw, viol, live, diag, counts, *, constraint_capture=None,
+                  geometry_samples=None) -> None:
         cfg = self.cfg
         B = sp.x.shape[0]
         dtype = sp.x.dtype
@@ -3473,13 +3957,20 @@ class FusedCost:
         aim = sp.x.new_zeros(B)
         vel = sp.x.new_zeros(B)
         elev_pen = sp.x.new_zeros(B)
+        tip_acc = sp.x.new_zeros(B)
         n_act = sp.x.new_zeros(B)
         d_pos, d_speed, d_elev, d_cos = [], [], [], []
 
         for hi, hand in enumerate(_HANDS):
             k = ctx.hit_index[:, hi].clamp(1, sp.max_segments)
             q_k = sp.knot(k)
-            if cfg.impact_velocity_mode == "fd_coarse":
+            if geometry_samples is not None:
+                index = k*cfg.n_sub
+                stride = cfg.n_sub if cfg.impact_velocity_mode == "fd_coarse" else 1
+                gather = lambda i: geometry_samples.q.gather(1,
+                    i[:, None, None].expand(-1, 1, self.n_dof)).squeeze(1)
+                q_k, q_p = gather(index), gather(index-stride)
+            elif cfg.impact_velocity_mode == "fd_coarse":
                 q_p = sp.knot(k - 1)
             else:
                 # one sub-sample step back along the spline
@@ -3519,11 +4010,19 @@ class FusedCost:
             b_k = base_k + sig_hi.unsqueeze(-1) * u_k
             a_p = base_p + sig_lo.unsqueeze(-1) * u_p
             b_p = base_p + sig_hi.unsqueeze(-1) * u_p
+            has_half_plane = ctx.has_half_plane[:, hi]
+            if cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                # Isaac credits top-face entry anywhere on a cymbal/hi-hat.
+                # Keep the near-side aim as a soft preference, not a hard
+                # contact-region boundary inherited from older trajopt.
+                edge = self.c_edge_hit[ctx.target_drum[:, hi].clamp_min(0)]
+                has_half_plane = torch.where(edge,torch.zeros_like(has_half_plane),
+                                             has_half_plane)
             _dmin, s_star, p_c, cand_s, dist, valid = segment_hit_region(
                 a_k, b_k,
                 ctx.p_star[:, hi], ctx.n_out[:, hi], ctx.hit_radius[:, hi],
                 ctx.disk_offset[:, hi], ctx.half_plane_dir[:, hi],
-                ctx.has_half_plane[:, hi],
+                has_half_plane,
                 cfg.terminal_axial_lo, cfg.terminal_axial_hi,
                 return_candidates=True,
             )
@@ -3537,8 +4036,14 @@ class FusedCost:
             wgt = torch.softmax(logits, dim=-1)
             act = ctx.active[:, hi]
 
-            reg = reg + act * (wgt * _softplus_hinge(dist, cfg.beta_terminal)).sum(-1)
-            reg_raw = reg_raw + act * (wgt * dist).sum(-1)
+            region_row = (wgt * _softplus_hinge(dist, cfg.beta_terminal)).sum(-1)
+            region_raw_row = (wgt * dist).sum(-1)
+            if cfg.physics_loss_version == "geometry_v2":
+                # Feasibility is a union, not a Boltzmann weighted mean.
+                index = (dist+1e3*(1-valid)).argmin(-1)
+                wgt = F.one_hot(index, dist.shape[-1]).to(dtype)
+                region_raw_row = (wgt*dist).sum(-1)
+                region_row = _softplus_hinge(region_raw_row, cfg.beta_terminal)
             # In-plane distance to the AIM (do not subtract ``disk_offset``:
             # toms/cymbals aim off-centre, and the pull is toward the star the
             # strike asked for).  Deadband then a region-style softplus so the
@@ -3550,7 +4055,7 @@ class FusedCost:
             aim_excess = (
                 rho_aim - float(cfg.terminal_aim_deadband_m)
             ).clamp_min(0.0)
-            aim = aim + act * (
+            aim_row = (
                 wgt * _softplus_hinge(aim_excess, cfg.beta_terminal)
             ).sum(-1)
 
@@ -3565,7 +4070,7 @@ class FusedCost:
                 cfg.terminal_a_normal * along * along
                 + cfg.terminal_a_tangential * perp2.clamp_min(0.0)
             )
-            vel = vel + act * (wgt * vcost).sum(-1)
+            velocity_row = (wgt * vcost).sum(-1)
 
             # stick elevation band on |elev|
             # Interior clamp: ``asin'(±1)`` is inf, and ``clamp`` onto the pole
@@ -3582,18 +4087,129 @@ class FusedCost:
                 + _softplus_hinge(el - hi_, cfg.beta_elev)
             )
             elev_pen = elev_pen + act * ctx.elev_required[:, hi] * ep
+            # Tip-up: penalize a handle-to-tip axis that points below horizontal.
+            # Snare and floor tom stay free so a downward stroke there is not taxed.
+            down = (-u_k[:, 2]).clamp_min(0.0)
+            drum = ctx.target_drum[:, hi]
+            n_drums = int(self.c_tip_up_exempt.numel())
+            known = (drum >= 0) & (drum < n_drums)
+            is_exempt = self.c_tip_up_exempt[drum.clamp(0, max(n_drums - 1, 0))] & known
+            keep = act * (~is_exempt).to(dtype)
+            tip_acc = tip_acc + keep * down
             n_act = n_act + act
 
             # diagnostics at the selected capsule contact (what the harness scores)
             pk = p_c
             pp = a_p + s_star.unsqueeze(-1) * d_ab_p
             vspec = (pk - pp) / dt
-            d_pos.append(
-                act * torch.sqrt(((pk - ctx.p_star[:, hi]) ** 2).sum(-1) + 1e-12)
-            )
+            position_row = torch.sqrt(((pk - ctx.p_star[:, hi]) ** 2).sum(-1) + 1e-12)
             sp_ = torch.sqrt((vspec * vspec).sum(-1) + 1e-12)
-            d_speed.append(act * (sp_ - speed_star.squeeze(1)).abs())
-            d_cos.append(act * (vspec * nv.squeeze(1)).sum(-1) / sp_.clamp_min(1e-9))
+            speed_row = (sp_ - speed_star.squeeze(1)).abs()
+            cosine_row = (vspec * nv.squeeze(1)).sum(-1) / sp_.clamp_min(1e-9)
+
+            if cfg.contact_scoring_mode in ('isaac_v4','isaac_v5'):
+                # The actual tracker tests separate tip/shaft probe centres,
+                # not a free point on the playing-shaft segment. Score the
+                # union of swept top entry and upper-side contact for those
+                # probes; keep the legacy contact region for membrane heads.
+                target = ctx.target_drum[:, hi].clamp(0, self.n_drums-1)
+                edge = self.c_edge_hit[target]
+                rows = torch.arange(B, device=self.device)
+                head = (self.c_heads[target] if ctx.drum_head_centers is None else
+                        ctx.drum_head_centers[rows, target])
+                radius = (self.c_radii[target] if ctx.drum_radii is None else
+                          ctx.drum_radii[rows, target])
+                height = 2*self.c_half_h[target]
+                if cfg.contact_scoring_mode=='isaac_v5':
+                    mount_k=base_k+(tip_s-SHAFT_HIT_SPAN)[:,None]*u_k
+                    mount_p=base_p+(tip_s-SHAFT_HIT_SPAN)[:,None]*u_p
+                    bead_k=base_k+tip_s[:,None]*u_k
+                    bead_p=base_p+tip_s[:,None]*u_p
+                    (contact_distance,top_distance,side_distance,_fractions,
+                     probe_k,probe_p)=capsule_sweep_distance(
+                        mount_p,bead_p,mount_k,bead_k,head,ctx.n_out[:,hi],
+                        radius,height,dt=dt,incidence_ratio=cfg.v4_incidence_ratio)
+                else:
+                    probe_local=self.c_points[hand][:-1].to(dtype)
+                    if ctx.stick_points_local is not None:
+                        probe_local=ctx.stick_points_local[:,hi,:-1].to(dtype)
+                    probe_k=ChainFK.points_world(R[:B],p[:B],probe_local)
+                    probe_p=ChainFK.points_world(R[B:],p[B:],probe_local)
+                    probe_radius=self.c_pt_radii[:-1].to(dtype)
+                    contact_distance, top_distance, side_distance = v4_contact_probe_distance(
+                        probe_p,probe_k,head,ctx.n_out[:, hi],radius,height,
+                        probe_radius,dt=dt,incidence_ratio=cfg.v4_incidence_ratio)
+                v4_weights = torch.softmax(-contact_distance/cfg.v4_contact_softmin_temp,dim=-1)
+                v4_region = (v4_weights*_softplus_hinge(contact_distance,
+                                                        cfg.beta_terminal)).sum(-1)
+                v4_region_raw = (v4_weights*contact_distance).sum(-1)
+                probe_delta = probe_k-ctx.p_star[:, hi, None]
+                probe_axial = (probe_delta*ctx.n_out[:, hi, None]).sum(-1)
+                probe_planar = probe_delta-probe_axial[..., None]*ctx.n_out[:, hi, None]
+                probe_aim = (torch.linalg.vector_norm(probe_planar,dim=-1)
+                             -cfg.terminal_aim_deadband_m).clamp_min(0.)
+                v4_aim = (v4_weights*_softplus_hinge(probe_aim,
+                                                    cfg.beta_terminal)).sum(-1)
+                probe_v = (probe_k-probe_p)/dt
+                delta_v = probe_v-vs
+                along_v4 = (delta_v*nv).sum(-1)
+                perp_v4 = (delta_v*delta_v).sum(-1)-along_v4.square()
+                (normal_speed,tangential_speed,speed_quality,
+                 incidence_excess,quality_deficit) = v4_impact_quality(
+                    probe_v,ctx.n_out[:, hi, None],speed_star,
+                    incidence_ratio=cfg.v4_incidence_ratio)
+                complete_distance = None
+                if cfg.physics_loss_version == "geometry_v2":
+                    # One probe must satisfy geometry/incidence AND speed
+                    # quality. Convert quality deficit to a displacement scale
+                    # for the existing metre-valued terminal AL residual.
+                    v4_weights, complete_distance = v4_contact_selection(
+                        contact_distance, quality_deficit, speed_star, dt=dt)
+                    v4_region = (v4_weights*_softplus_hinge(contact_distance,
+                                                           cfg.beta_terminal)).sum(-1)
+                    v4_region_raw = complete_distance
+                    v4_aim = (v4_weights*_softplus_hinge(probe_aim,
+                                                        cfg.beta_terminal)).sum(-1)
+                v4_velocity_candidates=(cfg.terminal_a_normal*along_v4.square()
+                    +cfg.terminal_a_tangential*perp_v4.clamp_min(0.)
+                    +cfg.terminal_a_incidence*incidence_excess.square()
+                    +cfg.terminal_a_speed_quality*quality_deficit.square())
+                v4_velocity=(v4_weights*v4_velocity_candidates).sum(-1)
+                v4_position=(v4_weights*torch.linalg.vector_norm(probe_delta,dim=-1)).sum(-1)
+                v4_speed=(v4_weights*(torch.linalg.vector_norm(probe_v,dim=-1)
+                                    -speed_star).abs()).sum(-1)
+                v4_cosine=(v4_weights*(probe_v*nv).sum(-1)
+                           /torch.linalg.vector_norm(probe_v,dim=-1).clamp_min(1e-9)).sum(-1)
+                region_row = torch.where(edge,v4_region,region_row)
+                region_raw_row = torch.where(edge,v4_region_raw,region_raw_row)
+                aim_row = torch.where(edge,v4_aim,aim_row)
+                velocity_row = torch.where(edge,v4_velocity,velocity_row)
+                position_row = torch.where(edge,v4_position,position_row)
+                speed_row = torch.where(edge,v4_speed,speed_row)
+                cosine_row = torch.where(edge,v4_cosine,cosine_row)
+                monitor=act*edge.to(dtype)
+                diag[f'v4_geometric_min_distance_{hand}'] = (
+                    monitor*contact_distance.amin(-1)).detach()
+                diag[f'v4_top_contact_distance_{hand}'] = (
+                    monitor*(v4_weights*top_distance).sum(-1)).detach()
+                diag[f'v4_side_contact_distance_{hand}'] = (
+                    monitor*(v4_weights*side_distance).sum(-1)).detach()
+                diag[f'v4_normal_impact_speed_{hand}'] = (
+                    monitor*(v4_weights*normal_speed).sum(-1)).detach()
+                diag[f'v4_tangential_impact_speed_{hand}'] = (
+                    monitor*(v4_weights*tangential_speed).sum(-1)).detach()
+                diag[f'v4_speed_quality_{hand}'] = (
+                    monitor*(v4_weights*speed_quality).sum(-1)).detach()
+                diag[f'v4_incidence_excess_{hand}'] = (
+                    monitor*(v4_weights*incidence_excess).sum(-1)).detach()
+
+            reg = reg + act*region_row
+            reg_raw = reg_raw + act*region_raw_row
+            aim = aim + act*aim_row
+            vel = vel + act*velocity_row
+            d_pos.append(act*position_row)
+            d_speed.append(act*speed_row)
+            d_cos.append(act*cosine_row)
             d_elev.append(act * torch.rad2deg(el))
 
         den = n_act.clamp_min(1.0)
@@ -3601,6 +4217,8 @@ class FusedCost:
         raw["terminal_aim"] = aim / den
         raw["terminal_velocity"] = vel / den
         raw["terminal_elev"] = elev_pen / den
+        raw["tip_up"] = tip_acc / den
+        diag["tip_up_down"] = raw["tip_up"].detach()
         # Raw violation = distance OUTSIDE the legal hit region (0 when on head).
         term_live = reg_raw / den
         viol["terminal"] = term_live.detach()
@@ -3610,4 +4228,13 @@ class FusedCost:
         diag["contact_speed_err"] = (sum(d_speed) / den).detach()
         diag["contact_dir_cos"] = (sum(d_cos) / den).detach()
         diag["stick_elev_deg"] = (sum(d_elev) / den).detach()
+        elevation_by_hand = torch.stack(d_elev, dim=-1)
+        diag["stick_elev_deg_per_hand"] = elevation_by_hand.detach()
+        if constraint_capture is not None:
+            constraint_capture["direction"] = (.5-sum(d_cos)/den)[:, None]
+            required = (ctx.active > .5) & (ctx.elev_required > .5)
+            constraint_capture["elev_lo"] = torch.where(required,
+                STICK_ELEV_MIN_DEG-elevation_by_hand, -1e3)
+            constraint_capture["elev_hi"] = torch.where(required,
+                elevation_by_hand-STICK_ELEV_MAX_DEG, -1e3)
         counts["terminal"] = n_act.detach()

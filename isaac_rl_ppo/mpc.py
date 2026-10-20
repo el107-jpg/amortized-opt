@@ -55,7 +55,7 @@ from amortized_opt.lead import LEAD_PRESETS, lead_fraction, lead_waypoints, reso
 from amortized_opt.limits import ETA_VELOCITY, isaac_velocity_limits, urdf_position_limits
 from amortized_opt.model import ContextEncoding
 from amortized_opt.tokenizer import ContextInputs, build_waypoint_masks
-from amortized_opt.train_cost import ramp_seed
+from amortized_opt.train_cost import group_lengths, ramp_seed
 from amortized_opt.strike_seed import accelerating_path_torch
 from amortized_opt.warmstart import (
     GoalPoseLibrary, arm_slice, seed_waist_pr_to_sp, update_waist_pr_ema,
@@ -138,6 +138,10 @@ class MPCConfig:
     #: Bound, rad, on the |BC state - measured| offset the token may carry --
     #: see ``isaac_rl.mpc.MPCConfig.yaw_cond_leash``.
     yaw_cond_leash: float = 0.35
+    descent_accept: bool = False
+    descent_alphas: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625)
+    descent_min_abs: float = 1.0e-4
+    descent_min_rel: float = 1.0e-6
 
 
 @dataclass

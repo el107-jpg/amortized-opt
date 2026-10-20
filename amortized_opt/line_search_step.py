@@ -8,6 +8,7 @@ evaluation still lives next to the live objective assembly in ``train_cost``
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -242,6 +243,15 @@ def build_objective_direction_fingerprint(
         "torque_grad_cap": float(
             getattr(phase2_cfg, "torque_grad_cap", 0.0) or 0.0
         ),
+        "terminal_head_grad_fraction_cap": float(getattr(phase2_cfg, "terminal_head_grad_fraction_cap", 0.3)),
+        "terminal_head_grad_cap_mode": getattr(phase2_cfg, "terminal_head_grad_cap_mode", "combined_l2"),
+        "terminal_role_checkpoint": getattr(phase2_cfg, "terminal_role_checkpoint", None),
+        "terminal_role_w_com": getattr(phase2_cfg, "terminal_role_w_com", None),
+        "terminal_role_dynamic_al": bool(getattr(phase2_cfg, "terminal_role_dynamic_al", False)),
+        "terminal_role_al_lam_max": getattr(phase2_cfg, "terminal_role_al_lam_max", None),
+        "w_elbow_down": getattr(cost_cfg, "w_elbow_down", None),
+        "w_arm_compact": getattr(cost_cfg, "w_arm_compact", None),
+        "w_terminal_role": float(getattr(phase2_cfg, "w_terminal_role", 1.0)),
         "torque_grad_cap_refresh": int(
             getattr(phase2_cfg, "torque_grad_cap_refresh", 1) or 1
         ),
@@ -336,6 +346,7 @@ def build_objective_direction_fingerprint(
           else {}),
         "grad_clip": float(getattr(phase2_cfg, "grad_clip", 0.0) or 0.0),
         "strict_actual_update": bool(ls_cfg.strict_actual_update),
+        "retry_retained_rate": bool(ls_cfg.retry_retained_rate),
         "reject_current_probe_increase": bool(
             ls_cfg.reject_current_probe_increase
         ),
@@ -385,11 +396,19 @@ def init_line_search_runtime(
         # veto behavior behind the CLI's back.
         ls_cfg = dataclasses_replace(
             ls_cfg,
+            # A caller can explicitly raise the minimum meaningful probe rate
+            # on a same-objective resume without losing optimizer/AL/selector
+            # state.  Omitted CLI bounds retain the checkpoint values.
+            epsilon_min=(ls_cfg.epsilon_min if requested_cfg.epsilon_min is None
+                         else requested_cfg.epsilon_min),
+            epsilon_max=(ls_cfg.epsilon_max if requested_cfg.epsilon_max is None
+                         else requested_cfg.epsilon_max),
             actual_update_diagnostic_every=int(
                 requested_cfg.actual_update_diagnostic_every
             ),
             moment_on=str(requested_cfg.moment_on),
             strict_actual_update=bool(requested_cfg.strict_actual_update),
+            retry_retained_rate=bool(requested_cfg.retry_retained_rate),
             reject_current_probe_increase=bool(
                 requested_cfg.reject_current_probe_increase
             ),
@@ -562,6 +581,21 @@ def fixed_epsilon_rate(rt: LineSearchRuntime) -> float:
     )
 
 
+def _record_selection_failure(
+    rt: LineSearchRuntime, *, last_tried_epsilon: float | None,
+    epsilon_min: float,
+) -> None:
+    retry_seed = (
+        rt.ctrl.last_selected_epsilon
+        if rt.cfg.retry_retained_rate else last_tried_epsilon
+    )
+    on_selection_failure(
+        rt.ctrl, rt.accept, last_tried_epsilon=retry_seed,
+        fallback_shrink=float(rt.cfg.fallback_shrink),
+        epsilon_min=float(epsilon_min),
+    )
+
+
 def resolve_known_search(rt: LineSearchRuntime) -> tuple[bool, list[str], int]:
     """Return ``(known_search, reasons, j)`` for proposed update ``j = u+1``."""
     j = int(rt.ctrl.successful_update_count) + 1
@@ -617,6 +651,7 @@ def run_search_or_ordinary(
     g_objective: Sequence[Tensor | None] | None = None,
     replay_ctx: ObjectiveReplayContext | None = None,
     replay_rec: ReplayRecord | None = None,
+    pre_activation_epsilon: float | None = None,
 ) -> SearchStepResult:
     """Stage / trial / commit, or ordinary ``opt.step`` with retained ε.
 
@@ -628,10 +663,12 @@ def run_search_or_ordinary(
     floor = rt.cfg.epsilon_min_at(j, float(rt.epsilon_min))
     delayed_activation = not rt.cfg.active_at(j)
     if delayed_activation:
-        # Before activation the cosine floor is the deterministic optimizer
-        # schedule. Keep the retained selector rate synchronized so the first
-        # post-delay search starts exactly at the completed floor.
-        eps_cur = float(floor)
+        # The caller may supply its warmup/cosine rate until activation.
+        # Keep the retained rate synchronized for the first adaptive search.
+        # Existing callers retain the epsilon-floor curriculum by default.
+        eps_cur = float(floor if pre_activation_epsilon is None else pre_activation_epsilon)
+        if not math.isfinite(eps_cur) or eps_cur <= 0:
+            raise ValueError("pre-activation learning rate must be finite and positive")
         rt.ctrl.last_selected_epsilon = float(eps_cur)
     elif rt.cfg.mode == "fixed_epsilon":
         eps_cur = fixed_epsilon_rate(rt)
@@ -648,7 +685,9 @@ def run_search_or_ordinary(
 
     if not run_search:
         u_breakdown: dict[str, float] = {}
-        if rt.cfg.strict_actual_update or actual_diagnostic_due:
+        if (rt.cfg.strict_actual_update or actual_diagnostic_due) and not (
+            delayed_activation and pre_activation_epsilon is not None
+        ):
             rt.adapter.snapshot_theta0()
             st = rt.adapter.stage_from_q(
                 g_objective=objective_grad,
@@ -699,12 +738,8 @@ def run_search_or_ordinary(
                         else "actual_update_increase"
                     )
                     rt.adapter.discard(restore_params=True)
-                    on_selection_failure(
-                        rt.ctrl,
-                        rt.accept,
-                        last_tried_epsilon=float(epsilon),
-                        fallback_shrink=float(rt.cfg.fallback_shrink),
-                        epsilon_min=floor,
+                    _record_selection_failure(
+                        rt, last_tried_epsilon=float(epsilon), epsilon_min=floor,
                     )
                     log = logging_dict_from_search(
                         F0=F0,
@@ -831,12 +866,7 @@ def run_search_or_ordinary(
     stats = staged.stats
     if not stats.probe_valid:
         rt.adapter.discard(restore_params=True)
-        on_selection_failure(
-            rt.ctrl, rt.accept,
-            last_tried_epsilon=eps_cur,
-            fallback_shrink=float(rt.cfg.fallback_shrink),
-            epsilon_min=floor,
-        )
+        _record_selection_failure(rt, last_tried_epsilon=eps_cur, epsilon_min=floor)
         log = logging_dict_from_search(
             F0=F0, a=stats.a, P2=stats.P2, s_exec=stats.s_exec,
             K=int(rt.ctrl.K), searched=True, accepted=False,
@@ -912,6 +942,11 @@ def run_search_or_ordinary(
                     rt.cfg.reject_current_probe_increase
                 ),
             )
+            if os.environ.get("P2_LS_REPLAY_DIAGNOSTIC") == "1":
+                print(f"[line_search] trial update={j} n={trial_index + 1} "
+                      f"eps={epsilon:.7g} F0={F0:.7g} Fp={Fp:.7g} "
+                      f"a={a_armijo:.7g} accept={int(decision.accept)} "
+                      f"next={decision.next_epsilon}", flush=True)
             last_decision = decision
             if decision.accept:
                 if rt.cfg.strict_actual_update:
@@ -964,11 +999,8 @@ def run_search_or_ordinary(
         last_tried_epsilon = float(epsilon)
         floor_commit = not selected
         if floor_commit:
-            on_selection_failure(
-                rt.ctrl, rt.accept,
-                last_tried_epsilon=last_tried_epsilon,
-                fallback_shrink=float(rt.cfg.fallback_shrink),
-                epsilon_min=floor,
+            _record_selection_failure(
+                rt, last_tried_epsilon=last_tried_epsilon, epsilon_min=floor,
             )
             skip_exhausted = bool(
                 rt.cfg.strict_actual_update or rt.cfg.skip_on_probe_exhaustion
@@ -1042,11 +1074,8 @@ def run_search_or_ordinary(
         _write_actual_candidate(rt.adapter, staged, epsilon)
         if not params_finite(rt.adapter._params):
             rt.adapter.discard(restore_params=True)
-            on_selection_failure(
-                rt.ctrl, rt.accept,
-                last_tried_epsilon=last_tried_epsilon,
-                fallback_shrink=float(rt.cfg.fallback_shrink),
-                epsilon_min=floor,
+            _record_selection_failure(
+                rt, last_tried_epsilon=last_tried_epsilon, epsilon_min=floor,
             )
             latch_triggers(rt.ctrl, ["nonfinite_exec_params"])
             log = logging_dict_from_search(
